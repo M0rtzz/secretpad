@@ -1,0 +1,977 @@
+/*
+ * Copyright 2026 Ant Group Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ */
+
+package org.secretflow.secretpad.web.service;
+
+import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.util.UserContext;
+import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
+import org.secretflow.secretpad.web.util.RequestUtils;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.secretflow.v1alpha1.kusciaapi.Health;
+import org.secretflow.v1alpha1.kusciaapi.Job;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileStore;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * Compact application service for the Data Sandbox MVP.
+ *
+ * <p>The service deliberately keeps the new feature inside SecretPad and uses the existing
+ * JdbcTemplate and Kuscia client. It is intended as an operational MVP, not a replacement for
+ * a full Kubernetes resource controller.</p>
+ */
+@Slf4j
+@Service
+public class DataSandboxMvpService {
+
+    private static final Set<String> NETWORK_POLICIES = Set.of("INTERNAL_ONLY", "ALLOW_LIST", "NO_NETWORK");
+    private static final Set<String> LOG_TYPES = Set.of("OPERATION", "AUDIT", "LOGIN", "SYSTEM");
+    private static final Set<String> MODEL_STATES = Set.of("MODEL_REVIEW", "RESOURCE_REVIEW", "APPROVED", "REJECTED", "PUBLISHED");
+
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
+    private final KusciaGrpcClientAdapter kuscia;
+    private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+
+    @Value("${secretpad.node-id:kuscia-system}")
+    private String nodeId;
+
+    @Value("${secretpad.data-sandbox.kuscia.enabled:false}")
+    private boolean kusciaEnabled;
+
+    @Value("${secretpad.data-sandbox.snapshot-root:/nas/Misc/data-sandbox/snapshots}")
+    private String snapshotRoot;
+
+    @Value("${secretpad.data-sandbox.backup-root:/nas/Misc/data-sandbox/backups}")
+    private String backupRoot;
+
+    @Value("${spring.datasource.default.jdbc-url:jdbc:sqlite:./db/secretpad.sqlite}")
+    private String databaseUrl;
+
+    public DataSandboxMvpService(
+            @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
+            ObjectMapper objectMapper,
+            KusciaGrpcClientAdapter kuscia) {
+        this.jdbc = jdbc;
+        this.objectMapper = objectMapper;
+        this.kuscia = kuscia;
+    }
+
+    /* ------------------------------- Sandbox ------------------------------- */
+
+    public List<Map<String, Object>> listSandboxes(String ownerId, String keyword, String status) {
+        StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0");
+        List<Object> args = new ArrayList<>();
+        if (notBlank(ownerId)) {
+            sql.append(" and s.owner_id=?");
+            args.add(ownerId);
+        }
+        if (notBlank(keyword)) {
+            sql.append(" and (lower(s.name) like ? or lower(s.id) like ?)");
+            String value = "%" + keyword.toLowerCase(Locale.ROOT) + "%";
+            args.add(value);
+            args.add(value);
+        }
+        if (notBlank(status)) {
+            sql.append(" and s.status=?");
+            args.add(status.toUpperCase(Locale.ROOT));
+        }
+        sql.append(" order by s.created_at desc");
+        return jdbc.queryForList(sql.toString(), args.toArray());
+    }
+
+    @Transactional
+    public Map<String, Object> createSandbox(Map<String, Object> request) {
+        String id = "sbx-" + shortId();
+        String name = required(request, "name");
+        String ownerId = value(request, "ownerId", currentOwner());
+        String imageId = required(request, "imageId");
+        String networkPolicy = value(request, "networkPolicy", "INTERNAL_ONLY").toUpperCase(Locale.ROOT);
+        if (!NETWORK_POLICIES.contains(networkPolicy)) {
+            throw new IllegalArgumentException("不支持的网络策略: " + networkPolicy);
+        }
+        requireRow("select id from ds_sandbox_image where id=? and enabled=1", imageId);
+        double cpu = positive(request, "cpuCores", 1);
+        double memory = positive(request, "memoryGb", 2);
+        int gpu = nonNegativeInt(request, "gpuCount", 0);
+        double storage = positive(request, "storageGb", 10);
+        int days = Math.max(1, Math.min(nonNegativeInt(request, "validDays", 7), 365));
+        ensureQuota(ownerId);
+        assertCapacity(ownerId, cpu, memory, gpu, storage);
+        String now = now();
+        jdbc.update("insert into ds_sandbox(id,name,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
+                id, name, ownerId, value(request, "projectId", ""), imageId,
+                LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
+                actor(), now, now);
+        audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);
+        dispatchWebhooks("sandbox.created", Map.of("sandboxId", id, "name", name, "ownerId", ownerId));
+        return sandbox(id);
+    }
+
+    @Transactional
+    public Map<String, Object> sandboxAction(Map<String, Object> request) {
+        String id = required(request, "id");
+        String action = required(request, "action").toUpperCase(Locale.ROOT);
+        Map<String, Object> sandbox = sandbox(id);
+        String status = string(sandbox.get("status"));
+        String error = "";
+        switch (action) {
+            case "START" -> {
+                if ("EXPIRED".equals(status) || "DESTROYED".equals(status)) {
+                    throw new IllegalStateException("已过期或销毁的沙箱不能启动");
+                }
+                error = startKuscia(sandbox);
+                jdbc.update("update ds_sandbox set status=?,last_error=?,updated_at=? where id=?", error.isEmpty() ? "RUNNING" : "ERROR", error, now(), id);
+            }
+            case "STOP" -> {
+                error = stopKuscia(sandbox, "Stopped from Data Sandbox console");
+                jdbc.update("update ds_sandbox set status='STOPPED',last_error=?,updated_at=? where id=?", error, now(), id);
+            }
+            case "DESTROY" -> {
+                error = deleteKuscia(sandbox);
+                jdbc.update("update ds_sandbox set status='DESTROYED',deleted=1,last_error=?,updated_at=? where id=?", error, now(), id);
+            }
+            case "RENEW" -> {
+                int days = Math.max(1, Math.min(nonNegativeInt(request, "days", 7), 365));
+                jdbc.update("update ds_sandbox set expires_at=?,status=case when status='EXPIRED' then 'STOPPED' else status end,updated_at=? where id=?",
+                        LocalDateTime.now().plusDays(days).toString(), now(), id);
+            }
+            case "SNAPSHOT" -> createSnapshot(sandbox);
+            default -> throw new IllegalArgumentException("不支持的沙箱操作: " + action);
+        }
+        audit("OPERATION", "SANDBOX_" + action, "SANDBOX", id, error, error.isEmpty());
+        dispatchWebhooks("sandbox." + action.toLowerCase(Locale.ROOT), Map.of("sandboxId", id, "status", status));
+        return sandbox(id);
+    }
+
+    public Map<String, Object> sandbox(String id) {
+        return requireRow("select s.*, i.name image_name, i.image_ref, i.kuscia_app_image from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.id=?", id);
+    }
+
+    public List<Map<String, Object>> listSnapshots(String sandboxId) {
+        return jdbc.queryForList("select * from ds_sandbox_snapshot where sandbox_id=? order by created_at desc", sandboxId);
+    }
+
+    public List<Map<String, Object>> listImages() {
+        return jdbc.queryForList("select * from ds_sandbox_image order by enabled desc, created_at desc");
+    }
+
+    @Transactional
+    public Map<String, Object> saveImage(Map<String, Object> request) {
+        String id = value(request, "id", "img-" + shortId());
+        String now = now();
+        int changed = jdbc.update("update ds_sandbox_image set name=?,image_ref=?,kuscia_app_image=?,description=?,enabled=?,updated_at=? where id=?",
+                required(request, "name"), required(request, "imageRef"), value(request, "kusciaAppImage", ""),
+                value(request, "description", ""), bool(request, "enabled", true) ? 1 : 0, now, id);
+        if (changed == 0) {
+            jdbc.update("insert into ds_sandbox_image(id,name,image_ref,kuscia_app_image,description,enabled,created_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                    id, required(request, "name"), required(request, "imageRef"), value(request, "kusciaAppImage", ""),
+                    value(request, "description", ""), bool(request, "enabled", true) ? 1 : 0, actor(), now, now);
+        }
+        audit("OPERATION", "IMAGE_SAVE", "SANDBOX_IMAGE", id, json(request), true);
+        return requireRow("select * from ds_sandbox_image where id=?", id);
+    }
+
+    /* ------------------------------- Resources ------------------------------- */
+
+    public Map<String, Object> resourceOverview(String ownerId) {
+        List<Map<String, Object>> pools = jdbc.queryForList("select * from ds_resource_pool where enabled=1 order by resource_type");
+        Map<String, Double> totalUsage = usage(null);
+        Map<String, Double> ownerUsage = usage(ownerId);
+        for (Map<String, Object> pool : pools) {
+            String type = string(pool.get("resource_type"));
+            double total = number(pool.get("total_amount"), 0);
+            double used = totalUsage.getOrDefault(type, 0d);
+            pool.put("used_amount", used);
+            pool.put("available_amount", Math.max(0, total - used));
+            pool.put("usage_percent", total == 0 ? 0 : Math.round(used * 10000 / total) / 100d);
+        }
+        ensureQuota(notBlank(ownerId) ? ownerId : currentOwner());
+        Map<String, Object> quota = requireRow("select * from ds_resource_quota where owner_id=?", notBlank(ownerId) ? ownerId : currentOwner());
+        return Map.of("pools", pools, "quota", quota, "ownerUsage", ownerUsage,
+                "gpuInventory", List.of(
+                        Map.of("id", "gpu-a100-0", "model", "NVIDIA A100", "status", "AVAILABLE"),
+                        Map.of("id", "gpu-a100-1", "model", "NVIDIA A100", "status", "AVAILABLE"),
+                        Map.of("id", "gpu-a100-2", "model", "NVIDIA A100", "status", "AVAILABLE"),
+                        Map.of("id", "gpu-a100-3", "model", "NVIDIA A100", "status", "AVAILABLE")));
+    }
+
+    @Transactional
+    public Map<String, Object> saveQuota(Map<String, Object> request) {
+        String ownerId = required(request, "ownerId");
+        ensureQuota(ownerId);
+        jdbc.update("update ds_resource_quota set cpu_cores=?,memory_gb=?,gpu_count=?,storage_gb=?,updated_by=?,updated_at=? where owner_id=?",
+                positive(request, "cpuCores", 16), positive(request, "memoryGb", 64), nonNegativeInt(request, "gpuCount", 0),
+                positive(request, "storageGb", 1024), actor(), now(), ownerId);
+        audit("AUDIT", "RESOURCE_QUOTA_UPDATE", "RESOURCE_QUOTA", ownerId, json(request), true);
+        return requireRow("select * from ds_resource_quota where owner_id=?", ownerId);
+    }
+
+    public List<Map<String, Object>> listAlerts(String status) {
+        if (notBlank(status)) {
+            return jdbc.queryForList("select * from ds_alert_event where status=? order by created_at desc", status.toUpperCase(Locale.ROOT));
+        }
+        return jdbc.queryForList("select * from ds_alert_event order by created_at desc limit 200");
+    }
+
+    @Transactional
+    public void resolveAlert(String id) {
+        jdbc.update("update ds_alert_event set status='RESOLVED',resolved_at=? where id=?", now(), id);
+        audit("OPERATION", "ALERT_RESOLVE", "ALERT", id, "", true);
+    }
+
+    /* ------------------------------- Model approval ------------------------------- */
+
+    public List<Map<String, Object>> listApprovals(String status, String keyword) {
+        StringBuilder sql = new StringBuilder("select * from ds_model_approval where 1=1");
+        List<Object> args = new ArrayList<>();
+        if (notBlank(status)) {
+            sql.append(" and status=?");
+            args.add(status.toUpperCase(Locale.ROOT));
+        }
+        if (notBlank(keyword)) {
+            sql.append(" and (lower(model_name) like ? or lower(model_id) like ?)");
+            String q = "%" + keyword.toLowerCase(Locale.ROOT) + "%";
+            args.add(q);
+            args.add(q);
+        }
+        sql.append(" order by updated_at desc");
+        return jdbc.queryForList(sql.toString(), args.toArray());
+    }
+
+    @Transactional
+    public Map<String, Object> submitModel(Map<String, Object> request) {
+        String id = "apr-" + shortId();
+        String now = now();
+        jdbc.update("insert into ds_model_approval(id,model_id,model_name,project_id,version,status,current_stage,description,submitter,submitted_at,updated_at) values(?,?,?,?,1,'MODEL_REVIEW','MODEL_REVIEW',?,?,?,?)",
+                id, required(request, "modelId"), required(request, "modelName"), value(request, "projectId", ""),
+                value(request, "description", ""), actor(), now, now);
+        approvalHistory(id, "SUBMIT", "", "MODEL_REVIEW", value(request, "comment", ""));
+        audit("AUDIT", "MODEL_SUBMIT", "MODEL_APPROVAL", id, json(request), true);
+        dispatchWebhooks("model.submitted", Map.of("approvalId", id, "modelId", required(request, "modelId")));
+        return approval(id);
+    }
+
+    @Transactional
+    public Map<String, Object> approvalAction(Map<String, Object> request) {
+        String id = required(request, "id");
+        String action = required(request, "action").toUpperCase(Locale.ROOT);
+        String comment = value(request, "comment", "");
+        Map<String, Object> approval = approval(id);
+        String from = string(approval.get("status"));
+        String to;
+        String stage;
+        switch (action) {
+            case "APPROVE" -> {
+                if ("MODEL_REVIEW".equals(from)) {
+                    to = "RESOURCE_REVIEW";
+                    stage = "RESOURCE_REVIEW";
+                } else if ("RESOURCE_REVIEW".equals(from)) {
+                    to = "APPROVED";
+                    stage = "COMPLETED";
+                } else {
+                    throw new IllegalStateException("当前状态不能审批通过: " + from);
+                }
+            }
+            case "REJECT" -> {
+                if (!Set.of("MODEL_REVIEW", "RESOURCE_REVIEW").contains(from)) {
+                    throw new IllegalStateException("当前状态不能驳回: " + from);
+                }
+                to = "REJECTED";
+                stage = string(approval.get("current_stage"));
+            }
+            case "RESUBMIT" -> {
+                if (!"REJECTED".equals(from)) {
+                    throw new IllegalStateException("只有已驳回的模型可以复审");
+                }
+                to = "MODEL_REVIEW";
+                stage = "MODEL_REVIEW";
+                jdbc.update("update ds_model_approval set version=version+1 where id=?", id);
+            }
+            case "PUBLISH" -> {
+                if (!"APPROVED".equals(from)) {
+                    throw new IllegalStateException("模型审批完成后才能发布");
+                }
+                to = "PUBLISHED";
+                stage = "COMPLETED";
+            }
+            default -> throw new IllegalArgumentException("不支持的审批动作: " + action);
+        }
+        jdbc.update("update ds_model_approval set status=?,current_stage=?,reviewer=?,review_comment=?,updated_at=?,published_at=case when ?='PUBLISHED' then ? else published_at end where id=?",
+                to, stage, actor(), comment, now(), to, now(), id);
+        approvalHistory(id, action, from, to, comment);
+        audit("AUDIT", "MODEL_" + action, "MODEL_APPROVAL", id, comment, true);
+        dispatchWebhooks("model." + action.toLowerCase(Locale.ROOT), Map.of("approvalId", id, "from", from, "to", to));
+        return approval(id);
+    }
+
+    public Map<String, Object> approval(String id) {
+        Map<String, Object> data = requireRow("select * from ds_model_approval where id=?", id);
+        data.put("history", approvalHistory(id));
+        return data;
+    }
+
+    public List<Map<String, Object>> approvalHistory(String id) {
+        return jdbc.queryForList("select * from ds_model_approval_history where approval_id=? order by id desc", id);
+    }
+
+    public void assertModelApproved(String modelId) {
+        Integer count = jdbc.queryForObject("select count(1) from ds_model_approval where model_id=? and status in ('APPROVED','PUBLISHED')", Integer.class, modelId);
+        if (count == null || count == 0) {
+            throw new IllegalStateException("模型尚未完成模型与资源两级审批，不能发布 Serving");
+        }
+    }
+
+    /* ------------------------------- Unified logs ------------------------------- */
+
+    public List<Map<String, Object>> listLogs(String type, String level, String actor, String keyword, String start, String end, int limit) {
+        StringBuilder sql = new StringBuilder("select * from ds_unified_log where 1=1");
+        List<Object> args = new ArrayList<>();
+        if (notBlank(type)) { sql.append(" and log_type=?"); args.add(type.toUpperCase(Locale.ROOT)); }
+        if (notBlank(level)) { sql.append(" and level=?"); args.add(level.toUpperCase(Locale.ROOT)); }
+        if (notBlank(actor)) { sql.append(" and actor=?"); args.add(actor); }
+        if (notBlank(keyword)) {
+            sql.append(" and (lower(action) like ? or lower(detail) like ? or lower(resource_id) like ?)");
+            String q = "%" + keyword.toLowerCase(Locale.ROOT) + "%";
+            args.add(q); args.add(q); args.add(q);
+        }
+        if (notBlank(start)) { sql.append(" and created_at>=?"); args.add(start); }
+        if (notBlank(end)) { sql.append(" and created_at<=?"); args.add(end); }
+        sql.append(" order by id desc limit ?");
+        args.add(Math.max(1, Math.min(limit, 5000)));
+        return jdbc.queryForList(sql.toString(), args.toArray());
+    }
+
+    public byte[] exportLogs(String type, String keyword) {
+        List<Map<String, Object>> logs = listLogs(type, "", "", keyword, "", "", 5000);
+        StringBuilder csv = new StringBuilder("id,log_type,level,actor,action,resource_type,resource_id,success,ip_address,created_at,detail\n");
+        for (Map<String, Object> row : logs) {
+            csv.append(csv(row.get("id"))).append(',').append(csv(row.get("log_type"))).append(',')
+                    .append(csv(row.get("level"))).append(',').append(csv(row.get("actor"))).append(',')
+                    .append(csv(row.get("action"))).append(',').append(csv(row.get("resource_type"))).append(',')
+                    .append(csv(row.get("resource_id"))).append(',').append(csv(row.get("success"))).append(',')
+                    .append(csv(row.get("ip_address"))).append(',').append(csv(row.get("created_at"))).append(',')
+                    .append(csv(row.get("detail"))).append('\n');
+        }
+        return ("\ufeff" + csv).getBytes(StandardCharsets.UTF_8);
+    }
+
+    public List<Map<String, Object>> retentionPolicies() {
+        return jdbc.queryForList("select * from ds_log_retention order by log_type");
+    }
+
+    @Transactional
+    public void saveRetention(Map<String, Object> request) {
+        String type = required(request, "logType").toUpperCase(Locale.ROOT);
+        if (!LOG_TYPES.contains(type)) throw new IllegalArgumentException("无效日志类型");
+        int days = Math.max(1, nonNegativeInt(request, "retentionDays", 90));
+        jdbc.update("insert into ds_log_retention(log_type,retention_days,updated_by,updated_at) values(?,?,?,?) on conflict(log_type) do update set retention_days=excluded.retention_days,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                type, days, actor(), now());
+        audit("AUDIT", "LOG_RETENTION_UPDATE", "LOG_POLICY", type, "retentionDays=" + days, true);
+    }
+
+    public void loginAttempt(String username, boolean success, String detail) {
+        auditAs("LOGIN", success ? "INFO" : "WARN", username, "LOGIN", "USER", username, detail, success);
+    }
+
+    public void audit(String type, String action, String resourceType, String resourceId, String detail, boolean success) {
+        auditAs(type, success ? "INFO" : "ERROR", actor(), action, resourceType, resourceId, detail, success);
+    }
+
+    /* ------------------------------- Integrations ------------------------------- */
+
+    public Map<String, Object> integrationOverview() {
+        List<Map<String, Object>> clients = jdbc.queryForList("select id,name,client_id,scopes,enabled,last_used_at,created_by,created_at from ds_api_client order by created_at desc");
+        List<Map<String, Object>> webhooks = jdbc.queryForList("select id,name,url,events,enabled,created_by,created_at,updated_at from ds_webhook order by created_at desc");
+        List<Map<String, Object>> deliveries = jdbc.queryForList("select * from ds_webhook_delivery order by created_at desc limit 100");
+        Map<String, Object> oidc = new HashMap<>(requireRow("select * from ds_oidc_config where id=1"));
+        oidc.put("has_client_secret", notBlank(string(oidc.remove("client_secret"))));
+        return Map.of("clients", clients, "webhooks", webhooks, "deliveries", deliveries, "oidc", oidc,
+                "openapi", "/swagger-ui/index.html", "openapiJson", "/v3/api-docs");
+    }
+
+    @Transactional
+    public Map<String, Object> createApiClient(Map<String, Object> request) {
+        String id = "cli-" + shortId();
+        String clientId = "ds_" + shortId() + shortId();
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
+        jdbc.update("insert into ds_api_client(id,name,client_id,secret_hash,scopes,enabled,created_by,created_at) values(?,?,?,?,?,1,?,?)",
+                id, required(request, "name"), clientId, sha256(secret.getBytes(StandardCharsets.UTF_8)), value(request, "scopes", "sandbox:read"), actor(), now());
+        audit("AUDIT", "API_CLIENT_CREATE", "API_CLIENT", id, "", true);
+        Map<String, Object> result = new HashMap<>(requireRow("select id,name,client_id,scopes,enabled,created_by,created_at from ds_api_client where id=?", id));
+        result.put("client_secret", secret);
+        result.put("notice", "客户端密钥只显示一次，请立即保存");
+        return result;
+    }
+
+    /** Validate a machine credential without ever loading or storing the clear-text secret. */
+    public boolean authenticateApiClient(String clientId, String clientSecret) {
+        if (!notBlank(clientId) || !notBlank(clientSecret)) return false;
+        try {
+            Map<String, Object> client = requireRow("select id,secret_hash from ds_api_client where client_id=? and enabled=1", clientId);
+            byte[] expected = string(client.get("secret_hash")).getBytes(StandardCharsets.UTF_8);
+            byte[] actual = sha256(clientSecret.getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+            boolean valid = MessageDigest.isEqual(expected, actual);
+            if (valid) jdbc.update("update ds_api_client set last_used_at=? where id=?", now(), client.get("id"));
+            auditAs("AUDIT", valid ? "INFO" : "WARN", clientId, "API_CLIENT_AUTH", "API_CLIENT", string(client.get("id")), "", valid);
+            return valid;
+        } catch (IllegalArgumentException e) {
+            auditAs("AUDIT", "WARN", clientId, "API_CLIENT_AUTH", "API_CLIENT", "", "unknown client", false);
+            return false;
+        }
+    }
+
+    @Transactional
+    public void revokeApiClient(String id) {
+        jdbc.update("update ds_api_client set enabled=0 where id=?", id);
+        audit("AUDIT", "API_CLIENT_REVOKE", "API_CLIENT", id, "", true);
+    }
+
+    @Transactional
+    public Map<String, Object> saveWebhook(Map<String, Object> request) {
+        String url = required(request, "url");
+        validateHttpUrl(url);
+        String id = value(request, "id", "wh-" + shortId());
+        String now = now();
+        int changed = jdbc.update("update ds_webhook set name=?,url=?,events=?,secret=?,enabled=?,updated_at=? where id=?",
+                required(request, "name"), url, value(request, "events", "sandbox.created"), value(request, "secret", ""), bool(request, "enabled", true) ? 1 : 0, now, id);
+        if (changed == 0) {
+            jdbc.update("insert into ds_webhook(id,name,url,events,secret,enabled,created_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                    id, required(request, "name"), url, value(request, "events", "sandbox.created"), value(request, "secret", ""), bool(request, "enabled", true) ? 1 : 0, actor(), now, now);
+        }
+        audit("AUDIT", "WEBHOOK_SAVE", "WEBHOOK", id, url, true);
+        return requireRow("select id,name,url,events,enabled,created_by,created_at,updated_at from ds_webhook where id=?", id);
+    }
+
+    public Map<String, Object> testWebhook(String id) {
+        return deliverWebhook(id, "system.test", json(Map.of("message", "Data Sandbox webhook test", "time", now())));
+    }
+
+    public Map<String, Object> retryDelivery(String deliveryId) {
+        Map<String, Object> delivery = requireRow("select * from ds_webhook_delivery where id=?", deliveryId);
+        return deliverWebhook(string(delivery.get("webhook_id")), string(delivery.get("event_type")), string(delivery.get("payload")));
+    }
+
+    @Transactional
+    public Map<String, Object> saveOidc(Map<String, Object> request) {
+        Map<String, Object> current = requireRow("select * from ds_oidc_config where id=1");
+        String secret = value(request, "clientSecret", string(current.get("client_secret")));
+        jdbc.update("update ds_oidc_config set issuer=?,client_id=?,client_secret=?,scopes=?,enabled=?,discovery_status='UNTESTED',discovery_message='',updated_by=?,updated_at=? where id=1",
+                value(request, "issuer", ""), value(request, "clientId", ""), secret,
+                value(request, "scopes", "openid profile email"), bool(request, "enabled", false) ? 1 : 0, actor(), now());
+        audit("AUDIT", "OIDC_CONFIG_UPDATE", "OIDC", "1", "issuer=" + value(request, "issuer", ""), true);
+        return integrationOverview().get("oidc") instanceof Map<?, ?> map ? castMap(map) : Map.of();
+    }
+
+    @Transactional
+    public Map<String, Object> testOidc() {
+        Map<String, Object> config = requireRow("select * from ds_oidc_config where id=1");
+        String issuer = string(config.get("issuer"));
+        validateHttpUrl(issuer);
+        String discovery = issuer.replaceAll("/$", "") + "/.well-known/openid-configuration";
+        String status = "FAILED";
+        String message;
+        try {
+            HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder(URI.create(discovery)).timeout(Duration.ofSeconds(8)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            status = response.statusCode() >= 200 && response.statusCode() < 300 && response.body().contains("authorization_endpoint") ? "SUCCESS" : "FAILED";
+            message = "HTTP " + response.statusCode() + ": " + truncate(response.body(), 1200);
+        } catch (Exception e) {
+            message = e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+        jdbc.update("update ds_oidc_config set discovery_status=?,discovery_message=?,updated_at=? where id=1", status, message, now());
+        audit("SYSTEM", "OIDC_DISCOVERY_TEST", "OIDC", "1", message, "SUCCESS".equals(status));
+        return Map.of("status", status, "message", message, "discoveryUrl", discovery);
+    }
+
+    /* ------------------------------- Operations ------------------------------- */
+
+    public Map<String, Object> operationOverview() {
+        Map<String, Object> counts = new LinkedHashMap<>();
+        counts.put("sandboxes", count("select count(1) from ds_sandbox where deleted=0"));
+        counts.put("runningSandboxes", count("select count(1) from ds_sandbox where deleted=0 and status='RUNNING'"));
+        counts.put("pendingApprovals", count("select count(1) from ds_model_approval where status in ('MODEL_REVIEW','RESOURCE_REVIEW')"));
+        counts.put("openAlerts", count("select count(1) from ds_alert_event where status='OPEN'"));
+        counts.put("failedCallbacks", count("select count(1) from ds_webhook_delivery where status='FAILED'"));
+        return Map.of("status", "UP", "counts", counts, "kusciaIntegrationEnabled", kusciaEnabled,
+                "snapshotRoot", snapshotRoot, "backupRoot", backupRoot,
+                "backups", jdbc.queryForList("select * from ds_backup order by created_at desc limit 50"),
+                "tickets", jdbc.queryForList("select * from ds_support_ticket order by updated_at desc limit 50"));
+    }
+
+    @Transactional
+    public Map<String, Object> createBackup() {
+        String id = "bak-" + shortId();
+        Path dir = Path.of(backupRoot, id).normalize();
+        Path target = dir.resolve("secretpad.sqlite");
+        String created = now();
+        jdbc.update("insert into ds_backup(id,backup_type,status,artifact_path,created_by,created_at) values(?,'FULL','RUNNING',?,?,?)", id, target.toString(), actor(), created);
+        try {
+            Files.createDirectories(dir);
+            Path source = databasePath();
+            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            String checksum = sha256(Files.readAllBytes(target));
+            Files.writeString(dir.resolve("metadata.json"), json(Map.of("backupId", id, "createdAt", created, "source", source.toString(), "sha256", checksum)), StandardCharsets.UTF_8);
+            jdbc.update("update ds_backup set status='COMPLETED',size_bytes=?,checksum=?,completed_at=? where id=?", Files.size(target), checksum, now(), id);
+            audit("OPERATION", "BACKUP_CREATE", "BACKUP", id, target.toString(), true);
+        } catch (Exception e) {
+            jdbc.update("update ds_backup set status='FAILED',message=?,completed_at=? where id=?", truncate(e.getMessage(), 900), now(), id);
+            audit("SYSTEM", "BACKUP_CREATE", "BACKUP", id, e.getMessage(), false);
+        }
+        return requireRow("select * from ds_backup where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> stageRestore(String backupId) {
+        Map<String, Object> backup = requireRow("select * from ds_backup where id=? and status='COMPLETED'", backupId);
+        Path source = Path.of(string(backup.get("artifact_path"))).normalize();
+        Path pending = databasePath().resolveSibling("restore-pending.sqlite");
+        try {
+            String actual = sha256(Files.readAllBytes(source));
+            if (!Objects.equals(actual, string(backup.get("checksum")))) throw new IllegalStateException("备份校验和不一致");
+            Files.copy(source, pending, StandardCopyOption.REPLACE_EXISTING);
+            jdbc.update("update ds_backup set status='RESTORE_STAGED',message=? where id=?", "已暂存，重启时由 data-sandbox-package 完成切换", backupId);
+            audit("AUDIT", "RESTORE_STAGE", "BACKUP", backupId, pending.toString(), true);
+            return Map.of("status", "RESTORE_STAGED", "pendingFile", pending.toString(), "message", "恢复文件已校验并暂存，请使用部署包 restore 命令安全重启切换");
+        } catch (IOException e) {
+            throw new IllegalStateException("暂存恢复失败: " + e.getMessage(), e);
+        }
+    }
+
+    public Map<String, Object> diagnostics() {
+        List<Map<String, Object>> checks = new ArrayList<>();
+        checks.add(check("DATABASE", true, "SQLite query OK, tables=" + count("select count(1) from sqlite_master where type='table'")));
+        checks.add(pathCheck("SNAPSHOT_STORAGE", Path.of(snapshotRoot)));
+        checks.add(pathCheck("BACKUP_STORAGE", Path.of(backupRoot)));
+        if (kusciaEnabled) {
+            try {
+                var response = kuscia.healthZ(Health.HealthRequest.newBuilder().build());
+                checks.add(check("KUSCIA", response.getStatus().getCode() == 0, response.getStatus().getMessage()));
+            } catch (Exception e) {
+                checks.add(check("KUSCIA", false, e.getMessage()));
+            }
+        } else {
+            checks.add(Map.of("name", "KUSCIA", "status", "SKIPPED", "message", "secretpad.data-sandbox.kuscia.enabled=false"));
+        }
+        boolean ok = checks.stream().noneMatch(it -> "FAILED".equals(it.get("status")));
+        audit("SYSTEM", "DIAGNOSTICS_RUN", "SYSTEM", nodeId, "checks=" + checks.size(), ok);
+        return Map.of("status", ok ? "HEALTHY" : "DEGRADED", "time", now(), "checks", checks);
+    }
+
+    public List<Map<String, Object>> helpArticles() {
+        return List.of(
+                Map.of("id", "quick-start", "title", "沙箱快速入门", "content", "选择环境镜像和资源配额创建沙箱；启动后可在状态列查看运行情况，到期前可续期。"),
+                Map.of("id", "network", "title", "网络策略说明", "content", "INTERNAL_ONLY 仅允许平台内访问；ALLOW_LIST 使用管理员配置的白名单；NO_NETWORK 禁止主动访问外部网络。"),
+                Map.of("id", "approval", "title", "模型审批流程", "content", "模型审核 → 资源审核 → 已批准 → 发布。被驳回后修改版本并提交复审。"),
+                Map.of("id", "recovery", "title", "备份恢复", "content", "创建备份后先执行恢复暂存，再使用 data-sandbox-package/ops.sh restore 完成停机切换。"));
+    }
+
+    @Transactional
+    public Map<String, Object> createTicket(Map<String, Object> request) {
+        String id = "ticket-" + shortId();
+        String now = now();
+        jdbc.update("insert into ds_support_ticket(id,title,category,priority,description,status,submitter,created_at,updated_at) values(?,?,?,?,?,'OPEN',?,?,?)",
+                id, required(request, "title"), value(request, "category", "TECHNICAL"), value(request, "priority", "NORMAL"),
+                required(request, "description"), actor(), now, now);
+        audit("OPERATION", "SUPPORT_TICKET_CREATE", "SUPPORT_TICKET", id, "", true);
+        return requireRow("select * from ds_support_ticket where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> updateTicket(Map<String, Object> request) {
+        String id = required(request, "id");
+        jdbc.update("update ds_support_ticket set status=?,assignee=?,resolution=?,updated_at=? where id=?",
+                value(request, "status", "PROCESSING"), value(request, "assignee", actor()), value(request, "resolution", ""), now(), id);
+        audit("OPERATION", "SUPPORT_TICKET_UPDATE", "SUPPORT_TICKET", id, json(request), true);
+        return requireRow("select * from ds_support_ticket where id=?", id);
+    }
+
+    /* ------------------------------- Scheduled jobs ------------------------------- */
+
+    @Scheduled(fixedDelayString = "${secretpad.data-sandbox.status-sync-ms:30000}")
+    public void syncKusciaStatuses() {
+        if (!kusciaEnabled) return;
+        for (Map<String, Object> item : jdbc.queryForList("select id,kuscia_job_id from ds_sandbox where deleted=0 and kuscia_job_id<>''")) {
+            try {
+                Job.QueryJobResponse response = kuscia.queryJob(Job.QueryJobRequest.newBuilder().setJobId(string(item.get("kuscia_job_id"))).build());
+                if (response.getStatus().getCode() == 0) {
+                    String state = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+                    String mapped = switch (state) {
+                        case "PENDING", "AWAITINGAPPROVAL" -> "STARTING";
+                        case "RUNNING" -> "RUNNING";
+                        case "SUCCEEDED", "SUSPENDED", "CANCELLED" -> "STOPPED";
+                        default -> state.contains("FAIL") || state.contains("REJECT") ? "ERROR" : "STARTING";
+                    };
+                    jdbc.update("update ds_sandbox set status=?,last_error=?,updated_at=? where id=?", mapped,
+                            response.getData().getStatus().getErrMsg(), now(), item.get("id"));
+                }
+            } catch (Exception e) {
+                log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
+            }
+        }
+    }
+
+    @Scheduled(cron = "0 * * * * *")
+    @Transactional
+    public void expireSandboxesAndCheckAlerts() {
+        List<Map<String, Object>> expired = jdbc.queryForList("select * from ds_sandbox where deleted=0 and status not in ('EXPIRED','DESTROYED') and expires_at<?", now());
+        for (Map<String, Object> sandbox : expired) {
+            stopKuscia(sandbox, "Sandbox expired");
+            jdbc.update("update ds_sandbox set status='EXPIRED',updated_at=? where id=?", now(), sandbox.get("id"));
+            auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRED", "SANDBOX", string(sandbox.get("id")), "", true);
+        }
+        Map<String, Double> used = usage(null);
+        for (Map<String, Object> pool : jdbc.queryForList("select * from ds_resource_pool where enabled=1")) {
+            String type = string(pool.get("resource_type"));
+            double total = number(pool.get("total_amount"), 0);
+            double percent = total == 0 ? 0 : used.getOrDefault(type, 0d) * 100 / total;
+            double threshold = number(pool.get("warning_threshold"), 80);
+            if (percent >= threshold && count("select count(1) from ds_alert_event where status='OPEN' and source='RESOURCE' and title=?", type + " 使用率告警") == 0) {
+                jdbc.update("insert into ds_alert_event(id,severity,source,title,detail,status,created_at) values(?,'WARNING','RESOURCE',?,?,'OPEN',?)",
+                        "alert-" + shortId(), type + " 使用率告警", String.format(Locale.ROOT, "当前使用率 %.2f%%，阈值 %.2f%%", percent, threshold), now());
+            }
+        }
+    }
+
+    @Scheduled(cron = "0 20 2 * * *")
+    @Transactional
+    public void purgeExpiredLogs() {
+        for (Map<String, Object> policy : retentionPolicies()) {
+            int days = ((Number) policy.get("retention_days")).intValue();
+            jdbc.update("delete from ds_unified_log where log_type=? and created_at<?", policy.get("log_type"), LocalDateTime.now().minusDays(days).toString());
+        }
+    }
+
+    /* ------------------------------- Internal helpers ------------------------------- */
+
+    private String startKuscia(Map<String, Object> sandbox) {
+        if (!kusciaEnabled) return "";
+        try {
+            String existing = string(sandbox.get("kuscia_job_id"));
+            if (notBlank(existing)) {
+                var response = kuscia.restartJob(Job.RestartJobRequest.newBuilder().setJobId(existing).setReason("Started from Data Sandbox console").build());
+                return response.getStatus().getCode() == 0 ? "" : response.getStatus().getMessage();
+            }
+            String appImage = string(sandbox.get("kuscia_app_image"));
+            if (!notBlank(appImage)) return "环境镜像未配置 Kuscia AppImage 名称";
+            String jobId = ("ds-" + string(sandbox.get("id"))).replace("_", "-").toLowerCase(Locale.ROOT);
+            Job.Party party = Job.Party.newBuilder().setDomainId(nodeId).setRole("server")
+                    .setResources(Job.JobResource.newBuilder().setCpu(String.valueOf(sandbox.get("cpu_cores"))).setMemory(sandbox.get("memory_gb") + "Gi")).build();
+            Job.Task task = Job.Task.newBuilder().setTaskId(jobId + "-task").setAlias("data-sandbox")
+                    .setAppImage(appImage).addParties(party).setTaskInputConfig("{}").build();
+            Job.CreateJobResponse response = kuscia.createJob(Job.CreateJobRequest.newBuilder().setJobId(jobId).setInitiator(nodeId).setMaxParallelism(1).addTasks(task)
+                    .putCustomFields("data_sandbox_id", string(sandbox.get("id"))).putCustomFields("network_policy", string(sandbox.get("network_policy"))).build());
+            if (response.getStatus().getCode() == 0) {
+                jdbc.update("update ds_sandbox set kuscia_job_id=? where id=?", jobId, sandbox.get("id"));
+                return "";
+            }
+            return response.getStatus().getMessage();
+        } catch (Exception e) {
+            return truncate(e.getMessage(), 900);
+        }
+    }
+
+    private String stopKuscia(Map<String, Object> sandbox, String reason) {
+        if (!kusciaEnabled || !notBlank(string(sandbox.get("kuscia_job_id")))) return "";
+        try {
+            var response = kuscia.stopJob(Job.StopJobRequest.newBuilder().setJobId(string(sandbox.get("kuscia_job_id"))).setReason(reason).build());
+            return response.getStatus().getCode() == 0 ? "" : response.getStatus().getMessage();
+        } catch (Exception e) {
+            return truncate(e.getMessage(), 900);
+        }
+    }
+
+    private String deleteKuscia(Map<String, Object> sandbox) {
+        if (!kusciaEnabled || !notBlank(string(sandbox.get("kuscia_job_id")))) return "";
+        try {
+            var response = kuscia.deleteJob(Job.DeleteJobRequest.newBuilder().setJobId(string(sandbox.get("kuscia_job_id"))).build());
+            return response.getStatus().getCode() == 0 ? "" : response.getStatus().getMessage();
+        } catch (Exception e) {
+            return truncate(e.getMessage(), 900);
+        }
+    }
+
+    private void createSnapshot(Map<String, Object> sandbox) {
+        String sandboxId = string(sandbox.get("id"));
+        String snapshotId = "snap-" + shortId();
+        Path dir = Path.of(snapshotRoot, sandboxId, snapshotId).normalize();
+        try {
+            Files.createDirectories(dir);
+            Map<String, Object> metadata = new LinkedHashMap<>(sandbox);
+            metadata.put("snapshotId", snapshotId);
+            metadata.put("createdAt", now());
+            Path metadataFile = dir.resolve("metadata.json");
+            Files.writeString(metadataFile, objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(metadata), StandardCharsets.UTF_8);
+            String checksum = sha256(Files.readAllBytes(metadataFile));
+            Files.writeString(dir.resolve("metadata.json.sha256"), checksum + "  metadata.json\n", StandardCharsets.UTF_8);
+            jdbc.update("insert into ds_sandbox_snapshot(id,sandbox_id,status,artifact_path,size_bytes,checksum,created_by,created_at) values(?,?,'COMPLETED',?,?,?,?,?)",
+                    snapshotId, sandboxId, dir.toString(), Files.size(metadataFile), checksum, actor(), now());
+        } catch (IOException e) {
+            jdbc.update("insert into ds_sandbox_snapshot(id,sandbox_id,status,artifact_path,created_by,created_at) values(?,?,'FAILED',?,?,?)",
+                    snapshotId, sandboxId, dir.toString(), actor(), now());
+            throw new IllegalStateException("创建快照失败: " + e.getMessage(), e);
+        }
+    }
+
+    private void assertCapacity(String ownerId, double cpu, double memory, int gpu, double storage) {
+        Map<String, Double> global = usage(null);
+        Map<String, Double> owner = usage(ownerId);
+        Map<String, Object> quota = requireRow("select * from ds_resource_quota where owner_id=?", ownerId);
+        Map<String, Double> requested = Map.of("CPU", cpu, "MEMORY", memory, "GPU", (double) gpu, "STORAGE", storage);
+        Map<String, String> quotaColumns = Map.of("CPU", "cpu_cores", "MEMORY", "memory_gb", "GPU", "gpu_count", "STORAGE", "storage_gb");
+        for (Map<String, Object> pool : jdbc.queryForList("select * from ds_resource_pool where enabled=1")) {
+            String type = string(pool.get("resource_type"));
+            double amount = requested.getOrDefault(type, 0d);
+            if (global.getOrDefault(type, 0d) + amount > number(pool.get("total_amount"), 0)) {
+                throw new IllegalStateException(type + " 资源池余量不足");
+            }
+            if (owner.getOrDefault(type, 0d) + amount > number(quota.get(quotaColumns.get(type)), 0)) {
+                throw new IllegalStateException(type + " 超出用户配额");
+            }
+        }
+    }
+
+    private Map<String, Double> usage(String ownerId) {
+        String suffix = ownerId == null ? "" : " and owner_id=?";
+        Object[] args = ownerId == null ? new Object[]{} : new Object[]{ownerId};
+        Map<String, Object> row = jdbc.queryForMap("select coalesce(sum(cpu_cores),0) cpu,coalesce(sum(memory_gb),0) memory,coalesce(sum(gpu_count),0) gpu,coalesce(sum(storage_gb),0) storage from ds_sandbox where deleted=0 and status<>'DESTROYED'" + suffix, args);
+        return Map.of("CPU", number(row.get("cpu"), 0), "MEMORY", number(row.get("memory"), 0), "GPU", number(row.get("gpu"), 0), "STORAGE", number(row.get("storage"), 0));
+    }
+
+    private void ensureQuota(String ownerId) {
+        jdbc.update("insert or ignore into ds_resource_quota(owner_id,updated_by,updated_at) values(?,?,?)", ownerId, "system", now());
+    }
+
+    private void approvalHistory(String id, String action, String from, String to, String comment) {
+        if (!MODEL_STATES.contains(to)) throw new IllegalArgumentException("无效审批状态: " + to);
+        jdbc.update("insert into ds_model_approval_history(approval_id,action,from_status,to_status,operator,comment,created_at) values(?,?,?,?,?,?,?)",
+                id, action, from, to, actor(), comment, now());
+    }
+
+    private void auditAs(String type, String level, String actor, String action, String resourceType, String resourceId, String detail, boolean success) {
+        try {
+            String ip = "";
+            try { if (RequestUtils.getCurrentHttpRequest() != null) ip = RequestUtils.getRemoteHost(); } catch (Exception ignored) { }
+            jdbc.update("insert into ds_unified_log(log_type,level,actor,action,resource_type,resource_id,detail,ip_address,trace_id,success,created_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+                    type, level, actor, action, resourceType, resourceId, truncate(detail, 2000), ip, value(MDC.getCopyOfContextMap(), "Trace-Id", ""), success ? 1 : 0, now());
+        } catch (Exception e) {
+            log.warn("Unable to persist unified audit log: {}", e.getMessage());
+        }
+    }
+
+    private void dispatchWebhooks(String event, Map<String, Object> payload) {
+        String body = json(Map.of("event", event, "time", now(), "data", payload));
+        for (Map<String, Object> webhook : jdbc.queryForList("select id,events from ds_webhook where enabled=1")) {
+            String events = string(webhook.get("events"));
+            if (events.contains("*") || events.contains(event)) {
+                try { deliverWebhook(string(webhook.get("id")), event, body); }
+                catch (Exception e) { log.warn("Webhook {} failed: {}", webhook.get("id"), e.getMessage()); }
+            }
+        }
+    }
+
+    private Map<String, Object> deliverWebhook(String webhookId, String event, String payload) {
+        Map<String, Object> webhook = requireRow("select * from ds_webhook where id=? and enabled=1", webhookId);
+        String deliveryId = "delivery-" + shortId();
+        String created = now();
+        jdbc.update("insert into ds_webhook_delivery(id,webhook_id,event_type,payload,status,created_at,updated_at) values(?,?,?,?,'DELIVERING',?,?)",
+                deliveryId, webhookId, event, payload, created, created);
+        int code = 0;
+        String responseBody = "";
+        int attempts = 0;
+        for (int i = 1; i <= 3; i++) {
+            attempts = i;
+            try {
+                HttpRequest request = HttpRequest.newBuilder(URI.create(string(webhook.get("url")))).timeout(Duration.ofSeconds(8))
+                        .header("Content-Type", "application/json").header("X-Data-Sandbox-Event", event)
+                        .header("X-Data-Sandbox-Signature", sha256((string(webhook.get("secret")) + payload).getBytes(StandardCharsets.UTF_8)))
+                        .POST(HttpRequest.BodyPublishers.ofString(payload)).build();
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                code = response.statusCode();
+                responseBody = truncate(response.body(), 1800);
+                if (code >= 200 && code < 300) break;
+            } catch (Exception e) {
+                responseBody = truncate(e.getMessage(), 1800);
+            }
+        }
+        String status = code >= 200 && code < 300 ? "SUCCESS" : "FAILED";
+        jdbc.update("update ds_webhook_delivery set status=?,attempts=?,response_code=?,response_body=?,next_retry_at=?,updated_at=? where id=?",
+                status, attempts, code, responseBody, "FAILED".equals(status) ? LocalDateTime.now().plusMinutes(5).toString() : "", now(), deliveryId);
+        return requireRow("select * from ds_webhook_delivery where id=?", deliveryId);
+    }
+
+    private Map<String, Object> pathCheck(String name, Path path) {
+        try {
+            Files.createDirectories(path);
+            FileStore store = Files.getFileStore(path);
+            return Map.of("name", name, "status", Files.isWritable(path) ? "PASSED" : "FAILED", "message", path + ", usable=" + store.getUsableSpace());
+        } catch (Exception e) {
+            return check(name, false, e.getMessage());
+        }
+    }
+
+    private Map<String, Object> check(String name, boolean passed, String message) {
+        return Map.of("name", name, "status", passed ? "PASSED" : "FAILED", "message", string(message));
+    }
+
+    private Path databasePath() {
+        String prefix = "jdbc:sqlite:";
+        if (!databaseUrl.startsWith(prefix)) throw new IllegalStateException("MVP 备份当前仅支持 SQLite");
+        return Path.of(databaseUrl.substring(prefix.length())).toAbsolutePath().normalize();
+    }
+
+    private Map<String, Object> requireRow(String sql, Object... args) {
+        try {
+            return new LinkedHashMap<>(jdbc.queryForMap(sql, args));
+        } catch (EmptyResultDataAccessException e) {
+            throw new IllegalArgumentException("记录不存在");
+        }
+    }
+
+    private long count(String sql, Object... args) {
+        Long value = jdbc.queryForObject(sql, Long.class, args);
+        return value == null ? 0 : value;
+    }
+
+    private String actor() {
+        UserContextDTO user = UserContext.getUserOrNotExist();
+        return user == null || !notBlank(user.getName()) ? "system" : user.getName();
+    }
+
+    private String currentOwner() {
+        UserContextDTO user = UserContext.getUserOrNotExist();
+        return user == null || !notBlank(user.getOwnerId()) ? nodeId : user.getOwnerId();
+    }
+
+    private String required(Map<String, Object> request, String key) {
+        String value = string(request.get(key));
+        if (!notBlank(value)) throw new IllegalArgumentException(key + " 不能为空");
+        return value;
+    }
+
+    private String value(Map<?, ?> request, String key, String defaultValue) {
+        if (request == null) return defaultValue;
+        String value = string(request.get(key));
+        return notBlank(value) ? value : defaultValue;
+    }
+
+    private double positive(Map<String, Object> request, String key, double defaultValue) {
+        double value = number(request.get(key), defaultValue);
+        if (value <= 0) throw new IllegalArgumentException(key + " 必须大于 0");
+        return value;
+    }
+
+    private int nonNegativeInt(Map<String, Object> request, String key, int defaultValue) {
+        int value = (int) number(request.get(key), defaultValue);
+        if (value < 0) throw new IllegalArgumentException(key + " 不能小于 0");
+        return value;
+    }
+
+    private boolean bool(Map<String, Object> request, String key, boolean defaultValue) {
+        Object value = request.get(key);
+        return value == null ? defaultValue : Boolean.parseBoolean(String.valueOf(value));
+    }
+
+    private static double number(Object value, double defaultValue) {
+        if (value instanceof Number number) return number.doubleValue();
+        try { return value == null ? defaultValue : Double.parseDouble(String.valueOf(value)); }
+        catch (NumberFormatException e) { return defaultValue; }
+    }
+
+    private String json(Object value) {
+        try { return objectMapper.writeValueAsString(value); }
+        catch (JsonProcessingException e) { return String.valueOf(value); }
+    }
+
+    private static String csv(Object value) {
+        return "\"" + string(value).replace("\"", "\"\"").replace("\r", " ").replace("\n", " ") + "\"";
+    }
+
+    private static String string(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private static boolean notBlank(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private static String now() {
+        return LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString();
+    }
+
+    private static String shortId() {
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+    }
+
+    private static byte[] randomBytes() {
+        byte[] bytes = new byte[32];
+        new java.security.SecureRandom().nextBytes(bytes);
+        return bytes;
+    }
+
+    private static String sha256(byte[] bytes) {
+        try {
+            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static String truncate(String value, int max) {
+        String safe = string(value);
+        return safe.length() <= max ? safe : safe.substring(0, max);
+    }
+
+    private static void validateHttpUrl(String url) {
+        URI uri = URI.create(url);
+        if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme())) || !notBlank(uri.getHost())) {
+            throw new IllegalArgumentException("必须是有效的 HTTP/HTTPS 地址");
+        }
+    }
+
+    private static Map<String, Object> castMap(Map<?, ?> value) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        value.forEach((key, item) -> result.put(String.valueOf(key), item));
+        return result;
+    }
+}

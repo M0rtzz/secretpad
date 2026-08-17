@@ -16,8 +16,6 @@
 
 package org.secretflow.secretpad.web;
 
-import org.secretflow.secretpad.web.constant.AuthConstants;
-
 import com.google.common.collect.Lists;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.Connector;
@@ -70,20 +68,9 @@ public class SecretPadApplication {
 
     private static void printEnvironment(Environment environment) throws UnknownHostException {
         log.info("SecretPad start success, http://{}:{} innerHttpPort:{} Profile:{}", InetAddress.getLocalHost().getHostAddress(), environment.getProperty("server.port"), environment.getProperty("server.http-port-inner"), environment.getActiveProfiles());
-        String userName, password;
-        try {
-            userName = environment.getProperty("secretpad.auth.pad_name", String.class, AuthConstants.USER_NAME);
-        } catch (Exception e) {
-            log.debug("initUserAndPwd failed use default", e);
-            userName = AuthConstants.USER_NAME;
-        }
-        try {
-            password = environment.getProperty("secretpad.auth.pad_pwd", String.class, AuthConstants.getRandomPassword());
-        } catch (Exception e) {
-            log.debug("initUserAndPwd failed use default", e);
-            password = AuthConstants.getRandomPassword();
-        }
-        log.info("userName:{} password:{}", userName, password);
+        // Never print administrator credentials. They may be supplied by environment variables
+        // and application logs are commonly collected by third-party log systems.
+        log.info("SecretPad authentication is configured; rotate credentials after first deployment.");
     }
 
     /**

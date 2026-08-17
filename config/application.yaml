@@ -107,7 +107,9 @@ flyway:
 
 springdoc:
   api-docs:
-    enabled: false
+    enabled: ${OPENAPI_ENABLED:true}
+  swagger-ui:
+    enabled: ${SWAGGER_UI_ENABLED:true}
 management:
   endpoint:
     shutdown:
@@ -181,6 +183,13 @@ secretpad:
     max-request-size: -1 # -1 means not limit, e.g.  200MB, 1GB
   data:
     dir-path: /app/data/
+  data-sandbox:
+    # Enable only after a Jupyter/IDE AppImage is registered in Kuscia.
+    kuscia:
+      enabled: ${DATA_SANDBOX_KUSCIA_ENABLED:false}
+    snapshot-root: ${DATA_SANDBOX_SNAPSHOT_ROOT:/nas/Misc/data-sandbox/snapshots}
+    backup-root: ${DATA_SANDBOX_BACKUP_ROOT:/nas/Misc/data-sandbox/backups}
+    status-sync-ms: ${DATA_SANDBOX_STATUS_SYNC_MS:30000}
   datasync:
     center: true
     p2p: false

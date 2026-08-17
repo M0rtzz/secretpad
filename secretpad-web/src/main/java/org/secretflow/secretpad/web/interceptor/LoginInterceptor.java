@@ -31,6 +31,7 @@ import org.secretflow.secretpad.persistence.repository.UserTokensRepository;
 import org.secretflow.secretpad.service.EnvService;
 import org.secretflow.secretpad.service.SysResourcesBizService;
 import org.secretflow.secretpad.web.util.AuthUtils;
+import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
@@ -87,6 +88,9 @@ public class LoginInterceptor implements HandlerInterceptor {
 
     @Resource
     private InnerPortPathConfig innerPortPathConfig;
+
+    @Resource
+    private DataSandboxMvpService dataSandboxMvpService;
 
     @Autowired
     public LoginInterceptor(UserTokensRepository userTokensRepository, EnvService envService,
@@ -184,6 +188,17 @@ public class LoginInterceptor implements HandlerInterceptor {
 
     private void processByUserRequest(HttpServletRequest request, HttpServletResponse response) {
         refuseByOutPortInvokeInnerPort(request, response);
+        String clientId = request.getHeader("X-Client-Id");
+        String clientSecret = request.getHeader("X-Client-Secret");
+        if (StringUtils.isNotBlank(clientId) && request.getRequestURI().startsWith("/api/v1alpha1/data-sandbox/")) {
+            if (!dataSandboxMvpService.authenticateApiClient(clientId, clientSecret)) {
+                throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "invalid api client credential");
+            }
+            UserContextDTO apiClient = createTmpUserForPlatformType(envService.getPlatformType());
+            apiClient.setName("api:" + clientId);
+            UserContext.setBaseUser(apiClient);
+            return;
+        }
         String token = AuthUtils.findTokenInHeader(request);
         Optional<TokensDO> tokensDO = userTokensRepository.findByToken(token);
         if (tokensDO.isEmpty()) {

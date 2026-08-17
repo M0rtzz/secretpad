@@ -22,6 +22,7 @@ import org.secretflow.secretpad.service.ModelManagementService;
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.service.model.model.*;
 import org.secretflow.secretpad.service.model.serving.ServingDetailVO;
+import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import io.swagger.v3.oas.annotations.Operation;
 import jakarta.annotation.Resource;
@@ -41,6 +42,9 @@ public class ModelManagementController {
 
     @Resource
     private ModelManagementService modelManagementService;
+
+    @Resource
+    private DataSandboxMvpService dataSandboxMvpService;
 
     @DataResource(field = "projectId", resourceType = DataResourceTypeEnum.PROJECT_ID)
     @PostMapping(value = "/page", consumes = "application/json")
@@ -72,6 +76,7 @@ public class ModelManagementController {
     @PostMapping(value = "/serving/create", consumes = "application/json")
     @Operation(summary = "create model serving", description = "create model serving online")
     public SecretPadResponse<ModelPartiesVO> createServing(@RequestBody @Valid CreateModelServingRequest createModelServingRequest) {
+        dataSandboxMvpService.assertModelApproved(createModelServingRequest.getModelId());
         modelManagementService.createModelServing(createModelServingRequest.getProjectId(), createModelServingRequest.getModelId(), createModelServingRequest.getPartyConfigs());
         return SecretPadResponse.success();
     }
