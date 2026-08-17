@@ -383,8 +383,8 @@ public class DataSandboxMvpService {
         return jdbc.queryForList(sql.toString(), args.toArray());
     }
 
-    public byte[] exportLogs(String type, String keyword) {
-        List<Map<String, Object>> logs = listLogs(type, "", "", keyword, "", "", 5000);
+    public byte[] exportLogs(String type, String level, String actor, String keyword, String start, String end) {
+        List<Map<String, Object>> logs = listLogs(type, level, actor, keyword, start, end, 5000);
         StringBuilder csv = new StringBuilder("id,log_type,level,actor,action,resource_type,resource_id,success,ip_address,created_at,detail\n");
         for (Map<String, Object> row : logs) {
             csv.append(csv(row.get("id"))).append(',').append(csv(row.get("log_type"))).append(',')

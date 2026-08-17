@@ -141,8 +141,12 @@ public class DataSandboxController {
     @GetMapping("/logs/export")
     public ResponseEntity<byte[]> exportLogs(
             @RequestParam(defaultValue = "") String type,
-            @RequestParam(defaultValue = "") String keyword) {
-        byte[] content = service.exportLogs(type, keyword);
+            @RequestParam(defaultValue = "") String level,
+            @RequestParam(defaultValue = "") String actor,
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "") String start,
+            @RequestParam(defaultValue = "") String end) {
+        byte[] content = service.exportLogs(type, level, actor, keyword, start, end);
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(new MediaType("text", "csv", StandardCharsets.UTF_8));
         headers.setContentDisposition(ContentDisposition.attachment().filename("data-sandbox-logs-" + LocalDate.now() + ".csv").build());
