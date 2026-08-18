@@ -92,6 +92,12 @@ public class DataSandboxMvpService {
     @Value("${secretpad.data-sandbox.dev-endpoint.token-ttl-minutes:30}")
     private int devTokenTtlMinutes;
 
+    @Value("${secretpad.data-sandbox.dev-endpoint.kuscia-host:}")
+    private String devEndpointKusciaHost;
+
+    @Value("${secretpad.data-sandbox.dev-endpoint.kuscia-port:80}")
+    private int devEndpointKusciaPort;
+
     @Value("${secretpad.data-sandbox.alerts.quota-warning-percent:90}")
     private int quotaWarningPercent;
 
@@ -309,8 +315,13 @@ public class DataSandboxMvpService {
 
     /**
      * 跳板转发目标（token 已在拦截器校验通过）：仅允许 DB 中的 endpoint 值，防 SSRF。
+     * <p>Kuscia 的 endpoint 是集群头服务 hostname（如 ds-sbx-xxx-task-server-0-web.dev-zgz.svc，
+     * 无端口），SecretPad 所在网络无法解析 .svc 且容器不监听该端口；实际可达路径是
+     * Kuscia 节点 envoy（默认 :80）按 Host 头路由到沙箱容器。故配置
+     * {@code dev-endpoint.kuscia-host} 后，代理连接 {@code kuscia-host:kuscia-port} 并把
+     * endpoint 作为 Host 头发送；未配置则假定 endpoint 即 host:port 直连。</p>
      */
-    public String proxyTarget(String sandboxId) {
+    public DevEndpointTarget proxyTarget(String sandboxId) {
         Map<String, Object> sandbox = requireRow("select endpoint,network_policy from ds_sandbox where id=? and deleted=0", sandboxId);
         // Z-02 网络隔离纵深防御：NO_NETWORK 沙箱无集群外端点，拒绝转发
         if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
@@ -320,14 +331,37 @@ public class DataSandboxMvpService {
         if (!notBlank(endpoint)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点尚未就绪，请稍后重试");
         }
-        return endpoint;
+        if (notBlank(devEndpointKusciaHost)) {
+            return new DevEndpointTarget(devEndpointKusciaHost, devEndpointKusciaPort, endpoint);
+        }
+        int colon = endpoint.lastIndexOf(':');
+        if (colon < 0) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED,
+                    "沙箱开发端点格式异常（缺少端口，请配置 dev-endpoint.kuscia-host）: " + endpoint);
+        }
+        try {
+            return new DevEndpointTarget(endpoint.substring(0, colon), Integer.parseInt(endpoint.substring(colon + 1)), endpoint);
+        } catch (NumberFormatException e) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点端口非法: " + endpoint);
+        }
     }
 
-    /** 仅沙箱 owner 或平台管理员（center admin）可进入开发环境。 */
+    /** 开发端点转发目标：connectHost:connectPort 为实际连接地址，virtualHost 为 envoy 按 Host 头路由名。 */
+    public record DevEndpointTarget(String connectHost, int connectPort, String virtualHost) {
+    }
+
+    /** 仅沙箱 owner、所在节点运维账号（platformNodeId 与沙箱 owner 一致）或平台管理员可进入开发环境。 */
     private void requireOwner(Map<String, Object> sandbox) {
         UserContextDTO user = UserContext.getUserOrNotExist();
-        boolean admin = user != null && "kuscia-system".equals(user.getOwnerId()) && "admin".equals(user.getName());
-        if (user == null || (!admin && !Objects.equals(user.getOwnerId(), string(sandbox.get("owner_id"))))) {
+        if (user == null) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权访问该沙箱的开发环境");
+        }
+        boolean admin = "kuscia-system".equals(user.getOwnerId()) && "admin".equals(user.getName());
+        String sandboxOwner = string(sandbox.get("owner_id"));
+        // 沙箱 owner 与登录账号 ownerId 相同，或该账号是其所在节点（platformNodeId）的运维账号
+        boolean isOwner = Objects.equals(user.getOwnerId(), sandboxOwner)
+                || Objects.equals(user.getPlatformNodeId(), sandboxOwner);
+        if (!admin && !isOwner) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权访问该沙箱的开发环境");
         }
     }

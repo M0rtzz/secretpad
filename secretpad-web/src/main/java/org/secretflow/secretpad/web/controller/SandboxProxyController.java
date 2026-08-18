@@ -65,6 +65,12 @@ public class SandboxProxyController {
             "last-modified", "set-cookie", "content-encoding", "www-authenticate");
     private static final String WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+    static {
+        // Kuscia 集群端跳板需覆盖 Host 头（envoy 按 Host 头路由到沙箱容器）；
+        // JDK HttpClient 默认禁止设置 host，须在首个请求构建前放行（Spring 启动时已设置）。
+        System.setProperty("jdk.httpclient.allowRestrictedHeaders", "host");
+    }
+
     private final DataSandboxMvpService service;
     private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
@@ -81,26 +87,28 @@ public class SandboxProxyController {
      */
     @GetMapping({"/{sandboxId}", "/{sandboxId}/**"})
     public void proxy(@PathVariable String sandboxId, HttpServletRequest request, HttpServletResponse response) throws IOException, jakarta.servlet.ServletException {
-        String endpoint = service.proxyTarget(sandboxId);
+        DataSandboxMvpService.DevEndpointTarget target = service.proxyTarget(sandboxId);
         if (isWebSocketUpgrade(request)) {
-            proxyWebSocket(sandboxId, endpoint, request);
+            proxyWebSocket(sandboxId, target, request);
         } else {
-            proxyHttp(endpoint, request, response);
+            proxyHttp(target, request, response);
         }
     }
 
     /* ------------------------------- HTTP streaming ------------------------------- */
 
-    private void proxyHttp(String endpoint, HttpServletRequest request, HttpServletResponse response) throws IOException {
+    private void proxyHttp(DataSandboxMvpService.DevEndpointTarget target, HttpServletRequest request, HttpServletResponse response) throws IOException {
         try {
-            String targetUrl = buildTargetUrl(endpoint, request, false);
+            String targetUrl = buildTargetUrl(target, request, false);
             String method = request.getMethod().toUpperCase(Locale.ROOT);
             boolean hasBody = !Set.of("GET", "HEAD", "DELETE", "OPTIONS", "TRACE").contains(method);
             // 请求头白名单（凭证类一律不转发）；先收集头再一次性 build，避免丢失 body
             var names = request.getHeaderNames();
             HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(targetUrl))
                     .timeout(Duration.ofSeconds(Math.max(1, proxyTimeoutSeconds)))
-                    .header("user-agent", "SecretPad-DevProxy");
+                    .header("user-agent", "SecretPad-DevProxy")
+                    // Kuscia envoy 按 Host 头路由到具体沙箱（Virtual Host），而非按连接地址
+                    .header("host", target.virtualHost());
             while (names != null && names.hasMoreElements()) {
                 String name = names.nextElement().toLowerCase(Locale.ROOT);
                 if (REQUEST_HEADER_ALLOW.contains(name)) {
@@ -142,7 +150,7 @@ public class SandboxProxyController {
                 response.setContentType("text/plain;charset=UTF-8");
                 response.getWriter().write("开发环境暂时不可达，请确认沙箱仍在运行后重试");
             }
-            log.warn("dev proxy to {} failed: {}", endpoint, e.getMessage());
+            log.warn("dev proxy to {} failed: {}", target.virtualHost(), e.getMessage());
         }
     }
 
@@ -153,10 +161,12 @@ public class SandboxProxyController {
         return upgrade != null && "websocket".equalsIgnoreCase(upgrade.trim());
     }
 
-    private void proxyWebSocket(String sandboxId, String endpoint, HttpServletRequest request) throws IOException, jakarta.servlet.ServletException {
+    private void proxyWebSocket(String sandboxId, DataSandboxMvpService.DevEndpointTarget target, HttpServletRequest request) throws IOException, jakarta.servlet.ServletException {
         Map<String, String> handshake = new HashMap<>();
-        handshake.put("endpoint", endpoint);
-        handshake.put("path", buildTargetUrl(endpoint, request, true));
+        handshake.put("connectHost", target.connectHost());
+        handshake.put("connectPort", Integer.toString(target.connectPort()));
+        handshake.put("virtualHost", target.virtualHost());
+        handshake.put("path", buildTargetUrl(target, request, true));
         for (String header : new String[]{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions", "Origin"}) {
             String value = request.getHeader(header);
             if (value != null) {
@@ -173,7 +183,7 @@ public class SandboxProxyController {
      * 拼接目标 URL：/proxy/{sandboxId} 之后的部分 + 查询串（token 参数剥除）。
      * ws=true 时仅返回原始路径（不含 scheme/host），供 WS 握手重建请求行。
      */
-    private String buildTargetUrl(String endpoint, HttpServletRequest request, boolean rawPathOnly) {
+    private String buildTargetUrl(DataSandboxMvpService.DevEndpointTarget target, HttpServletRequest request, boolean rawPathOnly) {
         String uri = request.getRequestURI();
         String prefix = request.getContextPath() + "/api/v1alpha1/data-sandbox/proxy/";
         String sub = uri.startsWith(prefix) ? uri.substring(prefix.length()) : "";
@@ -202,7 +212,7 @@ public class SandboxProxyController {
         if (rawPathOnly) {
             return path + query;
         }
-        return "http://" + endpoint + path + query;
+        return "http://" + target.connectHost() + ":" + target.connectPort() + path + query;
     }
 
     /**
@@ -223,15 +233,17 @@ public class SandboxProxyController {
                 closeQuietly(wc);
                 return;
             }
-            String endpoint = target.get("endpoint");
+            String connectHost = target.get("connectHost");
+            int connectPort = Integer.parseInt(target.get("connectPort"));
+            String virtualHost = target.get("virtualHost");
             String path = target.get("path");
             String key = target.get("Sec-WebSocket-Key");
             try {
-                socket = new Socket(endpoint.substring(0, endpoint.lastIndexOf(':')), Integer.parseInt(endpoint.substring(endpoint.lastIndexOf(':') + 1)));
+                socket = new Socket(connectHost, connectPort);
                 socket.setSoTimeout(0);
                 OutputStream toTarget = socket.getOutputStream();
                 StringBuilder handshake = new StringBuilder("GET ").append(path).append(" HTTP/1.1\r\n")
-                        .append("Host: ").append(endpoint).append("\r\n")
+                        .append("Host: ").append(virtualHost).append("\r\n")
                         .append("Upgrade: websocket\r\n")
                         .append("Connection: Upgrade\r\n");
                 if (key == null) {
@@ -262,7 +274,7 @@ public class SandboxProxyController {
                 clientToTarget.join(0);
                 targetToClient.join(0);
             } catch (Exception e) {
-                log.warn("ws tunnel to {} failed: {}", endpoint, e.getMessage());
+                log.warn("ws tunnel to {} failed: {}", virtualHost, e.getMessage());
                 closeQuietly(wc);
             }
         }

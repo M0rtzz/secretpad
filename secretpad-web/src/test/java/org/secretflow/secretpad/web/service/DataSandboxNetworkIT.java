@@ -36,6 +36,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.Map;
@@ -178,6 +179,50 @@ public class DataSandboxNetworkIT {
         assertTrue(String.valueOf(issued.get("url")).startsWith("/api/v1alpha1/data-sandbox/proxy/"));
         String endpoint = jdbc.queryForObject("select endpoint from ds_sandbox where id=?", String.class, id);
         assertEquals("10.0.0.1:31234", endpoint);
+    }
+
+    @Test
+    public void proxyTargetDirectModeParsesHostPort() {
+        String id = createSandbox("INTERNAL_ONLY");
+        service.sandboxAction(Map.of("id", id, "action", "START"));
+        run();
+        // 未配置 kuscia-host：endpoint（10.0.0.1:31234）即连接地址 + Host 头
+        DataSandboxMvpService.DevEndpointTarget target = service.proxyTarget(id);
+        assertEquals("10.0.0.1", target.connectHost());
+        assertEquals(31234, target.connectPort());
+        assertEquals("10.0.0.1:31234", target.virtualHost());
+    }
+
+    @Test
+    public void proxyTargetRoutesViaKusciaHostWhenConfigured() {
+        String id = createSandbox("INTERNAL_ONLY");
+        service.sandboxAction(Map.of("id", id, "action", "START"));
+        run();
+        // 配置 kuscia-host（Kuscia 节点 envoy 跳板）：连接 {host}:{port}，endpoint hostname 作 Host 头
+        try {
+            ReflectionTestUtils.setField(service, "devEndpointKusciaHost", "data-sandbox-dev-test-kuscia");
+            ReflectionTestUtils.setField(service, "devEndpointKusciaPort", 80);
+            DataSandboxMvpService.DevEndpointTarget target = service.proxyTarget(id);
+            assertEquals("data-sandbox-dev-test-kuscia", target.connectHost());
+            assertEquals(80, target.connectPort());
+            // mock 下 endpoint 为 host:port；envoy 按 Host 头路由，整体作为 virtual host
+            assertEquals("10.0.0.1:31234", target.virtualHost());
+        } finally {
+            ReflectionTestUtils.setField(service, "devEndpointKusciaHost", "");
+        }
+    }
+
+    @Test
+    public void requireOwnerAllowsNodeOperatorByPlatformNodeId() {
+        String id = createSandbox("INTERNAL_ONLY");
+        service.sandboxAction(Map.of("id", id, "action", "START"));
+        run();
+        // 运维账号：ownerId 与沙箱 owner 不同，但 platformNodeId 与沙箱 owner 一致 → 允许进入
+        UserContext.setBaseUser(UserContextDTO.builder().ownerId("ops-001").name("ops")
+                .platformType(PlatformTypeEnum.CENTER).platformNodeId("alice")
+                .ownerType(UserOwnerTypeEnum.CENTER).projectIds(Set.of("p1")).build());
+        Map<String, Object> issued = service.generateDevToken(id);
+        assertTrue(String.valueOf(issued.get("url")).startsWith("/api/v1alpha1/data-sandbox/proxy/"));
     }
 
     @Test
