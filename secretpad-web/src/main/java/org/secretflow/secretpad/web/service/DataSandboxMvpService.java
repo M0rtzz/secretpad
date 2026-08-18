@@ -346,12 +346,34 @@ public class DataSandboxMvpService {
         }
         ensureQuota(notBlank(ownerId) ? ownerId : currentOwner());
         Map<String, Object> quota = requireRow("select * from ds_resource_quota where owner_id=?", notBlank(ownerId) ? ownerId : currentOwner());
-        return Map.of("pools", pools, "quota", quota, "ownerUsage", ownerUsage,
-                "gpuInventory", List.of(
-                        Map.of("id", "gpu-a100-0", "model", "NVIDIA A100", "status", "AVAILABLE"),
-                        Map.of("id", "gpu-a100-1", "model", "NVIDIA A100", "status", "AVAILABLE"),
-                        Map.of("id", "gpu-a100-2", "model", "NVIDIA A100", "status", "AVAILABLE"),
-                        Map.of("id", "gpu-a100-3", "model", "NVIDIA A100", "status", "AVAILABLE")));
+        // Z-02：真实节点指标（ResourceCollector 写入 ds_node_metric）与 GPU 台账（ds_gpu_ledger）
+        Map<String, Object> nodeMetrics = latestNodeMetric();
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        if (nodeMetrics.isEmpty()) {
+            metrics.put("status", "N/A");
+            metrics.put("lastUpdatedAt", "");
+        } else {
+            metrics.put("status", nodeMetrics.get("status"));
+            metrics.put("lastUpdatedAt", nodeMetrics.get("created_at"));
+        }
+        double gpuUtilization = number(nodeMetrics.get("gpu_utilization_percent"), -1);
+        List<Map<String, Object>> gpuInventory = jdbc.queryForList("select * from ds_gpu_ledger order by id");
+        for (Map<String, Object> gpu : gpuInventory) {
+            gpu.put("utilization", gpuUtilization);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("pools", pools);
+        result.put("quota", quota);
+        result.put("ownerUsage", ownerUsage);
+        result.put("gpuInventory", gpuInventory);
+        result.put("nodeMetrics", nodeMetrics);
+        result.put("metrics", metrics);
+        return result;
+    }
+
+    private Map<String, Object> latestNodeMetric() {
+        List<Map<String, Object>> rows = jdbc.queryForList("select * from ds_node_metric order by created_at desc limit 1");
+        return rows.isEmpty() ? new LinkedHashMap<>() : rows.get(0);
     }
 
     @Transactional

@@ -195,6 +195,13 @@ secretpad:
       token-ttl-minutes: ${DATA_SANDBOX_DEV_TOKEN_TTL:30}
       # 开发端点跳板转发超时（秒）
       proxy-timeout-seconds: ${DATA_SANDBOX_PROXY_TIMEOUT:30}
+    # 节点真实资源指标采集（Kuscia Prometheus 端点 :9091/metrics，node_exporter/DCGM）
+    metrics:
+      # 采集开关；URL 形如 http://<kuscia容器名>:9091
+      enabled: ${DATA_SANDBOX_METRICS_ENABLED:false}
+      url: ${DATA_SANDBOX_METRICS_URL:}
+      # 采集周期（毫秒）
+      interval-ms: ${DATA_SANDBOX_METRICS_INTERVAL:30000}
   datasync:
     center: true
     p2p: false
