@@ -759,7 +759,7 @@ public class DataSandboxMvpService {
                     log.warn("Kuscia Job {} for sandbox {} no longer exists: {}", item.get("kuscia_job_id"), item.get("id"), response.getStatus().getMessage());
                     continue;
                 }
-                String state = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+                String state = effectiveKusciaState(response);
                 SandboxStatusMachine.Decision decision = SandboxStatusMachine.mapKusciaState(state,
                         string(item.get("status")), string(item.get("intent")));
                 String target = decision.targetStatus();
@@ -782,6 +782,9 @@ public class DataSandboxMvpService {
                         args.add(endpoint);
                         args.add(now());
                     }
+                } else {
+                    sql.append(",endpoint='',endpoint_updated_at=?");
+                    args.add(now());
                 }
                 sql.append(" where id=?");
                 args.add(item.get("id"));
@@ -790,6 +793,45 @@ public class DataSandboxMvpService {
                 log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
             }
         }
+    }
+
+    /**
+     * Kuscia marks a Job RUNNING once it has dispatched its tasks. A task may still be
+     * Pending while its image is pulled, so the Job state alone is not proof that the
+     * sandbox endpoint is ready. Use the least-ready task/party state instead.
+     */
+    private String effectiveKusciaState(Job.QueryJobResponse response) {
+        String topLevel = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+        List<String> states = new ArrayList<>();
+        for (Job.TaskStatus task : response.getData().getStatus().getTasksList()) {
+            if (!task.getState().isBlank()) {
+                states.add(task.getState().toUpperCase(Locale.ROOT));
+            }
+            for (Job.PartyStatus party : task.getPartiesList()) {
+                if (!party.getState().isBlank()) {
+                    states.add(party.getState().toUpperCase(Locale.ROOT));
+                }
+            }
+        }
+        if (states.isEmpty()) {
+            return topLevel;
+        }
+        for (String state : states) {
+            if (state.contains("FAIL") || state.equals("REJECTED")) {
+                return state;
+            }
+        }
+        for (String state : states) {
+            if (state.equals("PENDING") || state.equals("AWAITINGAPPROVAL")) {
+                return state;
+            }
+        }
+        for (String state : states) {
+            if (state.equals("RUNNING")) {
+                return state;
+            }
+        }
+        return topLevel;
     }
 
     /**

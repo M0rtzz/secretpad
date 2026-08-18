@@ -37,6 +37,8 @@ public class JobService extends JobServiceGrpc.JobServiceImplBase implements Com
         public static volatile String createJobMessage = "success";
         public static volatile int jobQueryCode = KusciaAPIConstants.OK;
         public static volatile String jobState = "RUNNING";
+        public static volatile String taskState = "";
+        public static volatile String partyState = "";
         public static volatile String jobErrMsg = "";
         public static volatile boolean withEndpoints = false;
         public static volatile String endpointPortName = "web";
@@ -53,8 +55,10 @@ public class JobService extends JobServiceGrpc.JobServiceImplBase implements Com
     }
 
     private Job.QueryJobResponseData queryData() {
-        Job.TaskStatus.Builder task = Job.TaskStatus.newBuilder().setTaskId("data-sandbox-task").setState(State.jobState);
-        Job.PartyStatus.Builder party = Job.PartyStatus.newBuilder().setDomainId("kuscia-system").setState(State.jobState).setErrMsg(State.jobErrMsg);
+        String taskState = State.taskState.isBlank() ? State.jobState : State.taskState;
+        String partyState = State.partyState.isBlank() ? taskState : State.partyState;
+        Job.TaskStatus.Builder task = Job.TaskStatus.newBuilder().setTaskId("data-sandbox-task").setState(taskState);
+        Job.PartyStatus.Builder party = Job.PartyStatus.newBuilder().setDomainId("kuscia-system").setState(partyState).setErrMsg(State.jobErrMsg);
         if (State.withEndpoints) {
             party.addEndpoints(Job.JobPartyEndpoint.newBuilder()
                     .setPortName(State.endpointPortName).setScope(State.endpointScope).setEndpoint(State.endpointAddress));

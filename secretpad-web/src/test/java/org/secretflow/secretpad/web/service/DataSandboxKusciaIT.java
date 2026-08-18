@@ -100,6 +100,8 @@ public class DataSandboxKusciaIT {
         JobService.State.createJobMessage = "success";
         JobService.State.jobQueryCode = KusciaAPIConstants.OK;
         JobService.State.jobState = "RUNNING";
+        JobService.State.taskState = "";
+        JobService.State.partyState = "";
         JobService.State.jobErrMsg = "";
         JobService.State.withEndpoints = true;
         JobService.State.endpointPortName = "web";
@@ -161,16 +163,32 @@ public class DataSandboxKusciaIT {
     }
 
     @Test
-    public void runningIsNeverRolledBackToStartingOnKusciaPending() {
+    public void runningReturnsToStartingWhenRuntimeBecomesPending() {
         String id = createSandbox();
         // 直接构造 RUNNING 本地状态
-        jdbc.update("update ds_sandbox set status='RUNNING',intent='',kuscia_job_id='ds-" + id + "' where id=?", id);
+        jdbc.update("update ds_sandbox set status='RUNNING',intent='',endpoint='old:1234',kuscia_job_id='ds-" + id + "' where id=?", id);
         JobService.State.jobState = "PENDING";
 
         service.syncKusciaStatuses();
         Map<String, Object> after = statusOf(id);
-        assertEquals("RUNNING", after.get("status"), "PENDING 不得把已 RUNNING 的记录打回 STARTING");
+        assertEquals("STARTING", after.get("status"));
         assertEquals("", after.get("intent"));
+        assertEquals("", after.get("endpoint"));
+    }
+
+    @Test
+    public void runningJobWithPendingTaskDoesNotExposeEndpoint() {
+        String id = createSandbox();
+        service.sandboxAction(Map.of("id", id, "action", "START"));
+        JobService.State.jobState = "RUNNING";
+        JobService.State.taskState = "PENDING";
+        JobService.State.partyState = "PENDING";
+
+        service.syncKusciaStatuses();
+        Map<String, Object> after = statusOf(id);
+        assertEquals("STARTING", after.get("status"));
+        assertEquals("START", after.get("intent"));
+        assertEquals("", after.get("endpoint"));
     }
 
     @Test

@@ -9,13 +9,23 @@ spec:
       spec:
         containers:
           - command:
-              - start-notebook.sh
-              - --ServerApp.ip=0.0.0.0
-              - --ServerApp.port=8888
-              - --ServerApp.token=
-              - --ServerApp.password=
-              - --no-browser
-              - --NotebookApp.allow_origin=*
+              - /bin/sh
+              - -c
+              - >-
+                sandbox_id="${HOSTNAME#ds-}";
+                sandbox_id="${sandbox_id%-task-server-0}";
+                mkdir -p /home/jovyan/workspace;
+                cd /home/jovyan/workspace;
+                exec python3 -m jupyter lab
+                --ServerApp.ip=0.0.0.0
+                --ServerApp.port="${KUSCIA_PORT_WEB_NUMBER:-8888}"
+                --ServerApp.base_url="/api/v1alpha1/data-sandbox/proxy/${sandbox_id}/"
+                --ServerApp.root_dir=/home/jovyan/workspace
+                --ServerApp.token=
+                --ServerApp.password=
+                --ServerApp.allow_origin=*
+                --no-browser
+                --allow-root
             name: jupyter
             # scope=Cluster 的端口由 Kuscia 分配集群外可达地址并回填 endpoints，
             # 沙箱状态同步据此写入 ds_sandbox.endpoint（开发端点跳板的数据来源）。
@@ -26,22 +36,19 @@ spec:
                 protocol: HTTP
                 scope: Cluster
             readinessProbe:
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
             livenessProbe:
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
             startupProbe:
               failureThreshold: 60
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
               periodSeconds: 10
               successThreshold: 1
               timeoutSeconds: 1
-            workingDir: /home/jovyan
+            workingDir: /home/jovyan/work
   image:
     id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
     name: {{.IMAGE_NAME}}
