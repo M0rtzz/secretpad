@@ -39,7 +39,7 @@ apply_appimage() {
         "${TEMPLATE_DIR}/${template}" >"${rendered}"
     log "apply AppImage ${name} (image ${image})"
     docker cp "${rendered}" "${KUSCIA_MASTER_CTR}":/home/kuscia/"${template}"
-    docker exec -it "${KUSCIA_MASTER_CTR}" kubectl apply -f /home/kuscia/"${template}"
+    docker exec "${KUSCIA_MASTER_CTR}" kubectl apply -f /home/kuscia/"${template}"
     rm -f "${rendered}"
 }
 
