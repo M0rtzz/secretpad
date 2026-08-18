@@ -24,6 +24,7 @@ import org.secretflow.secretpad.service.AuthService;
 import org.secretflow.secretpad.service.model.auth.LoginRequest;
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.util.AuthUtils;
+import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
@@ -40,10 +41,12 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping(value = "/api")
 public class AuthController {
     private final AuthService authService;
+    private final DataSandboxMvpService dataSandboxMvpService;
 
     @Autowired
-    public AuthController(AuthService authService) {
+    public AuthController(AuthService authService, DataSandboxMvpService dataSandboxMvpService) {
         this.authService = authService;
+        this.dataSandboxMvpService = dataSandboxMvpService;
     }
 
     /**
@@ -55,8 +58,14 @@ public class AuthController {
     @ResponseBody
     @PostMapping(value = "/login", consumes = "application/json")
     public SecretPadResponse<UserContextDTO> login(@Valid @RequestBody LoginRequest request) {
-        UserContextDTO login = authService.login(request.getName(), request.getPasswordHash());
-        return SecretPadResponse.success(login);
+        try {
+            UserContextDTO login = authService.login(request.getName(), request.getPasswordHash());
+            dataSandboxMvpService.loginAttempt(request.getName(), true, "login success");
+            return SecretPadResponse.success(login);
+        } catch (RuntimeException e) {
+            dataSandboxMvpService.loginAttempt(request.getName(), false, "login failed");
+            throw e;
+        }
     }
 
     /**

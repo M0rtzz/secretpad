@@ -52,6 +52,7 @@ public class AddResponseHeaderFilter extends OncePerRequestFilter {
      */
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+        response.setHeader("Cache-Control", "no-store");
         Map<String, String> extraResponseHeaders = secretPadResponse.getExtraHeaders();
         if (!CollectionUtils.isEmpty(extraResponseHeaders)) {
             extraResponseHeaders.forEach((key, value) -> {

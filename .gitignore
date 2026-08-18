@@ -36,6 +36,10 @@ secretpad-service/**/org/secretflow/proto/
 secretpad-service/**/com/secretflow/spec/v1/
 secretpad-web/config
 
+### Generated frontend bundle ###
+# data-sandbox-package/build.sh rebuilds and copies these files before Maven packaging.
+/secretpad-web/src/main/resources/static/
+
 ### VS Code ###
 .vscode/
 tmp/
