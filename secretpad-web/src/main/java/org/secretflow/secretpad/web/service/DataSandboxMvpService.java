@@ -11,8 +11,11 @@
 package org.secretflow.secretpad.web.service;
 
 import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
+import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
+import org.secretflow.secretpad.web.service.sandbox.SandboxStatusMachine;
 import org.secretflow.secretpad.web.util.RequestUtils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -85,6 +88,9 @@ public class DataSandboxMvpService {
 
     @Value("${secretpad.data-sandbox.backup-root:/nas/Misc/data-sandbox/backups}")
     private String backupRoot;
+
+    @Value("${secretpad.data-sandbox.dev-endpoint.token-ttl-minutes:30}")
+    private int devTokenTtlMinutes;
 
     @Value("${spring.datasource.default.jdbc-url:jdbc:sqlite:./db/secretpad.sqlite}")
     private String databaseUrl;
@@ -161,23 +167,57 @@ public class DataSandboxMvpService {
                 if ("EXPIRED".equals(status) || "DESTROYED".equals(status)) {
                     throw new IllegalStateException("已过期或销毁的沙箱不能启动");
                 }
+                if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.START)) {
+                    throw new IllegalStateException("当前状态不允许启动: " + status);
+                }
+                // 先落库启动意图（STARTING + intent=START）再请求 Kuscia 创建真实 Job；
+                // 成功保持 STARTING，由 syncKusciaStatuses 确认 Job RUNNING 后推进为 RUNNING；
+                // 失败置 ERROR——禁止将未创建容器的记录标记为运行中。
+                jdbc.update("update ds_sandbox set status='STARTING',intent='START',last_error='',updated_at=? where id=?", now(), id);
                 error = startKuscia(sandbox);
-                jdbc.update("update ds_sandbox set status=?,last_error=?,updated_at=? where id=?", error.isEmpty() ? "RUNNING" : "ERROR", error, now(), id);
+                if (!error.isEmpty()) {
+                    jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                }
             }
             case "STOP" -> {
+                if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.STOP)) {
+                    throw new IllegalStateException("当前状态不允许停止: " + status);
+                }
+                // 先落库停止意图（STOPPING + intent=STOP），由 sync 在 Kuscia Job 终态后置 STOPPED；
+                // 停止失败置 ERROR，不假 STOPPED。
+                jdbc.update("update ds_sandbox set status='STOPPING',intent='STOP',updated_at=? where id=?", now(), id);
                 error = stopKuscia(sandbox, "Stopped from Data Sandbox console");
-                jdbc.update("update ds_sandbox set status='STOPPED',last_error=?,updated_at=? where id=?", error, now(), id);
+                if (!error.isEmpty()) {
+                    jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                } else if (!notBlank(string(sandbox.get("kuscia_job_id")))) {
+                    // 无真实 Kuscia Job（运行时未启用或从未成功创建）：本地直接完成，
+                    // 避免卡在 STOPPING（sync 只处理带 job 的记录）
+                    jdbc.update("update ds_sandbox set status='STOPPED',intent='',updated_at=? where id=?", now(), id);
+                }
             }
             case "DESTROY" -> {
+                if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.DESTROY)) {
+                    throw new IllegalStateException("当前状态不允许销毁: " + status);
+                }
                 error = deleteKuscia(sandbox);
-                jdbc.update("update ds_sandbox set status='DESTROYED',deleted=1,last_error=?,updated_at=? where id=?", error, now(), id);
+                if (error.isEmpty()) {
+                    jdbc.update("update ds_sandbox set status='DESTROYED',deleted=1,intent='',last_error='',updated_at=? where id=?", now(), id);
+                } else {
+                    // 销毁失败保留记录并置 ERROR（不 throw，避免事务回滚丢失错误状态）
+                    jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                }
             }
             case "RENEW" -> {
                 int days = Math.max(1, Math.min(nonNegativeInt(request, "days", 7), 365));
                 jdbc.update("update ds_sandbox set expires_at=?,status=case when status='EXPIRED' then 'STOPPED' else status end,updated_at=? where id=?",
                         LocalDateTime.now().plusDays(days).toString(), now(), id);
             }
-            case "SNAPSHOT" -> createSnapshot(sandbox);
+            case "SNAPSHOT" -> {
+                if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.SNAPSHOT)) {
+                    throw new IllegalStateException("当前状态不允许快照: " + status);
+                }
+                createSnapshot(sandbox);
+            }
             default -> throw new IllegalArgumentException("不支持的沙箱操作: " + action);
         }
         audit("OPERATION", "SANDBOX_" + action, "SANDBOX", id, error, error.isEmpty());
@@ -187,6 +227,83 @@ public class DataSandboxMvpService {
 
     public Map<String, Object> sandbox(String id) {
         return requireRow("select s.*, i.name image_name, i.image_ref, i.kuscia_app_image from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.id=?", id);
+    }
+
+    /* ------------------------------- Dev endpoint ------------------------------- */
+
+    /**
+     * 为运行中的沙箱签发一次性开发端点 token（DB 只存 sha256，明文仅本次返回），
+     * 返回同域跳板 URL。每次进入重置有效期（默认 30 分钟）。
+     */
+    public Map<String, Object> generateDevToken(String sandboxId) {
+        Map<String, Object> sandbox = sandbox(sandboxId);
+        requireOwner(sandbox);
+        if (!"RUNNING".equals(string(sandbox.get("status")))) {
+            throw new IllegalStateException("沙箱未运行，无法进入开发环境（当前状态: " + string(sandbox.get("status")) + "）");
+        }
+        if (!notBlank(string(sandbox.get("endpoint")))) {
+            throw new IllegalStateException("沙箱开发端点尚未就绪，请稍后重试");
+        }
+        byte[] raw = new byte[16];
+        new java.security.SecureRandom().nextBytes(raw);
+        String token = java.util.HexFormat.of().formatHex(raw);
+        String expiresAt = LocalDateTime.now().plusMinutes(Math.max(1, devTokenTtlMinutes)).truncatedTo(ChronoUnit.SECONDS).toString();
+        jdbc.update("update ds_sandbox set endpoint_token=?,endpoint_token_expires_at=?,endpoint_updated_at=?,updated_at=? where id=?",
+                sha256(token.getBytes(StandardCharsets.UTF_8)), expiresAt, now(), now(), sandboxId);
+        audit("AUDIT", "DEV_TOKEN_ISSUE", "SANDBOX", sandboxId, "ttl=" + devTokenTtlMinutes + "m", true);
+        return Map.of("url", "/api/v1alpha1/data-sandbox/proxy/" + sandboxId + "?token=" + token, "expiresAt", expiresAt);
+    }
+
+    /**
+     * 校验开发端点访问凭证（恒时比较 + 未过期 + 沙箱 RUNNING），供跳板鉴权使用。
+     * 失败抛 AuthErrorCode.AUTH_FAILED，由全局异常处理器返回明确业务错误码。
+     */
+    public void validateDevToken(String sandboxId, String token) {
+        if (!notBlank(token)) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "缺少开发端点访问凭证，请重新进入开发环境");
+        }
+        Map<String, Object> sandbox = requireRow("select id,status,owner_id,endpoint,endpoint_token,endpoint_token_expires_at from ds_sandbox where id=? and deleted=0", sandboxId);
+        byte[] expected = string(sandbox.get("endpoint_token")).getBytes(StandardCharsets.UTF_8);
+        byte[] actual = sha256(token.getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+        if (!MessageDigest.isEqual(expected, actual)) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "开发端点访问凭证无效或已失效，请重新进入开发环境");
+        }
+        String expiresAt = string(sandbox.get("endpoint_token_expires_at"));
+        if (notBlank(expiresAt)) {
+            try {
+                if (LocalDateTime.parse(expiresAt).isBefore(LocalDateTime.now())) {
+                    throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "开发端点访问凭证已过期，请重新进入开发环境");
+                }
+            } catch (java.time.format.DateTimeParseException e) {
+                throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "开发端点访问凭证已失效，请重新进入开发环境");
+            }
+        }
+        if (!"RUNNING".equals(string(sandbox.get("status")))) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED,
+                    "沙箱未运行，开发环境不可访问（当前状态: " + string(sandbox.get("status")) + "）");
+        }
+        auditAs("AUDIT", "INFO", "dev-proxy:" + sandboxId, "DEV_ENDPOINT_ACCESS", "SANDBOX", sandboxId, "", true);
+    }
+
+    /**
+     * 跳板转发目标（token 已在拦截器校验通过）：仅允许 DB 中的 endpoint 值，防 SSRF。
+     */
+    public String proxyTarget(String sandboxId) {
+        Map<String, Object> sandbox = requireRow("select endpoint from ds_sandbox where id=? and deleted=0", sandboxId);
+        String endpoint = string(sandbox.get("endpoint"));
+        if (!notBlank(endpoint)) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点尚未就绪，请稍后重试");
+        }
+        return endpoint;
+    }
+
+    /** 仅沙箱 owner 或平台管理员（center admin）可进入开发环境。 */
+    private void requireOwner(Map<String, Object> sandbox) {
+        UserContextDTO user = UserContext.getUserOrNotExist();
+        boolean admin = user != null && "kuscia-system".equals(user.getOwnerId()) && "admin".equals(user.getName());
+        if (user == null || (!admin && !Objects.equals(user.getOwnerId(), string(sandbox.get("owner_id"))))) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权访问该沙箱的开发环境");
+        }
     }
 
     public List<Map<String, Object>> listSnapshots(String sandboxId) {
@@ -631,24 +748,68 @@ public class DataSandboxMvpService {
     @Scheduled(fixedDelayString = "${secretpad.data-sandbox.status-sync-ms:30000}")
     public void syncKusciaStatuses() {
         if (!kusciaEnabled) return;
-        for (Map<String, Object> item : jdbc.queryForList("select id,kuscia_job_id from ds_sandbox where deleted=0 and kuscia_job_id<>''")) {
+        // 只同步带真实 Kuscia Job 的沙箱；结合本地状态与意图做受保护映射，禁止无条件覆盖本地状态
+        for (Map<String, Object> item : jdbc.queryForList(
+                "select s.id,kuscia_job_id,s.status status,intent,i.dev_port_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0 and s.kuscia_job_id<>''")) {
             try {
                 Job.QueryJobResponse response = kuscia.queryJob(Job.QueryJobRequest.newBuilder().setJobId(string(item.get("kuscia_job_id"))).build());
-                if (response.getStatus().getCode() == 0) {
-                    String state = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
-                    String mapped = switch (state) {
-                        case "PENDING", "AWAITINGAPPROVAL" -> "STARTING";
-                        case "RUNNING" -> "RUNNING";
-                        case "SUCCEEDED", "SUSPENDED", "CANCELLED" -> "STOPPED";
-                        default -> state.contains("FAIL") || state.contains("REJECT") ? "ERROR" : "STARTING";
-                    };
-                    jdbc.update("update ds_sandbox set status=?,last_error=?,updated_at=? where id=?", mapped,
-                            response.getData().getStatus().getErrMsg(), now(), item.get("id"));
+                if (response.getStatus().getCode() != 0) {
+                    // Job 已不存在（如被外部删除）：记录原始状态但不改写本地状态，交由用户操作处理
+                    jdbc.update("update ds_sandbox set kuscia_job_state=?,updated_at=? where id=?", "DELETED", now(), item.get("id"));
+                    log.warn("Kuscia Job {} for sandbox {} no longer exists: {}", item.get("kuscia_job_id"), item.get("id"), response.getStatus().getMessage());
+                    continue;
                 }
+                String state = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+                SandboxStatusMachine.Decision decision = SandboxStatusMachine.mapKusciaState(state,
+                        string(item.get("status")), string(item.get("intent")));
+                String target = decision.targetStatus();
+                if (target == null) {
+                    // 无状态变化也刷新 Kuscia 原始状态与时间，便于排障
+                    jdbc.update("update ds_sandbox set kuscia_job_state=?,updated_at=? where id=?", state, now(), item.get("id"));
+                    continue;
+                }
+                List<Object> args = new ArrayList<>();
+                StringBuilder sql = new StringBuilder("update ds_sandbox set status=?,intent=?,last_error=?,kuscia_job_state=?,updated_at=?");
+                args.add(target);
+                args.add(decision.clearIntent() ? "" : string(item.get("intent")));
+                args.add(decision.lastError() == null ? "" : decision.lastError());
+                args.add(state);
+                args.add(now());
+                if (target.equals("RUNNING")) {
+                    String endpoint = extractEndpoint(response, string(item.get("dev_port_name")));
+                    if (!endpoint.isEmpty()) {
+                        sql.append(",endpoint=?,endpoint_updated_at=?");
+                        args.add(endpoint);
+                        args.add(now());
+                    }
+                }
+                sql.append(" where id=?");
+                args.add(item.get("id"));
+                jdbc.update(sql.toString(), args.toArray());
             } catch (Exception e) {
                 log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
             }
         }
+    }
+
+    /**
+     * 从 Kuscia Job 状态中提取开发端点：取镜像端口名匹配且 scope=Cluster 的 endpoint
+     * （scope=Cluster 的端口由 Kuscia 分配集群外可达地址，可用于开发环境访问）。
+     */
+    private String extractEndpoint(Job.QueryJobResponse response, String portName) {
+        if (portName == null || portName.isBlank()) {
+            portName = "web";
+        }
+        for (Job.TaskStatus task : response.getData().getStatus().getTasksList()) {
+            for (Job.PartyStatus party : task.getPartiesList()) {
+                for (Job.JobPartyEndpoint endpoint : party.getEndpointsList()) {
+                    if (portName.equals(endpoint.getPortName()) && "Cluster".equalsIgnoreCase(endpoint.getScope())) {
+                        return endpoint.getEndpoint();
+                    }
+                }
+            }
+        }
+        return "";
     }
 
     @Scheduled(cron = "0 * * * * *")
@@ -656,9 +817,15 @@ public class DataSandboxMvpService {
     public void expireSandboxesAndCheckAlerts() {
         List<Map<String, Object>> expired = jdbc.queryForList("select * from ds_sandbox where deleted=0 and status not in ('EXPIRED','DESTROYED') and expires_at<?", now());
         for (Map<String, Object> sandbox : expired) {
-            stopKuscia(sandbox, "Sandbox expired");
-            jdbc.update("update ds_sandbox set status='EXPIRED',updated_at=? where id=?", now(), sandbox.get("id"));
-            auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRED", "SANDBOX", string(sandbox.get("id")), "", true);
+            // 到期先真实停止 Kuscia Job，成功才置 EXPIRED；停止失败置 ERROR 并记录原因，不假 EXPIRED
+            String error = stopKuscia(sandbox, "Sandbox expired");
+            if (error.isEmpty()) {
+                jdbc.update("update ds_sandbox set status='EXPIRED',intent='',last_error='',updated_at=? where id=?", now(), sandbox.get("id"));
+                auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRED", "SANDBOX", string(sandbox.get("id")), "", true);
+            } else {
+                jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", truncate(error, 900), now(), sandbox.get("id"));
+                auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRE_FAILED", "SANDBOX", string(sandbox.get("id")), error, false);
+            }
         }
         Map<String, Double> used = usage(null);
         for (Map<String, Object> pool : jdbc.queryForList("select * from ds_resource_pool where enabled=1")) {
@@ -685,7 +852,10 @@ public class DataSandboxMvpService {
     /* ------------------------------- Internal helpers ------------------------------- */
 
     private String startKuscia(Map<String, Object> sandbox) {
-        if (!kusciaEnabled) return "";
+        if (!kusciaEnabled) {
+            // 运行时未启用时禁止“假 RUNNING”：返回明确错误，由调用方将状态置为 ERROR
+            return "Kuscia 运行时未启用（secretpad.data-sandbox.kuscia.enabled=false），请启用后重试";
+        }
         try {
             String existing = string(sandbox.get("kuscia_job_id"));
             if (notBlank(existing)) {

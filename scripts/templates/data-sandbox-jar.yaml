@@ -1,0 +1,41 @@
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jar
+spec:
+  deployTemplates:
+    - name: jar
+      replicas: 1
+      spec:
+        containers:
+          - command:
+              - sh
+              - -c
+              - exec java -jar ${APP_JAR:-/app/app.jar}
+            name: jar
+            # 与 ds_sandbox_image.dev_port_name='app' 对应：scope=Cluster 端口由 Kuscia
+            # 分配集群外可达地址并回填 endpoints，供开发端点跳板访问。
+            ports:
+              - name: app
+                port: 8080
+                protocol: HTTP
+                scope: Cluster
+            # JAR 应用的就绪路径未知，仅做端口级探测
+            readinessProbe:
+              tcpSocket:
+                port: app
+            livenessProbe:
+              tcpSocket:
+                port: app
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: app
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+  image:
+    id: 0
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

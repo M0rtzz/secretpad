@@ -17,6 +17,8 @@
 package org.secretflow.secretpad.kuscia.v1alpha1.mock.service;
 
 import io.grpc.stub.StreamObserver;
+import org.secretflow.secretpad.kuscia.v1alpha1.constant.KusciaAPIConstants;
+import org.secretflow.v1alpha1.common.Common;
 import org.secretflow.v1alpha1.kusciaapi.Job;
 import org.secretflow.v1alpha1.kusciaapi.JobServiceGrpc;
 
@@ -26,17 +28,57 @@ import org.secretflow.v1alpha1.kusciaapi.JobServiceGrpc;
  */
 public class JobService extends JobServiceGrpc.JobServiceImplBase implements CommonService {
 
+    /**
+     * Test-only configurable state. Defaults keep the historical behaviour (all calls succeed);
+     * integration tests set these fields before driving a scenario.
+     */
+    public static final class State {
+        public static volatile int createJobCode = KusciaAPIConstants.OK;
+        public static volatile String createJobMessage = "success";
+        public static volatile int jobQueryCode = KusciaAPIConstants.OK;
+        public static volatile String jobState = "RUNNING";
+        public static volatile String jobErrMsg = "";
+        public static volatile boolean withEndpoints = false;
+        public static volatile String endpointPortName = "web";
+        public static volatile String endpointScope = "Cluster";
+        public static volatile String endpointAddress = "10.0.0.1:31234";
+        public static volatile int stopJobCode = KusciaAPIConstants.OK;
+        public static volatile String stopJobMessage = "success";
+        public static volatile int deleteJobCode = KusciaAPIConstants.OK;
+        public static volatile String deleteJobMessage = "success";
+    }
+
+    private Common.Status status(int code, String message) {
+        return Common.Status.newBuilder().setCode(code).setMessage(message).build();
+    }
+
+    private Job.QueryJobResponseData queryData() {
+        Job.TaskStatus.Builder task = Job.TaskStatus.newBuilder().setTaskId("data-sandbox-task").setState(State.jobState);
+        Job.PartyStatus.Builder party = Job.PartyStatus.newBuilder().setDomainId("kuscia-system").setState(State.jobState).setErrMsg(State.jobErrMsg);
+        if (State.withEndpoints) {
+            party.addEndpoints(Job.JobPartyEndpoint.newBuilder()
+                    .setPortName(State.endpointPortName).setScope(State.endpointScope).setEndpoint(State.endpointAddress));
+        }
+        Job.JobStatusDetail status = Job.JobStatusDetail.newBuilder().setState(State.jobState).setErrMsg(State.jobErrMsg)
+                .addTasks(task.addParties(party)).build();
+        return Job.QueryJobResponseData.newBuilder().setJobId("ds-test").setStatus(status).build();
+    }
 
     @Override
     public void queryJob(Job.QueryJobRequest request, StreamObserver<Job.QueryJobResponse> responseObserver) {
-        Job.QueryJobResponse resp = Job.QueryJobResponse.newBuilder().setStatus(getStatus()).build();
+        Job.QueryJobResponse resp;
+        if (State.jobQueryCode == KusciaAPIConstants.OK) {
+            resp = Job.QueryJobResponse.newBuilder().setStatus(getStatus()).setData(queryData()).build();
+        } else {
+            resp = Job.QueryJobResponse.newBuilder().setStatus(status(State.jobQueryCode, "job not found")).build();
+        }
         responseObserver.onNext(resp);
         responseObserver.onCompleted();
     }
 
     @Override
     public void createJob(Job.CreateJobRequest request, StreamObserver<Job.CreateJobResponse> responseObserver) {
-        Job.CreateJobResponse resp = Job.CreateJobResponse.newBuilder().setStatus(getStatus()).build();
+        Job.CreateJobResponse resp = Job.CreateJobResponse.newBuilder().setStatus(status(State.createJobCode, State.createJobMessage)).build();
         responseObserver.onNext(resp);
         responseObserver.onCompleted();
     }
@@ -50,7 +92,14 @@ public class JobService extends JobServiceGrpc.JobServiceImplBase implements Com
 
     @Override
     public void stopJob(Job.StopJobRequest request, StreamObserver<Job.StopJobResponse> responseObserver) {
-        Job.StopJobResponse resp = Job.StopJobResponse.newBuilder().setStatus(getStatus()).build();
+        Job.StopJobResponse resp = Job.StopJobResponse.newBuilder().setStatus(status(State.stopJobCode, State.stopJobMessage)).build();
+        responseObserver.onNext(resp);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void deleteJob(Job.DeleteJobRequest request, StreamObserver<Job.DeleteJobResponse> responseObserver) {
+        Job.DeleteJobResponse resp = Job.DeleteJobResponse.newBuilder().setStatus(status(State.deleteJobCode, State.deleteJobMessage)).build();
         responseObserver.onNext(resp);
         responseObserver.onCompleted();
     }

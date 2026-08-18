@@ -190,6 +190,11 @@ secretpad:
     snapshot-root: ${DATA_SANDBOX_SNAPSHOT_ROOT:/nas/Misc/data-sandbox/snapshots}
     backup-root: ${DATA_SANDBOX_BACKUP_ROOT:/nas/Misc/data-sandbox/backups}
     status-sync-ms: ${DATA_SANDBOX_STATUS_SYNC_MS:30000}
+    dev-endpoint:
+      # 开发端点一次性 token 有效期（分钟），每次进入重置
+      token-ttl-minutes: ${DATA_SANDBOX_DEV_TOKEN_TTL:30}
+      # 开发端点跳板转发超时（秒）
+      proxy-timeout-seconds: ${DATA_SANDBOX_PROXY_TIMEOUT:30}
   datasync:
     center: true
     p2p: false

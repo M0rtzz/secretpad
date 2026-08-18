@@ -136,6 +136,11 @@ public class LoginInterceptor implements HandlerInterceptor {
      */
     @Override
     public boolean preHandle(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response, @NotNull Object handler) {
+        // 开发端点跳板：安全关键路径，独立于 auth.enabled 强制校验一次性 token
+        if (request.getRequestURI().startsWith("/api/v1alpha1/data-sandbox/proxy/")) {
+            processByDevEndpointToken(request);
+            return true;
+        }
         if (!enable) {
             UserContextDTO admin = createTmpUserForPlatformType(envService.getPlatformType());
             UserContext.setBaseUser(admin);
@@ -155,6 +160,25 @@ public class LoginInterceptor implements HandlerInterceptor {
         return true;
     }
 
+
+    /**
+     * 开发端点跳板鉴权：/proxy/{sandboxId}?token=... 使用一次性 token（DB sha256 比对、
+     * 未过期、沙箱 RUNNING），通过后构造虚拟用户供审计使用。失败抛 AUTH_FAILED，
+     * 由全局异常处理器返回明确业务错误。
+     */
+    private void processByDevEndpointToken(HttpServletRequest request) {
+        String[] segments = request.getRequestURI().split("/");
+        String sandboxId = segments.length >= 6 ? segments[5] : "";
+        dataSandboxMvpService.validateDevToken(sandboxId, request.getParameter("token"));
+        UserContextDTO devUser = new UserContextDTO();
+        devUser.setName("dev-proxy:" + sandboxId);
+        devUser.setOwnerId(sandboxId);
+        devUser.setOwnerType(UserOwnerTypeEnum.CENTER);
+        devUser.setPlatformType(PlatformTypeEnum.CENTER);
+        devUser.setPlatformNodeId(envService.getPlatformNodeId());
+        devUser.setDeployMode(deployMode);
+        UserContext.setBaseUser(devUser);
+    }
 
     private void processByNodeRpcRequest(HttpServletRequest request) {
         String sourceNodeId = request.getHeader("kuscia-origin-source");
