@@ -46,6 +46,8 @@ public class JobService extends JobServiceGrpc.JobServiceImplBase implements Com
         public static volatile String stopJobMessage = "success";
         public static volatile int deleteJobCode = KusciaAPIConstants.OK;
         public static volatile String deleteJobMessage = "success";
+        /** 最近一次 createJob 请求原文（Z-02 网络隔离断言 -nonet 变体使用）。 */
+        public static volatile Job.CreateJobRequest lastCreateJobRequest = null;
     }
 
     private Common.Status status(int code, String message) {
@@ -78,6 +80,7 @@ public class JobService extends JobServiceGrpc.JobServiceImplBase implements Com
 
     @Override
     public void createJob(Job.CreateJobRequest request, StreamObserver<Job.CreateJobResponse> responseObserver) {
+        State.lastCreateJobRequest = request;
         Job.CreateJobResponse resp = Job.CreateJobResponse.newBuilder().setStatus(status(State.createJobCode, State.createJobMessage)).build();
         responseObserver.onNext(resp);
         responseObserver.onCompleted();

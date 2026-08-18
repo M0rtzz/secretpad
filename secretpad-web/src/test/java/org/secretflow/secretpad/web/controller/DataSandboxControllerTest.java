@@ -107,6 +107,9 @@ public class DataSandboxControllerTest {
     public void reset() {
         jdbc.update("delete from ds_sandbox");
         jdbc.update("delete from ds_sandbox_snapshot");
+        // Z-02：生命周期感知用量统计下，跨用例残留的分配行会累积占用配额，必须一并复位
+        jdbc.update("delete from ds_resource_allocation");
+        jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at=''");
         // TokensDO 走 @SQLDelete 软删除（is_deleted=1），deleteAll 不会真正移除行，同 PK 再插入会冲突，用 JDBC 硬删
         jdbc.update("delete from user_tokens");
         // 平台管理员（ownerId=kuscia-system + name=admin 判定）与普通用户 bob
@@ -134,9 +137,13 @@ public class DataSandboxControllerTest {
     /* ------------------------------- helpers ------------------------------- */
 
     private String createSandbox() {
+        return createSandbox("INTERNAL_ONLY");
+    }
+
+    private String createSandbox(String networkPolicy) {
         Map<String, Object> created = service.createSandbox(Map.of(
                 "name", "ctrl-sandbox", "ownerId", "alice", "imageId", "img-secretflow",
-                "networkPolicy", "INTERNAL_ONLY", "cpuCores", 1, "memoryGb", 2, "gpuCount", 0,
+                "networkPolicy", networkPolicy, "cpuCores", 1, "memoryGb", 2, "gpuCount", 0,
                 "storageGb", 10, "validDays", 7));
         return String.valueOf(created.get("id"));
     }
@@ -282,5 +289,71 @@ public class DataSandboxControllerTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    /* ------------------------------- Z-02 网络白名单 / 限制校验 ------------------------------- */
+
+    @Test
+    public void noNetworkRejectsDevTokenAtHttpLayer() throws Exception {
+        String id = createSandbox("NO_NETWORK");
+        setRunning(id, "10.0.0.1:31234");
+        JsonNode body = postDevToken(id, ADMIN_TOKEN);
+        assertEquals(SystemErrorCode.UNKNOWN_ERROR.getCode(), body.path("status").path("code").asInt());
+        assertTrue(body.path("status").path("msg").asText().contains("NO_NETWORK"), body.toString());
+    }
+
+    @Test
+    public void allowlistCrudThroughHttp() throws Exception {
+        String id = createSandbox();
+        // 新增（auth.enabled=true，需带登录 token）
+        MockHttpServletResponse add = mockMvc.perform(post("/api/v1alpha1/data-sandbox/resources/network/allowlist")
+                        .header("User-Token", ADMIN_TOKEN)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content("{\"sandboxId\":\"" + id + "\",\"host\":\"db.internal\",\"port\":5432,\"proto\":\"tcp\",\"remark\":\"训练库\"}"))
+                .andReturn().getResponse();
+        assertEquals(200, add.getStatus());
+        JsonNode addBody = objectMapper.readTree(add.getContentAsString());
+        assertEquals(0, addBody.path("status").path("code").asInt(), addBody.toString());
+        String entryId = addBody.path("data").path("id").asText();
+        assertTrue(entryId.startsWith("al-"), entryId);
+
+        // 列表
+        MockHttpServletResponse list = mockMvc.perform(get("/api/v1alpha1/data-sandbox/resources/network/allowlist")
+                        .header("User-Token", ADMIN_TOKEN)
+                        .param("sandboxId", id))
+                .andReturn().getResponse();
+        JsonNode listBody = objectMapper.readTree(list.getContentAsString());
+        assertEquals(1, listBody.path("data").size());
+
+        // 删除
+        MockHttpServletResponse del = mockMvc.perform(post("/api/v1alpha1/data-sandbox/resources/network/allowlist/delete")
+                        .header("User-Token", ADMIN_TOKEN)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content("{\"id\":\"" + entryId + "\"}"))
+                .andReturn().getResponse();
+        JsonNode delBody = objectMapper.readTree(del.getContentAsString());
+        assertEquals(0, delBody.path("status").path("code").asInt(), delBody.toString());
+        MockHttpServletResponse after = mockMvc.perform(get("/api/v1alpha1/data-sandbox/resources/network/allowlist")
+                        .header("User-Token", ADMIN_TOKEN)
+                        .param("sandboxId", id))
+                .andReturn().getResponse();
+        assertEquals(0, objectMapper.readTree(after.getContentAsString()).path("data").size());
+    }
+
+    @Test
+    public void limitVerifyReturnsExpectedAndInstructions() throws Exception {
+        String id = createSandbox();
+        MockHttpServletResponse response = mockMvc.perform(post("/api/v1alpha1/data-sandbox/operations/limit-verify")
+                        .header("User-Token", ADMIN_TOKEN)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content("{\"sandboxId\":\"" + id + "\"}"))
+                .andReturn().getResponse();
+        assertEquals(200, response.getStatus());
+        JsonNode body = objectMapper.readTree(response.getContentAsString());
+        assertEquals(0, body.path("status").path("code").asInt(), body.toString());
+        assertEquals(id, body.path("data").path("sandboxId").asText());
+        assertEquals(1, body.path("data").path("expected").path("cpu").asInt());
+        assertEquals(2, body.path("data").path("expected").path("memory_gb").asInt());
+        assertTrue(body.path("data").path("instructions").asText().contains("verify-limits.sh"));
     }
 }

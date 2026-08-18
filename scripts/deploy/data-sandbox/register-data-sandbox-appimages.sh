@@ -53,6 +53,10 @@ fi
 apply_appimage "data-sandbox-jupyter"    "data-sandbox-jupyter.yaml"    "${DATA_SANDBOX_JUPYTER_IMAGE}"
 apply_appimage "data-sandbox-jar"        "data-sandbox-jar.yaml"        "${DATA_SANDBOX_JAR_IMAGE}"
 apply_appimage "data-sandbox-secretflow" "data-sandbox-secretflow.yaml" "${DATA_SANDBOX_SECRETFLOW_IMAGE}"
+# Z-02 NO_NETWORK 隔离变体：无 scope=Cluster 端口，Kuscia 不分配集群外可达端点
+apply_appimage "data-sandbox-jupyter-nonet"    "data-sandbox-jupyter-nonet.yaml"    "${DATA_SANDBOX_JUPYTER_IMAGE}"
+apply_appimage "data-sandbox-jar-nonet"        "data-sandbox-jar-nonet.yaml"        "${DATA_SANDBOX_JAR_IMAGE}"
+apply_appimage "data-sandbox-secretflow-nonet" "data-sandbox-secretflow-nonet.yaml" "${DATA_SANDBOX_SECRETFLOW_IMAGE}"
 
-log "all three data-sandbox AppImages registered; verify with:"
+log "all six data-sandbox AppImages registered (3 正常 + 3 -nonet 隔离变体); verify with:"
 log "  docker exec ${KUSCIA_MASTER_CTR} kubectl get appimage"

@@ -246,6 +246,10 @@ public class DataSandboxMvpService {
     public Map<String, Object> generateDevToken(String sandboxId) {
         Map<String, Object> sandbox = sandbox(sandboxId);
         requireOwner(sandbox);
+        // Z-02 网络隔离：NO_NETWORK 沙箱不暴露任何集群外端点，开发跳板一并拒绝
+        if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
+            throw new IllegalStateException("NO_NETWORK 沙箱不提供开发端点");
+        }
         if (!"RUNNING".equals(string(sandbox.get("status")))) {
             throw new IllegalStateException("沙箱未运行，无法进入开发环境（当前状态: " + string(sandbox.get("status")) + "）");
         }
@@ -270,7 +274,11 @@ public class DataSandboxMvpService {
         if (!notBlank(token)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "缺少开发端点访问凭证，请重新进入开发环境");
         }
-        Map<String, Object> sandbox = requireRow("select id,status,owner_id,endpoint,endpoint_token,endpoint_token_expires_at from ds_sandbox where id=? and deleted=0", sandboxId);
+        Map<String, Object> sandbox = requireRow("select id,status,owner_id,endpoint,network_policy,endpoint_token,endpoint_token_expires_at from ds_sandbox where id=? and deleted=0", sandboxId);
+        // Z-02 网络隔离纵深防御：NO_NETWORK 即使伪造 token 也拒绝
+        if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "NO_NETWORK 沙箱不提供开发端点");
+        }
         byte[] expected = string(sandbox.get("endpoint_token")).getBytes(StandardCharsets.UTF_8);
         byte[] actual = sha256(token.getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
         if (!MessageDigest.isEqual(expected, actual)) {
@@ -297,7 +305,11 @@ public class DataSandboxMvpService {
      * 跳板转发目标（token 已在拦截器校验通过）：仅允许 DB 中的 endpoint 值，防 SSRF。
      */
     public String proxyTarget(String sandboxId) {
-        Map<String, Object> sandbox = requireRow("select endpoint from ds_sandbox where id=? and deleted=0", sandboxId);
+        Map<String, Object> sandbox = requireRow("select endpoint,network_policy from ds_sandbox where id=? and deleted=0", sandboxId);
+        // Z-02 网络隔离纵深防御：NO_NETWORK 沙箱无集群外端点，拒绝转发
+        if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "NO_NETWORK 沙箱不提供开发端点");
+        }
         String endpoint = string(sandbox.get("endpoint"));
         if (!notBlank(endpoint)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点尚未就绪，请稍后重试");
@@ -406,6 +418,39 @@ public class DataSandboxMvpService {
     public void resolveAlert(String id) {
         jdbc.update("update ds_alert_event set status='RESOLVED',resolved_at=? where id=?", now(), id);
         audit("OPERATION", "ALERT_RESOLVE", "ALERT", id, "", true);
+    }
+
+    /* ------------------------------- Network allowlist (Z-02) ------------------------------- */
+
+    public List<Map<String, Object>> listNetworkAllowlist(String sandboxId) {
+        if (notBlank(sandboxId)) {
+            return jdbc.queryForList("select * from ds_network_allowlist where sandbox_id=? order by created_at desc", sandboxId);
+        }
+        return jdbc.queryForList("select * from ds_network_allowlist order by created_at desc limit 500");
+    }
+
+    @Transactional
+    public Map<String, Object> addNetworkAllowlist(Map<String, Object> request) {
+        String sandboxId = required(request, "sandboxId");
+        String host = required(request, "host").trim().toLowerCase(Locale.ROOT);
+        int port = (int) number(request.get("port"), 0);
+        String proto = value(request, "proto", "tcp").trim().toLowerCase(Locale.ROOT);
+        if (port <= 0 || port > 65535) throw new IllegalArgumentException("port 必须为 1-65535");
+        if (!Set.of("tcp", "udp").contains(proto)) throw new IllegalArgumentException("proto 仅支持 tcp/udp");
+        String id = "al-" + shortId();
+        jdbc.update("insert into ds_network_allowlist(id,sandbox_id,host,port,proto,remark,created_by,created_at) values(?,?,?,?,?,?,?,?)",
+                id, sandboxId, host, port, proto, value(request, "remark", ""), actor(), now());
+        audit("OPERATION", "NETWORK_ALLOWLIST_ADD", "NETWORK_ALLOWLIST", sandboxId, host + ":" + port + "/" + proto, true);
+        return requireRow("select * from ds_network_allowlist where id=?", id);
+    }
+
+    @Transactional
+    public void deleteNetworkAllowlist(String id) {
+        if (count("select count(1) from ds_network_allowlist where id=?", id) == 0) {
+            throw new IllegalArgumentException("白名单记录不存在: " + id);
+        }
+        jdbc.update("delete from ds_network_allowlist where id=?", id);
+        audit("OPERATION", "NETWORK_ALLOWLIST_DELETE", "NETWORK_ALLOWLIST", id, "", true);
     }
 
     /* ------------------------------- Model approval ------------------------------- */
@@ -930,6 +975,11 @@ public class DataSandboxMvpService {
             }
             String appImage = string(sandbox.get("kuscia_app_image"));
             if (!notBlank(appImage)) return "环境镜像未配置 Kuscia AppImage 名称";
+            // Z-02 网络隔离：NO_NETWORK 使用 -nonet 变体（无 scope=Cluster 端口，Kuscia 不分配集群外端点）
+            String networkPolicy = string(sandbox.get("network_policy"));
+            if ("NO_NETWORK".equals(networkPolicy) && !appImage.endsWith("-nonet")) {
+                appImage = appImage + "-nonet";
+            }
             String jobId = ("ds-" + string(sandbox.get("id"))).replace("_", "-").toLowerCase(Locale.ROOT);
             Job.Party party = Job.Party.newBuilder().setDomainId(nodeId).setRole("server")
                     .setResources(Job.JobResource.newBuilder().setCpu(String.valueOf(sandbox.get("cpu_cores"))).setMemory(sandbox.get("memory_gb") + "Gi")).build();

@@ -107,6 +107,26 @@ public class DataSandboxController {
         return SecretPadResponse.success();
     }
 
+    @Operation(summary = "网络白名单列表（ALLOW_LIST 策略放行登记）")
+    @GetMapping("/resources/network/allowlist")
+    public SecretPadResponse<List<Map<String, Object>>> networkAllowlist(
+            @RequestParam(defaultValue = "") String sandboxId) {
+        return SecretPadResponse.success(service.listNetworkAllowlist(sandboxId));
+    }
+
+    @Operation(summary = "新增网络白名单条目")
+    @PostMapping("/resources/network/allowlist")
+    public SecretPadResponse<Map<String, Object>> addNetworkAllowlist(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.addNetworkAllowlist(request));
+    }
+
+    @Operation(summary = "删除网络白名单条目")
+    @PostMapping("/resources/network/allowlist/delete")
+    public SecretPadResponse<Void> deleteNetworkAllowlist(@RequestBody Map<String, Object> request) {
+        service.deleteNetworkAllowlist(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
     @Operation(summary = "模型审批列表")
     @GetMapping("/models")
     public SecretPadResponse<List<Map<String, Object>>> approvals(
