@@ -229,6 +229,12 @@ public class DataSandboxController {
         return SecretPadResponse.success(service.diagnostics());
     }
 
+    @Operation(summary = "沙箱资源限制生效校验（期望值 + 运维核对指引）")
+    @PostMapping("/operations/limit-verify")
+    public SecretPadResponse<Map<String, Object>> limitVerify(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.limitVerify(String.valueOf(request.get("sandboxId"))));
+    }
+
     @GetMapping("/operations/help")
     public SecretPadResponse<List<Map<String, Object>>> help() {
         return SecretPadResponse.success(service.helpArticles());

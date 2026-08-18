@@ -96,6 +96,9 @@ public class DataSandboxKusciaIT {
         // 每个用例前清理沙箱数据、重置 mock 状态、设置会话用户
         jdbc.update("delete from ds_sandbox");
         jdbc.update("delete from ds_sandbox_snapshot");
+        // Z-02：资源分配与 GPU 台账一并复位，避免跨用例残留占用
+        jdbc.update("delete from ds_resource_allocation");
+        jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at=''");
         JobService.State.createJobCode = KusciaAPIConstants.OK;
         JobService.State.createJobMessage = "success";
         JobService.State.jobQueryCode = KusciaAPIConstants.OK;

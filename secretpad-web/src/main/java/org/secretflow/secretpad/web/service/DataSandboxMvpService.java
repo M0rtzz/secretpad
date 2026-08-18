@@ -151,6 +151,10 @@ public class DataSandboxMvpService {
                 LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
                 actor(), now, now);
         audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);
+        // Z-02：创建即按规格预占资源（RESERVED），占住容量直到绑定或释放
+        Map<String, Object> created = sandbox(id);
+        reserveAllocations(created);
+        appendRuntimeMeta(id, Map.of("spec", Map.of("cpu", cpu, "memory_gb", memory, "gpu", gpu, "storage_gb", storage), "alloc_state", "RESERVED"));
         dispatchWebhooks("sandbox.created", Map.of("sandboxId", id, "name", name, "ownerId", ownerId));
         return sandbox(id);
     }
@@ -174,6 +178,8 @@ public class DataSandboxMvpService {
                 // 成功保持 STARTING，由 syncKusciaStatuses 确认 Job RUNNING 后推进为 RUNNING；
                 // 失败置 ERROR——禁止将未创建容器的记录标记为运行中。
                 jdbc.update("update ds_sandbox set status='STARTING',intent='START',last_error='',updated_at=? where id=?", now(), id);
+                // Z-02：重启（STOPPED 后已释放）时重新预占资源
+                reserveAllocations(sandbox);
                 error = startKuscia(sandbox);
                 if (!error.isEmpty()) {
                     jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
@@ -193,6 +199,7 @@ public class DataSandboxMvpService {
                     // 无真实 Kuscia Job（运行时未启用或从未成功创建）：本地直接完成，
                     // 避免卡在 STOPPING（sync 只处理带 job 的记录）
                     jdbc.update("update ds_sandbox set status='STOPPED',intent='',updated_at=? where id=?", now(), id);
+                    releaseAllocations(sandbox, "MANUAL");
                 }
             }
             case "DESTROY" -> {
@@ -202,6 +209,7 @@ public class DataSandboxMvpService {
                 error = deleteKuscia(sandbox);
                 if (error.isEmpty()) {
                     jdbc.update("update ds_sandbox set status='DESTROYED',deleted=1,intent='',last_error='',updated_at=? where id=?", now(), id);
+                    releaseAllocations(sandbox, "DESTROY");
                 } else {
                     // 销毁失败保留记录并置 ERROR（不 throw，避免事务回滚丢失错误状态）
                     jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
@@ -737,6 +745,34 @@ public class DataSandboxMvpService {
         return Map.of("status", ok ? "HEALTHY" : "DEGRADED", "time", now(), "checks", checks);
     }
 
+    /**
+     * 限制生效校验（Z-02）：secretpad 无 kubectl，这里返回期望值 + 由运维脚本
+     * （data-sandbox-package/scripts/deploy/data-sandbox/verify-limits.sh）执行的核对指引，
+     * 不伪造结果。
+     */
+    public Map<String, Object> limitVerify(String sandboxId) {
+        Map<String, Object> sandbox = sandbox(sandboxId);
+        double cpu = number(sandbox.get("cpu_cores"), 0);
+        double memoryGb = number(sandbox.get("memory_gb"), 0);
+        String jobId = string(sandbox.get("kuscia_job_id"));
+        return Map.of(
+                "sandboxId", sandboxId,
+                "expected", Map.of("cpu", cpu, "memory_gb", memoryGb, "gpu", number(sandbox.get("gpu_count"), 0), "storage_gb", number(sandbox.get("storage_gb"), 0)),
+                "jobId", jobId,
+                "runtimeMeta", parseRuntimeMeta(sandbox),
+                "instructions", "secretpad 无 kubectl：请在 Kuscia 侧核对 pod 资源限制（cpu/memory）与 cgroup 值。"
+                        + "运行 verify-limits.sh <kuscia容器> <sandboxId> 输出真实限制并交叉核对。");
+    }
+
+    private Map<String, Object> parseRuntimeMeta(Map<String, Object> sandbox) {
+        try {
+            Object parsed = objectMapper.readValue(string(sandbox.get("runtime_meta")), Object.class);
+            return parsed instanceof Map<?, ?> map ? castMap(map) : new LinkedHashMap<>();
+        } catch (Exception e) {
+            return new LinkedHashMap<>();
+        }
+    }
+
     public List<Map<String, Object>> helpArticles() {
         return List.of(
                 Map.of("id", "quick-start", "title", "沙箱快速入门", "content", "选择环境镜像和资源配额创建沙箱；启动后可在状态列查看运行情况，到期前可续期。"),
@@ -772,7 +808,7 @@ public class DataSandboxMvpService {
         if (!kusciaEnabled) return;
         // 只同步带真实 Kuscia Job 的沙箱；结合本地状态与意图做受保护映射，禁止无条件覆盖本地状态
         for (Map<String, Object> item : jdbc.queryForList(
-                "select s.id,kuscia_job_id,s.status status,intent,i.dev_port_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0 and s.kuscia_job_id<>''")) {
+                "select s.id,kuscia_job_id,s.status status,intent,i.dev_port_name,s.owner_id,s.gpu_count from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0 and s.kuscia_job_id<>''")) {
             try {
                 Job.QueryJobResponse response = kuscia.queryJob(Job.QueryJobRequest.newBuilder().setJobId(string(item.get("kuscia_job_id"))).build());
                 if (response.getStatus().getCode() != 0) {
@@ -797,8 +833,9 @@ public class DataSandboxMvpService {
                 args.add(decision.lastError() == null ? "" : decision.lastError());
                 args.add(state);
                 args.add(now());
+                String endpoint = "";
                 if (target.equals("RUNNING")) {
-                    String endpoint = extractEndpoint(response, string(item.get("dev_port_name")));
+                    endpoint = extractEndpoint(response, string(item.get("dev_port_name")));
                     if (!endpoint.isEmpty()) {
                         sql.append(",endpoint=?,endpoint_updated_at=?");
                         args.add(endpoint);
@@ -808,6 +845,12 @@ public class DataSandboxMvpService {
                 sql.append(" where id=?");
                 args.add(item.get("id"));
                 jdbc.update(sql.toString(), args.toArray());
+                // Z-02：绑定/释放资源分配，保持与真实运行状态一致
+                if (target.equals("RUNNING")) {
+                    bindAllocations(item, endpoint);
+                } else if (target.equals("STOPPED")) {
+                    releaseAllocations(item, "MANUAL");
+                }
             } catch (Exception e) {
                 log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
             }
@@ -843,6 +886,7 @@ public class DataSandboxMvpService {
             String error = stopKuscia(sandbox, "Sandbox expired");
             if (error.isEmpty()) {
                 jdbc.update("update ds_sandbox set status='EXPIRED',intent='',last_error='',updated_at=? where id=?", now(), sandbox.get("id"));
+                releaseAllocations(sandbox, "EXPIRE");
                 auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRED", "SANDBOX", string(sandbox.get("id")), "", true);
             } else {
                 jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", truncate(error, 900), now(), sandbox.get("id"));
@@ -895,6 +939,9 @@ public class DataSandboxMvpService {
                     .putCustomFields("data_sandbox_id", string(sandbox.get("id"))).putCustomFields("network_policy", string(sandbox.get("network_policy"))).build());
             if (response.getStatus().getCode() == 0) {
                 jdbc.update("update ds_sandbox set kuscia_job_id=? where id=?", jobId, sandbox.get("id"));
+                // Z-02：记录真实下发的规格（kusciaapi 仅支持 cpu/memory 下发）
+                appendRuntimeMeta(string(sandbox.get("id")), Map.of("job_id", jobId, "app_image", appImage,
+                        "resources", Map.of("cpu", string(sandbox.get("cpu_cores")), "memory", string(sandbox.get("memory_gb")) + "Gi")));
                 return "";
             }
             return response.getStatus().getMessage();
@@ -964,10 +1011,159 @@ public class DataSandboxMvpService {
     }
 
     private Map<String, Double> usage(String ownerId) {
+        // Z-02：资源用量改为生命周期感知——只统计 RESERVED/BOUND 的分配行，
+        // RELEASED 不再计数（停止/过期/销毁后 quota 与资源池余量立即回落）
         String suffix = ownerId == null ? "" : " and owner_id=?";
         Object[] args = ownerId == null ? new Object[]{} : new Object[]{ownerId};
-        Map<String, Object> row = jdbc.queryForMap("select coalesce(sum(cpu_cores),0) cpu,coalesce(sum(memory_gb),0) memory,coalesce(sum(gpu_count),0) gpu,coalesce(sum(storage_gb),0) storage from ds_sandbox where deleted=0 and status<>'DESTROYED'" + suffix, args);
+        Map<String, Object> row = jdbc.queryForMap("select "
+                + "coalesce(sum(case when resource_type='CPU' then amount else 0 end),0) cpu,"
+                + "coalesce(sum(case when resource_type='MEMORY' then amount else 0 end),0) memory,"
+                + "coalesce(sum(case when resource_type='GPU' then amount else 0 end),0) gpu,"
+                + "coalesce(sum(case when resource_type='STORAGE' then amount else 0 end),0) storage "
+                + "from ds_resource_allocation where state in ('RESERVED','BOUND')" + suffix, args);
         return Map.of("CPU", number(row.get("cpu"), 0), "MEMORY", number(row.get("memory"), 0), "GPU", number(row.get("gpu"), 0), "STORAGE", number(row.get("storage"), 0));
+    }
+
+    /* ------------------------------- Resource lifecycle (Z-02) ------------------------------- */
+
+    /**
+     * 按沙箱规格幂等创建 RESERVED 分配行（先清理同沙箱已有 RESERVED/BOUND，避免重复占额），
+     * 并把 sandbox.alloc_state 置为 RESERVED。零配额类型不生成行（GPU=0 不占 GPU 额度）。
+     */
+    private void reserveAllocations(Map<String, Object> sandbox) {
+        String sandboxId = string(sandbox.get("id"));
+        jdbc.update("delete from ds_resource_allocation where sandbox_id=? and state in ('RESERVED','BOUND')", sandboxId);
+        insertAllocation(sandboxId, "CPU", number(sandbox.get("cpu_cores"), 0), "RESERVED", sandbox);
+        insertAllocation(sandboxId, "MEMORY", number(sandbox.get("memory_gb"), 0), "RESERVED", sandbox);
+        int gpu = (int) number(sandbox.get("gpu_count"), 0);
+        if (gpu > 0) {
+            insertAllocation(sandboxId, "GPU", gpu, "RESERVED", sandbox);
+        }
+        insertAllocation(sandboxId, "STORAGE", number(sandbox.get("storage_gb"), 0), "RESERVED", sandbox);
+        jdbc.update("update ds_sandbox set alloc_state='RESERVED',updated_at=? where id=?", now(), sandboxId);
+    }
+
+    private void insertAllocation(String sandboxId, String resourceType, double amount, String state, Map<String, Object> sandbox) {
+        // 每次预占生成唯一 id：同一沙箱可经历多次 RESERVED→BOUND→RELEASED 周期，
+        // 释放历史保留，重复预占不触发主键冲突
+        jdbc.update("insert into ds_resource_allocation(id,sandbox_id,resource_type,amount,state,owner_id,sandbox_status,created_at) values(?,?,?,?,?,?,?,?)",
+                "alloc-" + sandboxId.replace("-", "") + "-" + resourceType + "-" + shortId(), sandboxId, resourceType, amount, state,
+                string(sandbox.get("owner_id")), string(sandbox.get("status")), now());
+    }
+
+    /** Job 确认 RUNNING 时把 RESERVED 分配绑定为 BOUND，并绑定 GPU 台账。 */
+    private void bindAllocations(Map<String, Object> sandbox, String endpoint) {
+        String sandboxId = string(sandbox.get("id"));
+        jdbc.update("update ds_resource_allocation set state='BOUND',bound_at=?,sandbox_status='RUNNING',released_at='',released_by='' "
+                + "where sandbox_id=? and state in ('RESERVED','BOUND')", now(), sandboxId);
+        bindGpuLedger(sandbox);
+        jdbc.update("update ds_sandbox set alloc_state='BOUND',updated_at=? where id=?", now(), sandboxId);
+        if (notBlank(endpoint)) {
+            appendRuntimeMeta(sandboxId, Map.of("endpoint", endpoint, "alloc_state", "BOUND"));
+        }
+    }
+
+    /** 释放：RESERVED/BOUND → RELEASED，GPU 台账归还，sandbox.alloc_state 置 RELEASED。 */
+    private void releaseAllocations(Map<String, Object> sandbox, String by) {
+        String sandboxId = string(sandbox.get("id"));
+        jdbc.update("update ds_resource_allocation set state='RELEASED',released_at=?,released_by=? "
+                + "where sandbox_id=? and state in ('RESERVED','BOUND')", now(), by, sandboxId);
+        releaseGpuLedger(sandbox);
+        jdbc.update("update ds_sandbox set alloc_state='RELEASED',updated_at=? where id=?", now(), sandboxId);
+    }
+
+    /**
+     * GPU 台账绑定：按沙箱 gpu_count 把 AVAILABLE 的 GPU 登记到 owner（台账级，无容器直通）。
+     * 同 owner 已分配的 GPU 保留，不足时从可用池补充。
+     */
+    private void bindGpuLedger(Map<String, Object> sandbox) {
+        int gpu = (int) number(sandbox.get("gpu_count"), 0);
+        if (gpu <= 0) {
+            return;
+        }
+        String owner = string(sandbox.get("owner_id"));
+        long allocated = count("select count(1) from ds_gpu_ledger where status='ALLOCATED' and owner_id=?", owner);
+        if (allocated >= gpu) {
+            return;
+        }
+        jdbc.update("update ds_gpu_ledger set status='ALLOCATED',owner_id=?,allocated_at=? where id in "
+                + "(select id from ds_gpu_ledger where status='AVAILABLE' order by id limit ?)", owner, now(), gpu - (int) allocated);
+    }
+
+    /** GPU 台账归还：该 owner 所有 ALLOCATED 的 GPU 恢复 AVAILABLE（台账级粒度）。 */
+    private void releaseGpuLedger(Map<String, Object> sandbox) {
+        String owner = string(sandbox.get("owner_id"));
+        if (notBlank(owner)) {
+            jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at='' where status='ALLOCATED' and owner_id=?", owner);
+        }
+    }
+
+    /** 合并补丁到 runtime_meta（JSON），超长截断为 2048。 */
+    private void appendRuntimeMeta(String sandboxId, Map<String, Object> patch) {
+        try {
+            Map<String, Object> meta = new LinkedHashMap<>();
+            String raw = string(jdbc.queryForObject("select runtime_meta from ds_sandbox where id=?", String.class, sandboxId));
+            if (notBlank(raw)) {
+                Object parsed = objectMapper.readValue(raw, Object.class);
+                if (parsed instanceof Map<?, ?> existing) {
+                    meta.putAll(castMap(existing));
+                }
+            }
+            meta.putAll(patch);
+            jdbc.update("update ds_sandbox set runtime_meta=?,updated_at=? where id=?",
+                    truncate(json(meta), 2048), now(), sandboxId);
+        } catch (Exception e) {
+            log.warn("Unable to append runtime_meta for sandbox {}: {}", sandboxId, e.getMessage());
+        }
+    }
+
+    /** 按剩余活动分配刷新 sandbox.alloc_state（BOUND>RESERVED>RELEASED）。 */
+    private void refreshAllocState(String sandboxId) {
+        String state = string(jdbc.queryForObject("select coalesce(max(case state when 'BOUND' then 2 when 'RESERVED' then 1 else 0 end),0) "
+                + "from ds_resource_allocation where sandbox_id=?", Integer.class, sandboxId));
+        jdbc.update("update ds_sandbox set alloc_state=? where id=?",
+                "2".equals(state) ? "BOUND" : ("1".equals(state) ? "RESERVED" : "RELEASED"), sandboxId);
+    }
+
+    /**
+     * 异常回收：每分钟兜底清理卡死的资源分配。
+     * 1) DESTROYED/deleted 沙箱遗留的 RESERVED/BOUND → 强制释放（RECLAIM）；
+     * 2) ERROR/STARTING 沙箱的 RESERVED/BOUND 分配超过 10 分钟仍未绑定 → RECLAIM + 告警 + 审计。
+     */
+    @Scheduled(cron = "0 * * * * *")
+    @Transactional
+    public void reclaimAbnormalAllocations() {
+        String now = now();
+        Set<String> affected = new java.util.HashSet<>();
+        for (Map<String, Object> row : jdbc.queryForList(
+                "select a.id,a.sandbox_id from ds_resource_allocation a where a.state in ('RESERVED','BOUND') "
+                        + "and exists(select 1 from ds_sandbox s where s.id=a.sandbox_id and (s.deleted=1 or s.status='DESTROYED'))")) {
+            jdbc.update("update ds_resource_allocation set state='RELEASED',released_at=?,released_by='RECLAIM' where id=?", now, row.get("id"));
+            affected.add(string(row.get("sandbox_id")));
+        }
+        String threshold = LocalDateTime.now().minusMinutes(10).toString();
+        List<Map<String, Object>> stuck = jdbc.queryForList(
+                "select a.id,a.sandbox_id,a.resource_type from ds_resource_allocation a "
+                        + "where a.state in ('RESERVED','BOUND') and a.created_at<? "
+                        + "and exists(select 1 from ds_sandbox s where s.id=a.sandbox_id and s.deleted=0 and s.status in ('ERROR','STARTING'))",
+                threshold);
+        if (!stuck.isEmpty()) {
+            String ids = String.join(",", stuck.stream().map(r -> "'" + string(r.get("id")) + "'").toList());
+            jdbc.update("update ds_resource_allocation set state='RELEASED',released_at=?,released_by='RECLAIM' where id in (" + ids + ")", now);
+            for (Map<String, Object> row : stuck) {
+                affected.add(string(row.get("sandbox_id")));
+                auditAs("SYSTEM", "WARN", "system", "RESOURCE_RECLAIM", "SANDBOX", string(row.get("sandbox_id")),
+                        "异常回收 " + string(row.get("resource_type")) + " 分配（超时未绑定）", true);
+            }
+            if (count("select count(1) from ds_alert_event where status='OPEN' and source='SANDBOX' and title=?", "资源异常回收") == 0) {
+                jdbc.update("insert into ds_alert_event(id,severity,source,title,detail,status,created_at) values(?,?,'SANDBOX',?,?,'OPEN',?)",
+                        "alert-" + shortId(), "WARNING", "资源异常回收",
+                        "异常回收 " + stuck.size() + " 条超时未绑定的资源分配", now);
+            }
+        }
+        for (String sandboxId : affected) {
+            refreshAllocState(sandboxId);
+        }
     }
 
     private void ensureQuota(String ownerId) {
