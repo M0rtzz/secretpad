@@ -202,6 +202,10 @@ secretpad:
       url: ${DATA_SANDBOX_METRICS_URL:}
       # 采集周期（毫秒）
       interval-ms: ${DATA_SANDBOX_METRICS_INTERVAL:30000}
+    # Z-02 告警阈值
+    alerts:
+      # 单用户配额使用率告警阈值（%）
+      quota-warning-percent: ${DATA_SANDBOX_ALERT_QUOTA_PERCENT:90}
   datasync:
     center: true
     p2p: false

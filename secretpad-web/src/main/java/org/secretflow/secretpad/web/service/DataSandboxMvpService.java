@@ -92,6 +92,9 @@ public class DataSandboxMvpService {
     @Value("${secretpad.data-sandbox.dev-endpoint.token-ttl-minutes:30}")
     private int devTokenTtlMinutes;
 
+    @Value("${secretpad.data-sandbox.alerts.quota-warning-percent:90}")
+    private int quotaWarningPercent;
+
     @Value("${spring.datasource.default.jdbc-url:jdbc:sqlite:./db/secretpad.sqlite}")
     private String databaseUrl;
 
@@ -183,6 +186,7 @@ public class DataSandboxMvpService {
                 error = startKuscia(sandbox);
                 if (!error.isEmpty()) {
                     jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                    raiseSandboxErrorAlert(id, "启动失败：" + error);
                 }
             }
             case "STOP" -> {
@@ -195,6 +199,7 @@ public class DataSandboxMvpService {
                 error = stopKuscia(sandbox, "Stopped from Data Sandbox console");
                 if (!error.isEmpty()) {
                     jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                    raiseSandboxErrorAlert(id, "停止失败：" + error);
                 } else if (!notBlank(string(sandbox.get("kuscia_job_id")))) {
                     // 无真实 Kuscia Job（运行时未启用或从未成功创建）：本地直接完成，
                     // 避免卡在 STOPPING（sync 只处理带 job 的记录）
@@ -213,6 +218,7 @@ public class DataSandboxMvpService {
                 } else {
                     // 销毁失败保留记录并置 ERROR（不 throw，避免事务回滚丢失错误状态）
                     jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", error, now(), id);
+                    raiseSandboxErrorAlert(id, "销毁失败：" + error);
                 }
             }
             case "RENEW" -> {
@@ -418,6 +424,35 @@ public class DataSandboxMvpService {
     public void resolveAlert(String id) {
         jdbc.update("update ds_alert_event set status='RESOLVED',resolved_at=? where id=?", now(), id);
         audit("OPERATION", "ALERT_RESOLVE", "ALERT", id, "", true);
+    }
+
+    /* ------------------------------- Alerts (Z-02) ------------------------------- */
+
+    /**
+     * 告警统一入口：按 (source, dedupe_key) 对 OPEN 告警去重（dedupeKey 为空时按 source+title），
+     * 插入后派发 alert.created webhook。dedupeKey 用于高频告警（节点指标/配额/沙箱异常）防刷屏。
+     */
+    private void raiseAlert(String severity, String source, String title, String detail, String dedupeKey) {
+        String dedupe = dedupeKey == null ? "" : dedupeKey;
+        long open;
+        if (notBlank(dedupe)) {
+            open = count("select count(1) from ds_alert_event where status='OPEN' and source=? and dedupe_key=?", source, dedupe);
+        } else {
+            open = count("select count(1) from ds_alert_event where status='OPEN' and source=? and title=?", source, title);
+        }
+        if (open > 0) return;
+        String id = "alert-" + shortId();
+        String created = now();
+        jdbc.update("insert into ds_alert_event(id,severity,source,title,detail,dedupe_key,status,created_at) values(?,?,?,?,?,?,'OPEN',?)",
+                id, severity, source, title, truncate(detail, 1024), dedupe, created);
+        dispatchWebhooks("alert.created", Map.of("id", id, "severity", severity, "source", source, "title", title, "detail", detail, "dedupeKey", dedupe));
+    }
+
+    /** 沙箱进入 ERROR 的统一告警（source=SANDBOX，按沙箱去重，RESOLVED 后可再次触发）。 */
+    private void raiseSandboxErrorAlert(String sandboxId, String detail) {
+        raiseAlert("WARNING", "SANDBOX", "沙箱异常",
+                "沙箱 " + sandboxId + " 进入 ERROR：" + truncate(detail, 900),
+                "sandbox:" + sandboxId + ":error");
     }
 
     /* ------------------------------- Network allowlist (Z-02) ------------------------------- */
@@ -895,6 +930,8 @@ public class DataSandboxMvpService {
                     bindAllocations(item, endpoint);
                 } else if (target.equals("STOPPED")) {
                     releaseAllocations(item, "MANUAL");
+                } else if (target.equals("ERROR")) {
+                    raiseSandboxErrorAlert(string(item.get("id")), "Kuscia 状态异常：" + state);
                 }
             } catch (Exception e) {
                 log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
@@ -936,17 +973,75 @@ public class DataSandboxMvpService {
             } else {
                 jdbc.update("update ds_sandbox set status='ERROR',intent='',last_error=?,updated_at=? where id=?", truncate(error, 900), now(), sandbox.get("id"));
                 auditAs("SYSTEM", "WARN", "system", "SANDBOX_EXPIRE_FAILED", "SANDBOX", string(sandbox.get("id")), error, false);
+                raiseSandboxErrorAlert(string(sandbox.get("id")), "到期停止失败：" + error);
             }
         }
+        // Z-02 规则1/规则2：资源池使用率 + 单用户配额使用率告警（source=RESOURCE）
         Map<String, Double> used = usage(null);
         for (Map<String, Object> pool : jdbc.queryForList("select * from ds_resource_pool where enabled=1")) {
             String type = string(pool.get("resource_type"));
             double total = number(pool.get("total_amount"), 0);
             double percent = total == 0 ? 0 : used.getOrDefault(type, 0d) * 100 / total;
             double threshold = number(pool.get("warning_threshold"), 80);
-            if (percent >= threshold && count("select count(1) from ds_alert_event where status='OPEN' and source='RESOURCE' and title=?", type + " 使用率告警") == 0) {
-                jdbc.update("insert into ds_alert_event(id,severity,source,title,detail,status,created_at) values(?,'WARNING','RESOURCE',?,?,'OPEN',?)",
-                        "alert-" + shortId(), type + " 使用率告警", String.format(Locale.ROOT, "当前使用率 %.2f%%，阈值 %.2f%%", percent, threshold), now());
+            if (percent >= threshold) {
+                raiseAlert("WARNING", "RESOURCE", type + " 使用率告警",
+                        String.format(Locale.ROOT, "当前使用率 %.2f%%，阈值 %.2f%%", percent, threshold),
+                        "resource:" + type + ":usage");
+            }
+        }
+        checkQuotaUsageAlerts();
+    }
+
+    /** Z-02 规则2：单用户配额使用率 ≥ quota-warning-percent 时告警（source=RESOURCE，按用户去重）。 */
+    private void checkQuotaUsageAlerts() {
+        List<String> resourceTypes = List.of("CPU", "MEMORY", "GPU", "STORAGE");
+        for (Map<String, Object> quotaRow : jdbc.queryForList("select owner_id,cpu_cores,memory_gb,gpu_count,storage_gb from ds_resource_quota")) {
+            String owner = string(quotaRow.get("owner_id"));
+            if (!notBlank(owner)) continue;
+            Map<String, Double> ownerUsed = usage(owner);
+            List<Object[]> cols = List.of(
+                    new Object[]{"CPU", quotaRow.get("cpu_cores")},
+                    new Object[]{"MEMORY", quotaRow.get("memory_gb")},
+                    new Object[]{"GPU", quotaRow.get("gpu_count")},
+                    new Object[]{"STORAGE", quotaRow.get("storage_gb")});
+            for (int i = 0; i < resourceTypes.size(); i++) {
+                String rt = resourceTypes.get(i);
+                double cap = number(cols.get(i)[1], 0);
+                if (cap <= 0) continue;
+                double pct = ownerUsed.getOrDefault(rt, 0d) * 100 / cap;
+                if (pct >= quotaWarningPercent) {
+                    raiseAlert("WARNING", "RESOURCE", owner + " 配额使用率告警",
+                            String.format(Locale.ROOT, "用户 %s 的 %s 配额使用率 %.2f%%（阈值 %d%%）", owner, rt, pct, quotaWarningPercent),
+                            "quota:" + owner + ":" + rt);
+                }
+            }
+        }
+    }
+
+    /** Z-02 规则1：真实节点指标（ds_node_metric）达到资源池 warning/critical 阈值时告警。 */
+    @Scheduled(fixedDelayString = "${secretpad.data-sandbox.metrics.interval-ms:30000}")
+    @Transactional
+    public void checkNodeMetricsAlerts() {
+        Map<String, Object> metric = latestNodeMetric();
+        if (metric.isEmpty() || !"FRESH".equals(string(metric.get("status")))) return;
+        Map<String, Double> nodePct = Map.of(
+                "CPU", number(metric.get("cpu_usage_percent"), 0),
+                "MEMORY", number(metric.get("memory_usage_percent"), 0),
+                "STORAGE", number(metric.get("storage_usage_percent"), 0));
+        for (Map<String, Object> pool : jdbc.queryForList("select * from ds_resource_pool where enabled=1")) {
+            String type = string(pool.get("resource_type"));
+            Double pct = nodePct.get(type);
+            if (pct == null) continue;
+            double critical = number(pool.get("critical_threshold"), 90);
+            double warning = number(pool.get("warning_threshold"), 80);
+            if (pct >= critical) {
+                raiseAlert("CRITICAL", "NODE_METRIC", type + " 节点使用率危险",
+                        String.format(Locale.ROOT, "节点 %s 使用率 %.2f%%（危险阈值 %.2f%%）", type, pct, critical),
+                        "node:" + type + ":critical");
+            } else if (pct >= warning) {
+                raiseAlert("WARNING", "NODE_METRIC", type + " 节点使用率告警",
+                        String.format(Locale.ROOT, "节点 %s 使用率 %.2f%%（告警阈值 %.2f%%）", type, pct, warning),
+                        "node:" + type + ":warning");
             }
         }
     }
@@ -1205,11 +1300,18 @@ public class DataSandboxMvpService {
                 auditAs("SYSTEM", "WARN", "system", "RESOURCE_RECLAIM", "SANDBOX", string(row.get("sandbox_id")),
                         "异常回收 " + string(row.get("resource_type")) + " 分配（超时未绑定）", true);
             }
-            if (count("select count(1) from ds_alert_event where status='OPEN' and source='SANDBOX' and title=?", "资源异常回收") == 0) {
-                jdbc.update("insert into ds_alert_event(id,severity,source,title,detail,status,created_at) values(?,?,'SANDBOX',?,?,'OPEN',?)",
-                        "alert-" + shortId(), "WARNING", "资源异常回收",
-                        "异常回收 " + stuck.size() + " 条超时未绑定的资源分配", now);
-            }
+            raiseAlert("WARNING", "SANDBOX", "资源异常回收",
+                    "异常回收 " + stuck.size() + " 条超时未绑定的资源分配", "reclaim:abnormal");
+        }
+        // Z-02 规则3：STARTING + intent=START 超过 5 分钟仍未 RUNNING → 资源绑定超时告警
+        String bindThreshold = LocalDateTime.now().minusMinutes(5).toString();
+        for (Map<String, Object> row : jdbc.queryForList(
+                "select id,kuscia_job_id from ds_sandbox where deleted=0 and status='STARTING' and intent='START' and updated_at<?",
+                bindThreshold)) {
+            String sandboxId = string(row.get("id"));
+            raiseAlert("WARNING", "SANDBOX", "资源绑定超时",
+                    "沙箱 " + sandboxId + " STARTING 超 5 分钟仍未 RUNNING（job=" + string(row.get("kuscia_job_id")) + "）",
+                    "sandbox:" + sandboxId + ":bind-timeout");
         }
         for (String sandboxId : affected) {
             refreshAllocState(sandboxId);
