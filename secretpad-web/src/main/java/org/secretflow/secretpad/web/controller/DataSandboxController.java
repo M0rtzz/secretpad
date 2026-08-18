@@ -64,6 +64,12 @@ public class DataSandboxController {
         return SecretPadResponse.success(service.sandboxAction(request));
     }
 
+    @Operation(summary = "签发开发环境访问 token（一次性，30 分钟有效）")
+    @PostMapping("/sandboxes/dev-token")
+    public SecretPadResponse<Map<String, Object>> devToken(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.generateDevToken(String.valueOf(request.get("id"))));
+    }
+
     @GetMapping("/snapshots")
     public SecretPadResponse<List<Map<String, Object>>> snapshots(@RequestParam String sandboxId) {
         return SecretPadResponse.success(service.listSnapshots(sandboxId));

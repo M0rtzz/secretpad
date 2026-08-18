@@ -98,6 +98,14 @@ public class MockKusciaGrpcServer {
         log.info("mock kuscia grpc server started, listening on {}", port);
     }
 
+    public void stop() {
+        if (server != null) {
+            server.shutdownNow();
+            server = null;
+            log.info("mock kuscia grpc server stopped");
+        }
+    }
+
     private ServerBuilder<?> getServerBuilder(int port) throws IOException, InterruptedException, CertificateException {
         ServerBuilder<?> serverBuilder;
         initCerts();
