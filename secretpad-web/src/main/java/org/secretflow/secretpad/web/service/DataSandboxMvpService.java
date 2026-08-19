@@ -107,6 +107,11 @@ public class DataSandboxMvpService {
         this.kuscia = kuscia;
     }
 
+    /** Kuscia 运行时是否启用（供 Z-03 审批执行引擎判断 CREATE/SPEC_CHANGE 可否拉起）。 */
+    public boolean isKusciaEnabled() {
+        return kusciaEnabled;
+    }
+
     /* ------------------------------- Sandbox ------------------------------- */
 
     public List<Map<String, Object>> listSandboxes(String ownerId, String keyword, String status) {
@@ -770,6 +775,8 @@ public class DataSandboxMvpService {
         counts.put("sandboxes", count("select count(1) from ds_sandbox where deleted=0"));
         counts.put("runningSandboxes", count("select count(1) from ds_sandbox where deleted=0 and status='RUNNING'"));
         counts.put("pendingApprovals", count("select count(1) from ds_model_approval where status in ('MODEL_REVIEW','RESOURCE_REVIEW')"));
+        // Z-03：沙箱资源申请单待处理数（含待审/已批准待执行/执行中）
+        counts.put("pendingSandboxApprovals", count("select count(1) from ds_sandbox_approval where deleted=0 and status in ('DATA_PROVIDER_REVIEW','OPERATOR_REVIEW','APPROVED','EXECUTING')"));
         counts.put("openAlerts", count("select count(1) from ds_alert_event where status='OPEN'"));
         counts.put("failedCallbacks", count("select count(1) from ds_webhook_delivery where status='FAILED'"));
         return Map.of("status", "UP", "counts", counts, "kusciaIntegrationEnabled", kusciaEnabled,
