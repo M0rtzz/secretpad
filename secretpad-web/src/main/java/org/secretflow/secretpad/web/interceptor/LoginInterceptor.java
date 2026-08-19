@@ -34,6 +34,7 @@ import org.secretflow.secretpad.web.util.AuthUtils;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import jakarta.annotation.Resource;
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
@@ -63,6 +64,8 @@ import java.util.stream.Collectors;
 @Component
 @Slf4j
 public class LoginInterceptor implements HandlerInterceptor {
+
+    private static final String DEV_ENDPOINT_COOKIE = "Data-Sandbox-Token";
 
     /**
      * Expiration time
@@ -138,7 +141,7 @@ public class LoginInterceptor implements HandlerInterceptor {
     public boolean preHandle(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response, @NotNull Object handler) {
         // 开发端点跳板：安全关键路径，独立于 auth.enabled 强制校验一次性 token
         if (request.getRequestURI().startsWith("/api/v1alpha1/data-sandbox/proxy/")) {
-            processByDevEndpointToken(request);
+            processByDevEndpointToken(request, response);
             return true;
         }
         if (!enable) {
@@ -166,10 +169,24 @@ public class LoginInterceptor implements HandlerInterceptor {
      * 未过期、沙箱 RUNNING），通过后构造虚拟用户供审计使用。失败抛 AUTH_FAILED，
      * 由全局异常处理器返回明确业务错误。
      */
-    private void processByDevEndpointToken(HttpServletRequest request) {
+    private void processByDevEndpointToken(HttpServletRequest request, HttpServletResponse response) {
         String[] segments = request.getRequestURI().split("/");
         String sandboxId = segments.length >= 6 ? segments[5] : "";
-        dataSandboxMvpService.validateDevToken(sandboxId, request.getParameter("token"));
+        String token = request.getParameter("token");
+        if (StringUtils.isBlank(token) && request.getCookies() != null) {
+            for (Cookie cookie : request.getCookies()) {
+                if (DEV_ENDPOINT_COOKIE.equals(cookie.getName())) {
+                    token = cookie.getValue();
+                    break;
+                }
+            }
+        }
+        dataSandboxMvpService.validateDevToken(sandboxId, token);
+        if (StringUtils.isNotBlank(request.getParameter("token"))) {
+            String path = "/api/v1alpha1/data-sandbox/proxy/" + sandboxId;
+            response.addHeader("Set-Cookie", DEV_ENDPOINT_COOKIE + "=" + token
+                    + "; Path=" + path + "; Max-Age=1800; HttpOnly; SameSite=Lax");
+        }
         UserContextDTO devUser = new UserContextDTO();
         devUser.setName("dev-proxy:" + sandboxId);
         devUser.setOwnerId(sandboxId);

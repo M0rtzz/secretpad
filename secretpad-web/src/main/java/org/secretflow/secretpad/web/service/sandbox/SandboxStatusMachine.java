@@ -18,9 +18,8 @@ import java.util.Set;
  *
  * <p>Local sandbox states are intent-driven: a user action first persists an intent
  * (START / STOP), then the Kuscia status synchronizer advances the record only when the
- * real Kuscia Job state confirms the intent. This prevents two known bugs of the MVP:
- * (1) marking a sandbox RUNNING without a real container; (2) the synchronizer blindly
- * overwriting local states such as RUNNING with the Kuscia PENDING state.</p>
+ * real Kuscia task state confirms the intent. This prevents the MVP from marking a
+ * sandbox RUNNING while its container is still pending or pulling an image.</p>
  */
 public final class SandboxStatusMachine {
 
@@ -87,8 +86,8 @@ public final class SandboxStatusMachine {
      *   <li>STARTING + intent START: advance to RUNNING only on Kuscia RUNNING; on Kuscia
      *       terminal failure advance to ERROR; stay STARTING otherwise.</li>
      *   <li>STOPPING + intent STOP: advance to STOPPED on any Kuscia terminal state.</li>
-     *   <li>RUNNING without intent: Kuscia PENDING keeps RUNNING (never roll back); Kuscia
-     *       terminal success moves to STOPPED; Kuscia failure moves to ERROR.</li>
+     *   <li>RUNNING without intent: Kuscia PENDING reflects a restarting/unready runtime
+     *       as STARTING; terminal success moves to STOPPED; failure moves to ERROR.</li>
      *   <li>Any other local status: never overwritten by the synchronizer.</li>
      * </ul>
      * </p>
@@ -109,7 +108,7 @@ public final class SandboxStatusMachine {
         Intent intentValue = intentOf(intent);
         return switch (local) {
             case STARTING -> {
-                if (intentValue == Intent.START) {
+                if (intentValue == Intent.START || intentValue == Intent.NONE) {
                     if (KUSCIA_RUNNING.contains(state)) {
                         yield Decision.to("RUNNING", true);
                     }
@@ -134,7 +133,7 @@ public final class SandboxStatusMachine {
                     yield Decision.to("RUNNING", false);
                 }
                 if (KUSCIA_PENDING.contains(state)) {
-                    yield Decision.NO_OP; // 修复：不把 RUNNING 打回 STARTING
+                    yield Decision.to("STARTING", false);
                 }
                 if (KUSCIA_TERMINAL.contains(state)) {
                     boolean failed = state.contains("FAIL") || state.contains("REJECT");

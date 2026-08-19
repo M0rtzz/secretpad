@@ -112,12 +112,18 @@ public class SandboxStatusMachineTest {
     }
 
     @Test
-    public void runningWithoutIntentNeverRollsBackToStartingOnPending() {
-        // 回归 bug：旧的同步逻辑会把已 RUNNING 的记录打回 STARTING
+    public void runningWithoutIntentReflectsPendingRuntimeAsStarting() {
         SandboxStatusMachine.Decision d = SandboxStatusMachine.mapKusciaState("PENDING", "RUNNING", "");
-        assertNull(d.targetStatus());
+        assertEquals("STARTING", d.targetStatus());
         SandboxStatusMachine.Decision d2 = SandboxStatusMachine.mapKusciaState("PENDING", "RUNNING", "NONE");
-        assertNull(d2.targetStatus());
+        assertEquals("STARTING", d2.targetStatus());
+    }
+
+    @Test
+    public void startingWithoutIntentRecoversWhenRuntimeBecomesRunning() {
+        SandboxStatusMachine.Decision d = SandboxStatusMachine.mapKusciaState("RUNNING", "STARTING", "");
+        assertEquals("RUNNING", d.targetStatus());
+        assertTrue(d.clearIntent());
     }
 
     @Test

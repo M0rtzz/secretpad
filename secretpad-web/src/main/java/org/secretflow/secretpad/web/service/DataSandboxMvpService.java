@@ -92,12 +92,6 @@ public class DataSandboxMvpService {
     @Value("${secretpad.data-sandbox.dev-endpoint.token-ttl-minutes:30}")
     private int devTokenTtlMinutes;
 
-    @Value("${secretpad.data-sandbox.dev-endpoint.kuscia-host:}")
-    private String devEndpointKusciaHost;
-
-    @Value("${secretpad.data-sandbox.dev-endpoint.kuscia-port:80}")
-    private int devEndpointKusciaPort;
-
     @Value("${secretpad.data-sandbox.alerts.quota-warning-percent:90}")
     private int quotaWarningPercent;
 
@@ -314,14 +308,13 @@ public class DataSandboxMvpService {
     }
 
     /**
-     * 跳板转发目标（token 已在拦截器校验通过）：仅允许 DB 中的 endpoint 值，防 SSRF。
-     * <p>Kuscia 的 endpoint 是集群头服务 hostname（如 ds-sbx-xxx-task-server-0-web.dev-zgz.svc，
-     * 无端口），SecretPad 所在网络无法解析 .svc 且容器不监听该端口；实际可达路径是
-     * Kuscia 节点 envoy（默认 :80）按 Host 头路由到沙箱容器。故配置
-     * {@code dev-endpoint.kuscia-host} 后，代理连接 {@code kuscia-host:kuscia-port} 并把
-     * endpoint 作为 Host 头发送；未配置则假定 endpoint 即 host:port 直连。</p>
+     * 跳板转发目标（token 已在拦截器校验通过）：返回 DB 中的 endpoint 原值，防 SSRF。
+     * <p>Kuscia 的 endpoint 是集群头服务 hostname（如 ds-sbx-xxx-task-server-0-web.dev-zgz.svc）。
+     * SandboxProxyController 依据 endpoint 是否 .svc 集群服务决定路由：集群服务经
+     * {@code secretpad.gateway}（Kuscia 节点 envoy，按 Host 头路由到沙箱容器）转发；
+     * 普通 host:port 则直连。endpoint 为空 / NO_NETWORK 一律拒绝。</p>
      */
-    public DevEndpointTarget proxyTarget(String sandboxId) {
+    public String proxyTarget(String sandboxId) {
         Map<String, Object> sandbox = requireRow("select endpoint,network_policy from ds_sandbox where id=? and deleted=0", sandboxId);
         // Z-02 网络隔离纵深防御：NO_NETWORK 沙箱无集群外端点，拒绝转发
         if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
@@ -331,23 +324,7 @@ public class DataSandboxMvpService {
         if (!notBlank(endpoint)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点尚未就绪，请稍后重试");
         }
-        if (notBlank(devEndpointKusciaHost)) {
-            return new DevEndpointTarget(devEndpointKusciaHost, devEndpointKusciaPort, endpoint);
-        }
-        int colon = endpoint.lastIndexOf(':');
-        if (colon < 0) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED,
-                    "沙箱开发端点格式异常（缺少端口，请配置 dev-endpoint.kuscia-host）: " + endpoint);
-        }
-        try {
-            return new DevEndpointTarget(endpoint.substring(0, colon), Integer.parseInt(endpoint.substring(colon + 1)), endpoint);
-        } catch (NumberFormatException e) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "沙箱开发端点端口非法: " + endpoint);
-        }
-    }
-
-    /** 开发端点转发目标：connectHost:connectPort 为实际连接地址，virtualHost 为 envoy 按 Host 头路由名。 */
-    public record DevEndpointTarget(String connectHost, int connectPort, String virtualHost) {
+        return endpoint;
     }
 
     /** 仅沙箱 owner、所在节点运维账号（platformNodeId 与沙箱 owner 一致）或平台管理员可进入开发环境。 */
@@ -931,7 +908,7 @@ public class DataSandboxMvpService {
                     log.warn("Kuscia Job {} for sandbox {} no longer exists: {}", item.get("kuscia_job_id"), item.get("id"), response.getStatus().getMessage());
                     continue;
                 }
-                String state = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+                String state = effectiveKusciaState(response);
                 SandboxStatusMachine.Decision decision = SandboxStatusMachine.mapKusciaState(state,
                         string(item.get("status")), string(item.get("intent")));
                 String target = decision.targetStatus();
@@ -955,6 +932,9 @@ public class DataSandboxMvpService {
                         args.add(endpoint);
                         args.add(now());
                     }
+                } else {
+                    sql.append(",endpoint='',endpoint_updated_at=?");
+                    args.add(now());
                 }
                 sql.append(" where id=?");
                 args.add(item.get("id"));
@@ -971,6 +951,45 @@ public class DataSandboxMvpService {
                 log.warn("Failed to synchronize sandbox {} with Kuscia: {}", item.get("id"), e.getMessage());
             }
         }
+    }
+
+    /**
+     * Kuscia marks a Job RUNNING once it has dispatched its tasks. A task may still be
+     * Pending while its image is pulled, so the Job state alone is not proof that the
+     * sandbox endpoint is ready. Use the least-ready task/party state instead.
+     */
+    private String effectiveKusciaState(Job.QueryJobResponse response) {
+        String topLevel = response.getData().getStatus().getState().toUpperCase(Locale.ROOT);
+        List<String> states = new ArrayList<>();
+        for (Job.TaskStatus task : response.getData().getStatus().getTasksList()) {
+            if (!task.getState().isBlank()) {
+                states.add(task.getState().toUpperCase(Locale.ROOT));
+            }
+            for (Job.PartyStatus party : task.getPartiesList()) {
+                if (!party.getState().isBlank()) {
+                    states.add(party.getState().toUpperCase(Locale.ROOT));
+                }
+            }
+        }
+        if (states.isEmpty()) {
+            return topLevel;
+        }
+        for (String state : states) {
+            if (state.contains("FAIL") || state.equals("REJECTED")) {
+                return state;
+            }
+        }
+        for (String state : states) {
+            if (state.equals("PENDING") || state.equals("AWAITINGAPPROVAL")) {
+                return state;
+            }
+        }
+        for (String state : states) {
+            if (state.equals("RUNNING")) {
+                return state;
+            }
+        }
+        return topLevel;
     }
 
     /**

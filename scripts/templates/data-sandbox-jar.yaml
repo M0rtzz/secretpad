@@ -8,6 +8,9 @@ spec:
       replicas: 1
       spec:
         containers:
+          # 保留原始命令：同事 30234b8 的 `java -cp /opt/data-sandbox JavaSandboxServer`
+          # 依赖其运行时镜像内置该 classpath；zgz 的 jar 镜像为 eclipse-temurin:17-jre
+          # 无此文件，采纳会致容器崩溃。jar 命令与开发端点代理无关，维持可验证基线。
           - command:
               - sh
               - -c

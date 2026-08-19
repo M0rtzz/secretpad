@@ -16,10 +16,29 @@ spec:
           # kuscia 会把 scope=Cluster 的逻辑端口（8888）重映射为分配的端口，并通过
           # KUSCIA_PORT_WEB_NUMBER 注入容器（此处容器端口实际为分配值如 20081），
           # 容器必须监听该 env 端口，Headless Service/探针/Dev 代理才能连通。
+          # base_url 指向跳板代理前缀：SecretPad 跳板把 /proxy/{sandboxId}/ 之后的
+          # 完整路径（含前缀）转发给 Jupyter，Jupyter 内所有相对链接/WebSocket 才会
+          # 落回跳板路径（配合 tcpSocket 探针，避免 base_url 下 httpGet 404）。
+          # workspace 用 /tmp 而非 /home/jovyan：scipy-notebook 镜像 /home/jovyan
+          # 属主是内部 uid 100999，容器以 uid 1000 运行无法写入（见上方注释）。
           - command:
-              - sh
+              - /bin/sh
               - -c
-              - "exec start-notebook.sh --ServerApp.ip=0.0.0.0 --ServerApp.port=${KUSCIA_PORT_WEB_NUMBER:-8888} --ServerApp.token= --ServerApp.password= --no-browser --NotebookApp.allow_origin=*"
+              - >-
+                sandbox_id="${HOSTNAME#ds-}";
+                sandbox_id="${sandbox_id%-task-server-0}";
+                mkdir -p /tmp/workspace;
+                cd /tmp/workspace;
+                exec python3 -m jupyter lab
+                --ServerApp.ip=0.0.0.0
+                --ServerApp.port="${KUSCIA_PORT_WEB_NUMBER:-8888}"
+                --ServerApp.base_url="/api/v1alpha1/data-sandbox/proxy/${sandbox_id}/"
+                --ServerApp.root_dir=/tmp/workspace
+                --ServerApp.token=
+                --ServerApp.password=
+                --ServerApp.allow_origin=*
+                --no-browser
+                --allow-root
             name: jupyter
             env:
               - name: HOME
@@ -41,17 +60,14 @@ spec:
                 protocol: HTTP
                 scope: Cluster
             readinessProbe:
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
             livenessProbe:
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
             startupProbe:
               failureThreshold: 60
-              httpGet:
-                path: /api/status
+              tcpSocket:
                 port: web
               periodSeconds: 10
               successThreshold: 1

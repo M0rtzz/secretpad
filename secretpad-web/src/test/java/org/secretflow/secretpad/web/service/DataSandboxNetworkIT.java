@@ -182,34 +182,13 @@ public class DataSandboxNetworkIT {
     }
 
     @Test
-    public void proxyTargetDirectModeParsesHostPort() {
+    public void proxyTargetReturnsRawEndpoint() {
         String id = createSandbox("INTERNAL_ONLY");
         service.sandboxAction(Map.of("id", id, "action", "START"));
         run();
-        // 未配置 kuscia-host：endpoint（10.0.0.1:31234）即连接地址 + Host 头
-        DataSandboxMvpService.DevEndpointTarget target = service.proxyTarget(id);
-        assertEquals("10.0.0.1", target.connectHost());
-        assertEquals(31234, target.connectPort());
-        assertEquals("10.0.0.1:31234", target.virtualHost());
-    }
-
-    @Test
-    public void proxyTargetRoutesViaKusciaHostWhenConfigured() {
-        String id = createSandbox("INTERNAL_ONLY");
-        service.sandboxAction(Map.of("id", id, "action", "START"));
-        run();
-        // 配置 kuscia-host（Kuscia 节点 envoy 跳板）：连接 {host}:{port}，endpoint hostname 作 Host 头
-        try {
-            ReflectionTestUtils.setField(service, "devEndpointKusciaHost", "data-sandbox-dev-test-kuscia");
-            ReflectionTestUtils.setField(service, "devEndpointKusciaPort", 80);
-            DataSandboxMvpService.DevEndpointTarget target = service.proxyTarget(id);
-            assertEquals("data-sandbox-dev-test-kuscia", target.connectHost());
-            assertEquals(80, target.connectPort());
-            // mock 下 endpoint 为 host:port；envoy 按 Host 头路由，整体作为 virtual host
-            assertEquals("10.0.0.1:31234", target.virtualHost());
-        } finally {
-            ReflectionTestUtils.setField(service, "devEndpointKusciaHost", "");
-        }
+        // 路由决策在 SandboxProxyController（.svc → secretpad.gateway 按 Host 头转发，
+        // host:port → 直连）；service 层只返回 DB endpoint 原值，防 SSRF
+        assertEquals("10.0.0.1:31234", service.proxyTarget(id));
     }
 
     @Test
