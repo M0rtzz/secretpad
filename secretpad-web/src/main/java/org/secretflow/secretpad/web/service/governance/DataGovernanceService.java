@@ -128,10 +128,11 @@ public class DataGovernanceService {
         if (user == null || !notBlank(user.getOwnerId())) {
             throw noPermission();
         }
-        // 平台自有数据：节点即用户平台节点（EDGE 模式 nodeId == ownerId），
+        // 平台自有数据：nodeId 即用户平台节点（EDGE 模式 nodeId == ownerId，
+        // P2P 模式 nodeId == user.ownerId 即用户所属 kuscia 域，无 node 行也放行）；
         // 或节点属于用户所在机构（P2P 模式 node.instId == user.ownerId，如 dev-zgz/ctqkgaov）
         NodeDO node = nodeRepository.findByNodeId(nodeId);
-        if (node != null && (nodeId.equals(user.getOwnerId()) || user.getOwnerId().equals(node.getInstId()))) {
+        if (nodeId.equals(user.getOwnerId()) || (node != null && user.getOwnerId().equals(node.getInstId()))) {
             return;
         }
         Set<String> projectIds = user.getProjectIds();
@@ -268,8 +269,8 @@ public class DataGovernanceService {
         Map<String, Object> policy = resolvePolicyMap(request);
         Map<String, Object> sampling = resolveSampling(request, policy);
 
-        // 读源 + 行数/字节校验（超限在任务创建前拒绝，不产生任务记录）
-        List<List<String>> parsed = readCsv(nodeId, relativeUri);
+        // 读源 + 行数/字节校验（超限在任务创建前拒绝，不产生任务记录）；物理目录 = 源表属主（kuscia 域）
+        List<List<String>> parsed = readCsv(source.getNodeId(), relativeUri);
         List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
         List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
         if (data.size() > maxInputRows) {
@@ -322,8 +323,8 @@ public class DataGovernanceService {
         Map<String, Object> sampling = resolveSampling(request, policy);
         List<Map<String, Object>> masking = resolveMasking(request, policy);
 
-        // 读源 + 行数校验（超限在任务创建前拒绝，不产生任务记录）
-        List<List<String>> parsed = readCsv(nodeId, relativeUri);
+        // 读源 + 行数校验（超限在任务创建前拒绝，不产生任务记录）；物理目录 = 源表属主（kuscia 域）
+        List<List<String>> parsed = readCsv(source.getNodeId(), relativeUri);
         List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
         List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
         if (data.size() > maxInputRows) {
@@ -418,7 +419,7 @@ public class DataGovernanceService {
         Map<String, Object> sampling = snapshot.get("sampling") instanceof Map<?, ?> sMap ? castMap(sMap) : new LinkedHashMap<>();
         List<Map<String, Object>> masking = castList(snapshot.get("masking"));
 
-        List<List<String>> parsed = readCsv(nodeId, relativeUri);
+        List<List<String>> parsed = readCsv(source.getNodeId(), relativeUri);
         List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
         List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
 
@@ -513,7 +514,7 @@ public class DataGovernanceService {
         if (!notBlank(relativeUri)) {
             throw new IllegalArgumentException(GOV_NOT_FOUND + ": 源数据表缺少 relativeUri");
         }
-        List<List<String>> parsed = readCsv(nodeId, relativeUri);
+        List<List<String>> parsed = readCsv(source.getNodeId(), relativeUri);
         List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
         List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
         List<List<String>> previewRows = new ArrayList<>();

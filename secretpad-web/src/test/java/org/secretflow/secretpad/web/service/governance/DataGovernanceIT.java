@@ -129,16 +129,16 @@ public class DataGovernanceIT {
 
     @BeforeAll
     public void startMock() throws Exception {
-        // 数据目录 + 源 CSV（alice + p2p-node 两个数据目录）
-        Files.createDirectories(Path.of(DATA_ROOT, "alice"));
-        Files.createDirectories(Path.of(DATA_ROOT, "p2p-node"));
+        // 数据目录 + 源 CSV（alice / p2p-node / dave 三个数据目录，分别对应三种权限路径）
         byte[] csvBytes;
         try (InputStream in = getClass().getResourceAsStream("/gov/sample_full.csv")) {
             assertNotNull(in, "test resource gov/sample_full.csv missing");
             csvBytes = in.readAllBytes();
         }
-        Files.write(Path.of(DATA_ROOT, "alice", SOURCE_URI), csvBytes);
-        Files.write(Path.of(DATA_ROOT, "p2p-node", SOURCE_URI), csvBytes);
+        for (String owner : List.of("alice", "p2p-node", "dave")) {
+            Files.createDirectories(Path.of(DATA_ROOT, owner));
+            Files.write(Path.of(DATA_ROOT, owner, SOURCE_URI), csvBytes);
+        }
         mockServer = new MockKusciaGrpcServer();
         mockServer.start(MOCK_PORT, KusciaProtocolEnum.NOTLS, List.of(
                 new GovernanceDomainDataService(), new JobService(), new HealthService()));
@@ -502,6 +502,21 @@ public class DataGovernanceIT {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> governance.submitBuiltinTask(request));
         assertTrue(e.getMessage().contains(DataGovernanceService.GOV_NO_PERMISSION), e.getMessage());
+    }
+
+    /** 13c. P2P 模式平台自有域数据：nodeId == user.ownerId 但无 node 行（如用户 kuscia 域）→ 允许。 */
+    @Test
+    public void platformOwnedDomainAllowedWithoutNodeRow() {
+        GovernanceDomainDataService.domainId = "dave"; // dave 无 node 行，nodeId==ownerId 即放行
+        UserContext.setBaseUser(noProjectUser()); // ownerId=dave, projectIds=empty
+        Map<String, Object> request = new java.util.LinkedHashMap<>();
+        request.put("nodeId", "dave");
+        request.put("datatableId", SOURCE_DT);
+        request.put("sampling", Map.of("method", "RANDOM", "count", 3));
+        request.put("masking", List.of());
+        Map<String, Object> task = governance.submitBuiltinTask(request);
+        assertEquals("SUCCEEDED", String.valueOf(task.get("status")));
+        assertEquals("dave", String.valueOf(task.get("result_node_id")));
     }
 
     /** 14. 输入超限：压低 input-rows 上限 → 任务创建前即被拒绝（GOV_INPUT_TOO_LARGE），不产生任务记录。 */
