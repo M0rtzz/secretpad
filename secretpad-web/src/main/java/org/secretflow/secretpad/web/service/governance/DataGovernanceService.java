@@ -540,6 +540,69 @@ public class DataGovernanceService {
         return result;
     }
 
+    /**
+     * 查看任务结果数据：仅脱敏后的结果可返回行数据（masked=true），表头携带数据源/结果表信息；
+     * 未脱敏（纯抽样或自定义代码输出）不返回行，仅返回 masked=false 元信息——保证不暴露未经授权的真实数据。
+     */
+    public Map<String, Object> viewResult(String taskId) {
+        Map<String, Object> task = requireTask(taskId);
+        UserContextDTO user = currentUser();
+        if (user == null || !notBlank(user.getOwnerId())) {
+            throw noPermission();
+        }
+        requireCreator(task, "结果");
+        if (!STATUS_SUCCEEDED.equals(string(task.get("status"))) || !notBlank(string(task.get("result_datatable_id")))) {
+            throw new IllegalStateException(GOV_STATE_CONFLICT + ": 仅 SUCCEEDED 且含结果数据集的任务可查看结果");
+        }
+        Map<String, Object> snapshot = parseJsonMap(string(task.get("exec_params")));
+        Object samplingObj = snapshot.get("sampling");
+        Map<String, Object> sampling = samplingObj instanceof Map<?, ?> m ? castMap(m) : new LinkedHashMap<>();
+        List<Map<String, Object>> masking = castList(snapshot.get("masking"));
+        boolean masked = masking != null && !masking.isEmpty();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("taskId", taskId);
+        result.put("execMode", string(task.get("exec_mode")));
+        result.put("samplingMethod", string(sampling.get("method")));
+        result.put("masked", masked);
+        result.put("sourceNodeId", string(task.get("source_node_id")));
+        result.put("sourceDatatableId", string(task.get("source_datatable_id")));
+        result.put("resultNodeId", string(task.get("result_node_id")));
+        result.put("resultDatatableId", string(task.get("result_datatable_id")));
+        result.put("sourceRows", longValue(task.get("source_rows")));
+        result.put("resultRows", longValue(task.get("result_rows")));
+        result.put("sourceName", tableName(string(task.get("source_node_id")), string(task.get("source_datatable_id"))));
+        result.put("resultName", tableName(string(task.get("result_node_id")), string(task.get("result_datatable_id"))));
+        if (!masked) {
+            result.put("message", "该结果未经脱敏（纯抽样或自定义代码输出），含真实数据，不予展示");
+            return result;
+        }
+        // 脱敏结果可展示：权限校验 + 读取结果 CSV（仅前 100 行）
+        checkSourcePermission(user, string(task.get("result_node_id")), string(task.get("result_datatable_id")));
+        DatatableDTO dst = resolveSource(string(task.get("result_node_id")), string(task.get("result_datatable_id")));
+        List<List<String>> parsed = readCsv(dst.getNodeId(), dst.getRelativeUri());
+        List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
+        List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
+        List<List<String>> rows = new ArrayList<>();
+        for (int i = 0; i < Math.min(100, data.size()); i++) {
+            rows.add(new ArrayList<>(data.get(i)));
+        }
+        result.put("header", header);
+        result.put("rows", rows);
+        return result;
+    }
+
+    /** 表名兜底：取不到元数据时退回 datatableId。 */
+    private String tableName(String nodeId, String datatableId) {
+        if (!notBlank(nodeId) || !notBlank(datatableId)) {
+            return "";
+        }
+        try {
+            return string(resolveSource(nodeId, datatableId).getDatatableName());
+        } catch (Exception e) {
+            return datatableId;
+        }
+    }
+
     /* ============================== 内置执行 ============================== */
 
     private void runBuiltin(String taskId, DatatableDTO source, List<String> header, List<List<String>> data,

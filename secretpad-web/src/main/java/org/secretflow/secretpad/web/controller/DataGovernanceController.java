@@ -126,6 +126,12 @@ public class DataGovernanceController {
         return SecretPadResponse.success(service.mountResult(request));
     }
 
+    @Operation(summary = "查看任务结果数据（仅脱敏后结果可返回行；表头携带数据源信息）")
+    @GetMapping("/tasks/results/view")
+    public SecretPadResponse<Map<String, Object>> viewResult(@RequestParam String taskId) {
+        return SecretPadResponse.success(service.viewResult(taskId));
+    }
+
     /* ------------------------------- 血缘 / 预览 ------------------------------- */
 
     @Operation(summary = "血缘查询（source 或 target 命中）")

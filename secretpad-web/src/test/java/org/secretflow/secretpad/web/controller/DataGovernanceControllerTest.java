@@ -62,10 +62,13 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -158,6 +161,7 @@ public class DataGovernanceControllerTest {
         // TokensDO 走 @SQLDelete 软删除，同 PK 再插入会冲突，用 JDBC 硬删后重插
         jdbc.update("delete from user_tokens");
         CtrlDomainDataService.created.clear();
+        CtrlDomainDataService.uriByDatatable.clear();
         CtrlDomainDataService.createCode = KusciaAPIConstants.OK;
         CtrlDomainDataService.relativeUri = SOURCE_URI;
         CtrlDomainDataService.datatableId = SOURCE_DT;
@@ -189,13 +193,14 @@ public class DataGovernanceControllerTest {
 
     /* ------------------------------- mock ------------------------------- */
 
-    /** 富数据 DomainData mock：query 返回真实元数据（relativeUri + schema），create 记录调用。 */
+    /** 富数据 DomainData mock：query 返回真实元数据（relativeUri + schema），create 记录调用并按 datatableId 回放 relativeUri。 */
     public static class CtrlDomainDataService extends DomainDataServiceGrpc.DomainDataServiceImplBase {
         static volatile String relativeUri = SOURCE_URI;
         static volatile String datatableId = SOURCE_DT;
         static volatile String domainId = "alice";
         static volatile int createCode = KusciaAPIConstants.OK;
         static final List<Domaindata.CreateDomainDataRequest> created = new CopyOnWriteArrayList<>();
+        static final Map<String, String> uriByDatatable = new ConcurrentHashMap<>();
         static volatile List<Common.DataColumn> columns = defaultColumns();
 
         static List<Common.DataColumn> defaultColumns() {
@@ -217,13 +222,15 @@ public class DataGovernanceControllerTest {
         @Override
         public void queryDomainData(Domaindata.QueryDomainDataRequest request,
                                     StreamObserver<Domaindata.QueryDomainDataResponse> observer) {
+            String qid = request.getData().getDomaindataId();
+            String qUri = uriByDatatable.getOrDefault(qid, relativeUri);
             Domaindata.DomainData domainData = Domaindata.DomainData.newBuilder()
-                    .setDomaindataId(datatableId)
+                    .setDomaindataId(qid)
                     .setDomainId(domainId)
                     .setAuthor(domainId)
-                    .setName(datatableId)
+                    .setName(qid)
                     .setType("table")
-                    .setRelativeUri(relativeUri)
+                    .setRelativeUri(qUri)
                     .setVendor("datatable")
                     .setFileFormat(Common.FileFormat.CSV)
                     .addAllColumns(columns)
@@ -240,6 +247,7 @@ public class DataGovernanceControllerTest {
         public void createDomainData(Domaindata.CreateDomainDataRequest request,
                                      StreamObserver<Domaindata.CreateDomainDataResponse> observer) {
             created.add(request);
+            uriByDatatable.put(request.getDomaindataId(), request.getRelativeUri());
             int code = createCode;
             String message = code == KusciaAPIConstants.OK ? "success" : "mock create failed";
             observer.onNext(Domaindata.CreateDomainDataResponse.newBuilder()
@@ -286,6 +294,19 @@ public class DataGovernanceControllerTest {
                         "datatableId", SOURCE_DT,
                         "sampling", Map.of("method", "RANDOM", "count", 3),
                         "masking", List.of())),
+                token);
+    }
+
+    /** 走控制器提交一个 BUILTIN 手机号掩码任务，返回任务 data JSON。 */
+    private JsonNode submitMasking(String token) throws Exception {
+        return doPost("/api/v1alpha1/data-governance/tasks/submit", json(Map.of(
+                        "name", "ctrl-masking",
+                        "execMode", "BUILTIN",
+                        "nodeId", "alice",
+                        "datatableId", SOURCE_DT,
+                        "sampling", Map.of(),
+                        "masking", List.of(Map.of("column", "phone", "method", "MASK",
+                                "params", Map.of("keepLeft", "3", "keepRight", "4"))))),
                 token);
     }
 
@@ -449,5 +470,60 @@ public class DataGovernanceControllerTest {
                 CAROL_TOKEN);
         assertEquals(SystemErrorCode.UNKNOWN_ERROR.getCode(), body.path("status").path("code").asInt());
         assertTrue(body.path("status").path("msg").asText().contains("GOV_NO_PERMISSION"), body.toString());
+    }
+
+    /* ------------------------------- 结果展示 ------------------------------- */
+
+    @Test
+    public void viewMaskedResultReturnsRowsWithSource() throws Exception {
+        JsonNode task = submitMasking(ALICE_TOKEN);
+        String id = task.path("data").path("id").asText();
+        assertEquals("SUCCEEDED", task.path("data").path("status").asText());
+        JsonNode body = doGet("/api/v1alpha1/data-governance/tasks/results/view?taskId=" + id, ALICE_TOKEN);
+        assertEquals(0, body.path("status").path("code").asInt(), body.toString());
+        JsonNode data = body.path("data");
+        assertTrue(data.path("masked").asBoolean(), data.toString());
+        assertTrue(data.path("rows").size() > 0, data.toString());
+        assertTrue(data.path("sourceName").asText().length() > 0, data.toString());
+        assertEquals("phone", data.path("header").get(2).asText());
+        // phone 列确已掩码（保留前3后4，含 *），且与源数据不同
+        JsonNode preview = doGet("/api/v1alpha1/data-governance/preview?nodeId=alice&datatableId=" + SOURCE_DT + "&limit=1",
+                ALICE_TOKEN);
+        String srcPhone = preview.path("data").path("rows").get(0).get(2).asText();
+        String resPhone = data.path("rows").get(0).get(2).asText();
+        assertNotEquals(srcPhone, resPhone);
+        assertTrue(resPhone.contains("*"), resPhone);
+    }
+
+    @Test
+    public void viewSamplingResultNotExposed() throws Exception {
+        // 纯抽样（未脱敏）结果：不返回行数据
+        JsonNode task = submitSampling(ALICE_TOKEN);
+        String id = task.path("data").path("id").asText();
+        JsonNode body = doGet("/api/v1alpha1/data-governance/tasks/results/view?taskId=" + id, ALICE_TOKEN);
+        assertEquals(0, body.path("status").path("code").asInt(), body.toString());
+        JsonNode data = body.path("data");
+        assertFalse(data.path("masked").asBoolean(), data.toString());
+        assertFalse(data.has("rows"), data.toString());
+        assertTrue(data.path("message").asText().contains("未经脱敏"), data.toString());
+    }
+
+    @Test
+    public void viewResultRejectedForNonCreator() throws Exception {
+        JsonNode task = submitMasking(ALICE_TOKEN);
+        String id = task.path("data").path("id").asText();
+        JsonNode body = doGet("/api/v1alpha1/data-governance/tasks/results/view?taskId=" + id, CAROL_TOKEN);
+        assertEquals(SystemErrorCode.UNKNOWN_ERROR.getCode(), body.path("status").path("code").asInt());
+        assertTrue(body.path("status").path("msg").asText().contains("GOV_NO_PERMISSION"), body.toString());
+    }
+
+    @Test
+    public void viewResultRejectedWhenNotSucceeded() throws Exception {
+        jdbc.update("insert into ds_governance_task(id,name,exec_mode,source_node_id,source_datatable_id,"
+                        + "exec_params,status,created_by,created_at,updated_at,deleted) "
+                        + "values('gt-ctrl-running','ctrl-running','BUILTIN','alice','" + SOURCE_DT + "','{}','RUNNING','alice','2026-08-19 00:00:00','2026-08-19 00:00:00',0)");
+        JsonNode body = doGet("/api/v1alpha1/data-governance/tasks/results/view?taskId=gt-ctrl-running", ALICE_TOKEN);
+        assertEquals(SystemErrorCode.UNKNOWN_ERROR.getCode(), body.path("status").path("code").asInt());
+        assertTrue(body.path("status").path("msg").asText().contains("仅 SUCCEEDED"), body.toString());
     }
 }
