@@ -138,7 +138,12 @@ public final class ModelApiGuard {
 
     private static Date parse(String text) {
         try {
-            return new SimpleDateFormat(DATETIME_PATTERN).parse(text.trim());
+            // 兼容 ISO 'T' 分隔（ModelApiService.now() 用 LocalDateTime.toString()）与空格分隔（外部配置）
+            String normalized = text.trim();
+            if (normalized.contains("T")) {
+                normalized = normalized.replace('T', ' ');
+            }
+            return new SimpleDateFormat(DATETIME_PATTERN).parse(normalized);
         } catch (ParseException e) {
             return null;
         }

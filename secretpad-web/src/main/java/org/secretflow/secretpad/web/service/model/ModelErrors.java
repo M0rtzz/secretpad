@@ -62,4 +62,7 @@ public final class ModelErrors {
 
     /** 调用方不在授权用户名单。 */
     public static final String MODEL_API_USER_DENIED = "MODEL_API_USER_DENIED";
+
+    /** API 调用执行失败（任务非 SUCCEEDED，errorMessage 随附）。 */
+    public static final String MODEL_API_INVOKE_FAILED = "MODEL_API_INVOKE_FAILED";
 }

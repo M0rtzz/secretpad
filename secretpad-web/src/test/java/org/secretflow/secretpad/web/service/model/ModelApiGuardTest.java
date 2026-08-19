@@ -67,6 +67,21 @@ public class ModelApiGuardTest {
     }
 
     @Test
+    public void isoTSeparatorFormatIsParsedLikeSpaceFormat() {
+        // ModelApiService.now() 用 LocalDateTime.toString()（'T' 分隔）；外部配置常用空格分隔，两者都须可解析
+        assertTrue(ModelApiGuard.inValidityWindow(
+                "2026-08-19 10:00:00", "2026-08-19 18:00:00", "2026-08-19T12:00:00"));
+        assertTrue(ModelApiGuard.inValidityWindow(
+                "2026-08-19T10:00:00", "2026-08-19T18:00:00", "2026-08-19T12:00:00"));
+        assertTrue(ModelApiGuard.inValidityWindow(
+                "", "2026-08-19T18:00:00", "2026-08-19T12:00:00"));
+        assertFalse(ModelApiGuard.inValidityWindow(
+                "2026-08-19T10:00:00", "2026-08-19T18:00:00", "2026-08-19T20:00:00"));
+        assertFalse(ModelApiGuard.inValidityWindow(
+                "", "2026-08-19T18:00:00", "2026-08-19T20:00:00"));
+    }
+
+    @Test
     public void nowBeforeWindowStartIsDenied() {
         assertFalse(ModelApiGuard.inValidityWindow(
                 "2026-08-19 10:00:00", "2026-08-19 18:00:00", "2026-08-19 08:00:00"));

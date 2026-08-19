@@ -706,7 +706,7 @@ public class ModelTestService {
         }
     }
 
-    private byte[] readJar(String filePath) {
+    byte[] readJar(String filePath) {
         if (!notBlank(filePath) || filePath.contains("..")) {
             throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID + ": 非法 JAR 路径");
         }
@@ -726,7 +726,7 @@ public class ModelTestService {
         }
     }
 
-    private void validatePython(String script) {
+    void validatePython(String script) {
         try {
             DevDependencyChecker.validate(script, enabledWhitelist());
         } catch (IllegalArgumentException e) {
@@ -735,7 +735,7 @@ public class ModelTestService {
         }
     }
 
-    private Set<String> enabledWhitelist() {
+    Set<String> enabledWhitelist() {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select name from ds_dev_dependency where deleted=0 and enabled=1");
         Set<String> result = new java.util.HashSet<>();
@@ -746,7 +746,7 @@ public class ModelTestService {
     }
 
     /** 请求参数覆盖版本 default_params 后作为执行参数。 */
-    private Map<String, Object> mergedParams(Map<String, Object> version, Object requestParams) {
+    Map<String, Object> mergedParams(Map<String, Object> version, Object requestParams) {
         Map<String, Object> params = new LinkedHashMap<>();
         Map<String, Object> defaults = parseJsonMap(string(version.get("default_params")));
         params.putAll(defaults);
