@@ -238,6 +238,72 @@ public class DataSandboxController {
         return SecretPadResponse.success(service.testOidc());
     }
 
+    @Operation(summary = "租户开通与资源规格")
+    @GetMapping("/tenants")
+    public SecretPadResponse<List<Map<String, Object>>> tenants() {
+        return SecretPadResponse.success(service.listTenants());
+    }
+
+    @PostMapping("/tenants/open")
+    public SecretPadResponse<Map<String, Object>> openTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.openTenant(request));
+    }
+
+    @PostMapping("/tenants/resize")
+    public SecretPadResponse<Map<String, Object>> resizeTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.resizeTenant(request));
+    }
+
+    @PostMapping("/tenants/deploy")
+    public SecretPadResponse<Map<String, Object>> deployTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.deployTenant(request));
+    }
+
+    @GetMapping("/billing/usage")
+    public SecretPadResponse<List<Map<String, Object>>> usage(@RequestParam String tenantId) {
+        return SecretPadResponse.success(service.tenantUsage(tenantId));
+    }
+
+    @PostMapping("/billing/calculate")
+    public SecretPadResponse<Map<String, Object>> calculateBilling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.calculateBilling(request));
+    }
+
+    @PostMapping("/billing/report")
+    public SecretPadResponse<Map<String, Object>> reportBilling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.reportBilling(request));
+    }
+
+    @GetMapping("/trusted/exchanges")
+    public SecretPadResponse<List<Map<String, Object>>> exchanges(@RequestParam(defaultValue = "") String tenantId) {
+        return SecretPadResponse.success(service.listTrustedExchanges(tenantId));
+    }
+
+    @PostMapping("/trusted/push")
+    public SecretPadResponse<Map<String, Object>> trustedPush(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.trustedPush(request));
+    }
+
+    @PostMapping("/trusted/callback")
+    public SecretPadResponse<Map<String, Object>> trustedCallback(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.trustedCallback(request));
+    }
+
+    @PostMapping("/trusted/verify")
+    public SecretPadResponse<Map<String, Object>> trustedVerify(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.verifyTrustedSignature(request));
+    }
+
+    @GetMapping("/trusted/policies")
+    public SecretPadResponse<List<Map<String, Object>>> policies(@RequestParam String tenantId) {
+        return SecretPadResponse.success(service.listAccessPolicies(tenantId));
+    }
+
+    @PostMapping("/trusted/policies/save")
+    public SecretPadResponse<Map<String, Object>> savePolicy(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveAccessPolicy(request));
+    }
+
     @Operation(summary = "运维总览")
     @GetMapping("/operations")
     public SecretPadResponse<Map<String, Object>> operations() {

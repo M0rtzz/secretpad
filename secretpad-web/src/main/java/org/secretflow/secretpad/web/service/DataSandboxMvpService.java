@@ -43,6 +43,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
@@ -766,6 +768,161 @@ public class DataSandboxMvpService {
         jdbc.update("update ds_oidc_config set discovery_status=?,discovery_message=?,updated_at=? where id=1", status, message, now());
         audit("SYSTEM", "OIDC_DISCOVERY_TEST", "OIDC", "1", message, "SUCCESS".equals(status));
         return Map.of("status", status, "message", message, "discoveryUrl", discovery);
+    }
+
+    /* ------------------------------- Z-07 tenancy, billing and trusted exchange ------------------------------- */
+
+    public List<Map<String, Object>> listTenants() {
+        return jdbc.queryForList("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant order by created_at desc");
+    }
+
+    @Transactional
+    public Map<String, Object> openTenant(Map<String, Object> request) {
+        String id = "ten-" + shortId();
+        String name = required(request, "name");
+        String ownerId = value(request, "ownerId", currentOwner());
+        String secret = value(request, "signingSecret", Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes()));
+        String now = now();
+        jdbc.update("insert into ds_tenant(id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,signing_secret,created_by,created_at,updated_at) values(?,?,?,'PENDING','',?,?,?,?,?,?,?,?)",
+                id, name, ownerId, positive(request, "cpuCores", 4), positive(request, "memoryGb", 16), nonNegativeInt(request, "gpuCount", 0), positive(request, "storageGb", 100), secret, actor(), now, now);
+        audit("OPERATION", "TENANT_OPEN", "TENANT", id, name, true);
+        dispatchWebhooks("tenant.opened", Map.of("tenantId", id, "ownerId", ownerId, "name", name));
+        Map<String, Object> result = new LinkedHashMap<>(requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant where id=?", id));
+        result.put("signingSecret", secret);
+        result.put("notice", "签名密钥只显示一次，请交由可信平台安全保存");
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> resizeTenant(Map<String, Object> request) {
+        String id = required(request, "tenantId");
+        requireRow("select id from ds_tenant where id=?", id);
+        jdbc.update("update ds_tenant set cpu_cores=?,memory_gb=?,gpu_count=?,storage_gb=?,status=case when status='ACTIVE' then 'RESIZE_PENDING' else status end,updated_at=? where id=?",
+                positive(request, "cpuCores", 4), positive(request, "memoryGb", 16), nonNegativeInt(request, "gpuCount", 0), positive(request, "storageGb", 100), now(), id);
+        audit("OPERATION", "TENANT_RESIZE", "TENANT", id, json(request), true);
+        return requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_at,updated_at from ds_tenant where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> deployTenant(Map<String, Object> request) {
+        String id = required(request, "tenantId");
+        requireRow("select id from ds_tenant where id=?", id);
+        String endpoint = value(request, "endpoint", "");
+        if (notBlank(endpoint)) validateHttpUrl(endpoint);
+        jdbc.update("update ds_tenant set status='ACTIVE',deploy_endpoint=?,updated_at=? where id=?", endpoint, now(), id);
+        audit("OPERATION", "TENANT_DEPLOY", "TENANT", id, endpoint, true);
+        dispatchWebhooks("tenant.deployed", Map.of("tenantId", id, "endpoint", endpoint));
+        return requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_at,updated_at from ds_tenant where id=?", id);
+    }
+
+    public List<Map<String, Object>> tenantUsage(String tenantId) {
+        requireRow("select id from ds_tenant where id=?", tenantId);
+        List<Map<String, Object>> usage = jdbc.queryForList("select resource_type,round(sum(amount),4) amount,unit,min(period_start) period_start,max(period_end) period_end from ds_usage_meter where tenant_id=? group by resource_type,unit order by resource_type", tenantId);
+        if (usage.isEmpty()) {
+            Map<String, Object> tenant = requireRow("select cpu_cores,memory_gb,gpu_count,storage_gb from ds_tenant where id=?", tenantId);
+            usage = List.of(
+                    Map.of("resource_type", "CPU_HOUR", "amount", tenant.get("cpu_cores"), "unit", "core-hour"),
+                    Map.of("resource_type", "MEMORY_GB_HOUR", "amount", tenant.get("memory_gb"), "unit", "GB-hour"),
+                    Map.of("resource_type", "STORAGE_GB_MONTH", "amount", tenant.get("storage_gb"), "unit", "GB-month"));
+        }
+        return usage;
+    }
+
+    @Transactional
+    public Map<String, Object> calculateBilling(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        String start = value(request, "periodStart", LocalDateTime.now().minusDays(30).toLocalDate().toString());
+        String end = value(request, "periodEnd", LocalDateTime.now().toLocalDate().toString());
+        Map<String, Double> rates = new HashMap<>();
+        rates.put("CPU_HOUR", number(request.get("cpuRate"), 0.8));
+        rates.put("MEMORY_GB_HOUR", number(request.get("memoryRate"), 0.08));
+        rates.put("GPU_HOUR", number(request.get("gpuRate"), 8));
+        rates.put("STORAGE_GB_MONTH", number(request.get("storageRate"), 0.12));
+        double amount = 0;
+        for (Map<String, Object> row : tenantUsage(tenantId)) amount += number(row.get("amount"), 0) * rates.getOrDefault(string(row.get("resource_type")), 0D);
+        String id = "bill-" + shortId();
+        jdbc.update("insert into ds_billing_record(id,tenant_id,period_start,period_end,amount,currency,status,created_at) values(?,?,?,?,?,'CNY','CALCULATED',?)", id, tenantId, start, end, Math.round(amount * 100.0) / 100.0, now());
+        audit("OPERATION", "BILLING_CALCULATE", "BILLING", id, "tenant=" + tenantId, true);
+        return requireRow("select * from ds_billing_record where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> reportBilling(Map<String, Object> request) {
+        String id = required(request, "billingId");
+        Map<String, Object> bill = requireRow("select * from ds_billing_record where id=?", id);
+        Map<String, Object> payload = new LinkedHashMap<>(bill);
+        payload.put("reportedAt", now());
+        Map<String, Object> exchange = trustedExchange(string(bill.get("tenant_id")), "PUSH", "billing.report", value(request, "idempotencyKey", "billing:" + id), json(payload), value(request, "signingSecret", tenantSecret(string(bill.get("tenant_id")))));
+        jdbc.update("update ds_billing_record set status='REPORTED',reported_at=? where id=?", now(), id);
+        return exchange;
+    }
+
+    public List<Map<String, Object>> listTrustedExchanges(String tenantId) {
+        if (notBlank(tenantId)) return jdbc.queryForList("select id,tenant_id,direction,event_type,idempotency_key,payload_hash,signature,status,attempts,last_error,created_at,updated_at from ds_trusted_exchange where tenant_id=? order by created_at desc limit 200", tenantId);
+        return jdbc.queryForList("select id,tenant_id,direction,event_type,idempotency_key,payload_hash,signature,status,attempts,last_error,created_at,updated_at from ds_trusted_exchange order by created_at desc limit 200");
+    }
+
+    public Map<String, Object> trustedPush(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        String payload = value(request, "payload", "{}");
+        return trustedExchange(tenantId, "PUSH", required(request, "eventType"), required(request, "idempotencyKey"), payload, value(request, "signingSecret", tenantSecret(tenantId)));
+    }
+
+    public Map<String, Object> trustedCallback(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        String payload = value(request, "payload", "{}");
+        Map<String, Object> result = trustedExchange(tenantId, "CALLBACK", required(request, "eventType"), required(request, "idempotencyKey"), payload, value(request, "signingSecret", tenantSecret(tenantId)));
+        dispatchWebhooks("trusted.callback", Map.of("tenantId", tenantId, "eventType", request.get("eventType"), "exchangeId", result.get("id")));
+        return result;
+    }
+
+    public Map<String, Object> verifyTrustedSignature(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        String payload = value(request, "payload", "{}");
+        String expected = hmacSha256(value(request, "signingSecret", tenantSecret(tenantId)), payload);
+        boolean valid = MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), required(request, "signature").getBytes(StandardCharsets.UTF_8));
+        audit("AUDIT", "TRUSTED_SIGNATURE_VERIFY", "TENANT", tenantId, "valid=" + valid, valid);
+        return Map.of("valid", valid, "payloadHash", sha256(payload.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    public List<Map<String, Object>> listAccessPolicies(String tenantId) {
+        requireRow("select id from ds_tenant where id=?", tenantId);
+        return jdbc.queryForList("select id,tenant_id,subject,action,resource,effect,expires_at,created_by,created_at from ds_access_policy where tenant_id=? order by created_at desc", tenantId);
+    }
+
+    @Transactional
+    public Map<String, Object> saveAccessPolicy(Map<String, Object> request) {
+        String id = value(request, "id", "pol-" + shortId());
+        String tenantId = required(request, "tenantId");
+        requireRow("select id from ds_tenant where id=?", tenantId);
+        jdbc.update("insert into ds_access_policy(id,tenant_id,subject,action,resource,effect,expires_at,created_by,created_at) values(?,?,?,?,?,?,?,?,?)", id, tenantId, required(request, "subject"), required(request, "action"), required(request, "resource"), value(request, "effect", "ALLOW"), value(request, "expiresAt", ""), actor(), now());
+        audit("OPERATION", "TRUSTED_POLICY_SAVE", "ACCESS_POLICY", id, json(request), true);
+        return requireRow("select * from ds_access_policy where id=?", id);
+    }
+
+    private Map<String, Object> trustedExchange(String tenantId, String direction, String eventType, String idempotencyKey, String payload, String secret) {
+        requireRow("select id from ds_tenant where id=?", tenantId);
+        String hash = sha256(payload.getBytes(StandardCharsets.UTF_8));
+        Map<String, Object> existing = null;
+        try { existing = requireRow("select id,tenant_id,direction,event_type,idempotency_key,payload_hash,signature,status,attempts,last_error,created_at,updated_at from ds_trusted_exchange where tenant_id=? and idempotency_key=?", tenantId, idempotencyKey); }
+        catch (IllegalArgumentException ignored) { }
+        if (existing != null) {
+            if (!hash.equals(string(existing.get("payload_hash")))) throw new IllegalArgumentException("幂等键已被其他 payload 使用");
+            return existing;
+        }
+        String id = "ex-" + shortId();
+        String signature = hmacSha256(secret, payload);
+        String now = now();
+        jdbc.update("insert into ds_trusted_exchange(id,tenant_id,direction,event_type,idempotency_key,payload,payload_hash,signature,status,attempts,last_error,created_at,updated_at) values(?,?,?,?,?,?,?,?,'SUCCESS',1,'',?,?)", id, tenantId, direction, eventType, idempotencyKey, payload, hash, signature, now, now);
+        audit("AUDIT", "TRUSTED_EXCHANGE_" + direction, "TRUSTED_EXCHANGE", id, eventType, true);
+        return requireRow("select id,tenant_id,direction,event_type,idempotency_key,payload_hash,signature,status,attempts,last_error,created_at,updated_at from ds_trusted_exchange where id=?", id);
+    }
+
+    private String tenantSecret(String tenantId) { return string(requireRow("select signing_secret from ds_tenant where id=?", tenantId).get("signing_secret")); }
+
+    private String hmacSha256(String secret, String payload) {
+        try { Mac mac = Mac.getInstance("HmacSHA256"); mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256")); return java.util.HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8))); }
+        catch (Exception e) { throw new IllegalStateException("签名计算失败", e); }
     }
 
     /* ------------------------------- Operations ------------------------------- */
