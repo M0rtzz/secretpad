@@ -623,7 +623,9 @@ public class DataDevService {
                     STATUS_CANCELLED, now(), now(), id, STATUS_PENDING);
         } else if (STATUS_RUNNING.equals(status)) {
             if (notBlank(jobId)) {
+                // stop 停止 Job；再 delete 终止运行中的 pod（stop 仅标记，运行中容器不立即退出）
                 devJobExecutor.stop(jobId, "Dev task cancelled");
+                devJobExecutor.delete(jobId);
             }
             jdbc.update("update ds_dev_task set status=?,finished_at=?,updated_at=? where id=? and status=?",
                     STATUS_CANCELLED, now(), now(), id, STATUS_RUNNING);

@@ -185,7 +185,7 @@ public class DevJobExecutor {
         }
     }
 
-    private String delete(String jobId) {
+    public String delete(String jobId) {
         if (!notBlank(jobId)) {
             return "";
         }
@@ -259,6 +259,7 @@ public class DevJobExecutor {
 
     /** 任务仍 Running 但结果已可取（endpoint 存在且 /result 是有效 CSV）→ 提前完成。 */
     private boolean finalizeIfReady(Map<String, Object> task, String jobId) {
+        String taskId = string(task.get("id"));
         Job.QueryJobResponse response;
         try {
             response = kuscia.queryJob(Job.QueryJobRequest.newBuilder().setJobId(jobId).build());
@@ -272,12 +273,51 @@ public class DevJobExecutor {
         if (endpoint.isEmpty()) {
             return false;
         }
+        // runner 失败时容器不退出：/status 返回 "failed"，保持提供 /log 供取回失败原因。
+        byte[] statusBody = fetchOutput(endpoint, "/status");
+        if (statusBody == null) {
+            return false; // 端点未就绪（容器启动 / 脚本执行中）
+        }
+        String runnerStatus = new String(statusBody, StandardCharsets.UTF_8).trim();
+        if ("failed".equalsIgnoreCase(runnerStatus)) {
+            String logText = fetchLog(endpoint);
+            String reason = extractFailureReason(logText);
+            fail(taskId, "执行容器失败: " + (notBlank(reason) ? reason : "脚本执行失败"),
+                    "dev:" + taskId + ":failed");
+            appendRunLog(taskId, retryCount(task), logText);
+            delete(jobId);
+            return true;
+        }
         byte[] body = fetchOutput(endpoint, "/result");
         if (body == null) {
             return false;
         }
         completeSuccess(task, jobId, endpoint, body);
         return true;
+    }
+
+    /** 从 run.log 提取明确的失败原因（ImportError / 超时 / rc 等），优先取 EXECUTION FAILED 行。 */
+    static String extractFailureReason(String logText) {
+        if (notBlank(logText)) {
+            String fallback = "";
+            for (String line : logText.split("\\n")) {
+                String t = line.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                if (t.contains("EXECUTION FAILED")) {
+                    return truncate(t.replaceFirst("^\\[[^]]*\\] EXECUTION FAILED: ", ""), 300);
+                }
+                if (t.contains("ImportError") || t.contains("SyntaxError") || t.contains("failed rc=")
+                        || t.contains("timed out")) {
+                    fallback = truncate(t, 300);
+                }
+            }
+            if (notBlank(fallback)) {
+                return fallback;
+            }
+        }
+        return "";
     }
 
     private void finalizeSuccess(Map<String, Object> task, String jobId, Job.QueryJobResponse response) {
