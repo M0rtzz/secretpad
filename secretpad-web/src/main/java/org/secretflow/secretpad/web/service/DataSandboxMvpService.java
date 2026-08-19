@@ -442,8 +442,9 @@ public class DataSandboxMvpService {
     /**
      * 告警统一入口：按 (source, dedupe_key) 对 OPEN 告警去重（dedupeKey 为空时按 source+title），
      * 插入后派发 alert.created webhook。dedupeKey 用于高频告警（节点指标/配额/沙箱异常）防刷屏。
+     * 供 Z-03 审批执行引擎复用。
      */
-    private void raiseAlert(String severity, String source, String title, String detail, String dedupeKey) {
+    public void raiseAlert(String severity, String source, String title, String detail, String dedupeKey) {
         String dedupe = dedupeKey == null ? "" : dedupeKey;
         long open;
         if (notBlank(dedupe)) {
@@ -459,8 +460,8 @@ public class DataSandboxMvpService {
         dispatchWebhooks("alert.created", Map.of("id", id, "severity", severity, "source", source, "title", title, "detail", detail, "dedupeKey", dedupe));
     }
 
-    /** 沙箱进入 ERROR 的统一告警（source=SANDBOX，按沙箱去重，RESOLVED 后可再次触发）。 */
-    private void raiseSandboxErrorAlert(String sandboxId, String detail) {
+    /** 沙箱进入 ERROR 的统一告警（source=SANDBOX，按沙箱去重，RESOLVED 后可再次触发）。供 Z-03 审批执行引擎复用。 */
+    public void raiseSandboxErrorAlert(String sandboxId, String detail) {
         raiseAlert("WARNING", "SANDBOX", "沙箱异常",
                 "沙箱 " + sandboxId + " 进入 ERROR：" + truncate(detail, 900),
                 "sandbox:" + sandboxId + ":error");
@@ -1110,7 +1111,8 @@ public class DataSandboxMvpService {
 
     /* ------------------------------- Internal helpers ------------------------------- */
 
-    private String startKuscia(Map<String, Object> sandbox) {
+    /** 启动 Kuscia Job（幂等：有 job 则 restart，否则 create）。供 Z-03 审批执行引擎复用。 */
+    public String startKuscia(Map<String, Object> sandbox) {
         if (!kusciaEnabled) {
             // 运行时未启用时禁止“假 RUNNING”：返回明确错误，由调用方将状态置为 ERROR
             return "Kuscia 运行时未启用（secretpad.data-sandbox.kuscia.enabled=false），请启用后重试";
@@ -1148,7 +1150,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private String stopKuscia(Map<String, Object> sandbox, String reason) {
+    /** 停止 Kuscia Job（幂等，job 为空返回 ""）。供 Z-03 审批执行引擎复用。 */
+    public String stopKuscia(Map<String, Object> sandbox, String reason) {
         if (!kusciaEnabled || !notBlank(string(sandbox.get("kuscia_job_id")))) return "";
         try {
             var response = kuscia.stopJob(Job.StopJobRequest.newBuilder().setJobId(string(sandbox.get("kuscia_job_id"))).setReason(reason).build());
@@ -1158,7 +1161,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private String deleteKuscia(Map<String, Object> sandbox) {
+    /** 删除 Kuscia Job（幂等，job 为空返回 ""）。供 Z-03 审批执行引擎复用。 */
+    public String deleteKuscia(Map<String, Object> sandbox) {
         if (!kusciaEnabled || !notBlank(string(sandbox.get("kuscia_job_id")))) return "";
         try {
             var response = kuscia.deleteJob(Job.DeleteJobRequest.newBuilder().setJobId(string(sandbox.get("kuscia_job_id"))).build());
@@ -1190,7 +1194,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private void assertCapacity(String ownerId, double cpu, double memory, int gpu, double storage) {
+    /** 容量与配额校验（提交到批准间容量可能变化，执行时重新校验）。供 Z-03 审批执行引擎复用。 */
+    public void assertCapacity(String ownerId, double cpu, double memory, int gpu, double storage) {
         Map<String, Double> global = usage(null);
         Map<String, Double> owner = usage(ownerId);
         Map<String, Object> quota = requireRow("select * from ds_resource_quota where owner_id=?", ownerId);
@@ -1208,7 +1213,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private Map<String, Double> usage(String ownerId) {
+    /** 资源用量统计（仅 RESERVED/BOUND）。供 Z-03 审批执行引擎复用。 */
+    public Map<String, Double> usage(String ownerId) {
         // Z-02：资源用量改为生命周期感知——只统计 RESERVED/BOUND 的分配行，
         // RELEASED 不再计数（停止/过期/销毁后 quota 与资源池余量立即回落）
         String suffix = ownerId == null ? "" : " and owner_id=?";
@@ -1228,7 +1234,8 @@ public class DataSandboxMvpService {
      * 按沙箱规格幂等创建 RESERVED 分配行（先清理同沙箱已有 RESERVED/BOUND，避免重复占额），
      * 并把 sandbox.alloc_state 置为 RESERVED。零配额类型不生成行（GPU=0 不占 GPU 额度）。
      */
-    private void reserveAllocations(Map<String, Object> sandbox) {
+    /** 按沙箱规格幂等创建 RESERVED 分配行。供 Z-03 审批执行引擎复用。 */
+    public void reserveAllocations(Map<String, Object> sandbox) {
         String sandboxId = string(sandbox.get("id"));
         jdbc.update("delete from ds_resource_allocation where sandbox_id=? and state in ('RESERVED','BOUND')", sandboxId);
         insertAllocation(sandboxId, "CPU", number(sandbox.get("cpu_cores"), 0), "RESERVED", sandbox);
@@ -1261,8 +1268,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    /** 释放：RESERVED/BOUND → RELEASED，GPU 台账归还，sandbox.alloc_state 置 RELEASED。 */
-    private void releaseAllocations(Map<String, Object> sandbox, String by) {
+    /** 释放：RESERVED/BOUND → RELEASED，GPU 台账归还，sandbox.alloc_state 置 RELEASED。供 Z-03 审批执行引擎复用。 */
+    public void releaseAllocations(Map<String, Object> sandbox, String by) {
         String sandboxId = string(sandbox.get("id"));
         jdbc.update("update ds_resource_allocation set state='RELEASED',released_at=?,released_by=? "
                 + "where sandbox_id=? and state in ('RESERVED','BOUND')", now(), by, sandboxId);
@@ -1296,8 +1303,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    /** 合并补丁到 runtime_meta（JSON），超长截断为 2048。 */
-    private void appendRuntimeMeta(String sandboxId, Map<String, Object> patch) {
+    /** 合并补丁到 runtime_meta（JSON），超长截断为 2048。供 Z-03 审批执行引擎复用。 */
+    public void appendRuntimeMeta(String sandboxId, Map<String, Object> patch) {
         try {
             Map<String, Object> meta = new LinkedHashMap<>();
             String raw = string(jdbc.queryForObject("select runtime_meta from ds_sandbox where id=?", String.class, sandboxId));
@@ -1371,7 +1378,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private void ensureQuota(String ownerId) {
+    /** 幂等补齐 owner 配额行。供 Z-03 审批执行引擎复用。 */
+    public void ensureQuota(String ownerId) {
         jdbc.update("insert or ignore into ds_resource_quota(owner_id,updated_by,updated_at) values(?,?,?)", ownerId, "system", now());
     }
 
@@ -1381,7 +1389,8 @@ public class DataSandboxMvpService {
                 id, action, from, to, actor(), comment, now());
     }
 
-    private void auditAs(String type, String level, String actor, String action, String resourceType, String resourceId, String detail, boolean success) {
+    /** 统一审计落库（显式 actor，供引擎身份使用）。供 Z-03 审批执行引擎复用。 */
+    public void auditAs(String type, String level, String actor, String action, String resourceType, String resourceId, String detail, boolean success) {
         try {
             String ip = "";
             try { if (RequestUtils.getCurrentHttpRequest() != null) ip = RequestUtils.getRemoteHost(); } catch (Exception ignored) { }
@@ -1392,7 +1401,8 @@ public class DataSandboxMvpService {
         }
     }
 
-    private void dispatchWebhooks(String event, Map<String, Object> payload) {
+    /** 按事件派发 webhook（精确/通配匹配）。供 Z-03 审批执行引擎复用。 */
+    public void dispatchWebhooks(String event, Map<String, Object> payload) {
         String body = json(Map.of("event", event, "time", now(), "data", payload));
         for (Map<String, Object> webhook : jdbc.queryForList("select id,events from ds_webhook where enabled=1")) {
             String events = string(webhook.get("events"));

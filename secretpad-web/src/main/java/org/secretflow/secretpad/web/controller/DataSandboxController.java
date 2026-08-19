@@ -12,6 +12,7 @@ package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalGate;
 
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -38,9 +39,11 @@ import java.util.Map;
 public class DataSandboxController {
 
     private final DataSandboxMvpService service;
+    private final SandboxApprovalGate gate;
 
-    public DataSandboxController(DataSandboxMvpService service) {
+    public DataSandboxController(DataSandboxMvpService service, SandboxApprovalGate gate) {
         this.service = service;
+        this.gate = gate;
     }
 
     @Operation(summary = "查询沙箱")
@@ -55,12 +58,19 @@ public class DataSandboxController {
     @Operation(summary = "创建沙箱")
     @PostMapping("/sandboxes/create")
     public SecretPadResponse<Map<String, Object>> createSandbox(@RequestBody Map<String, Object> request) {
+        // Z-03 门禁：approval.required 开启且非 admin/运营方时，直接创建被拒，需提交申请单
+        gate.assertDirectCreateAllowed();
         return SecretPadResponse.success(service.createSandbox(request));
     }
 
     @Operation(summary = "沙箱启停、销毁、续期或快照")
     @PostMapping("/sandboxes/action")
     public SecretPadResponse<Map<String, Object>> sandboxAction(@RequestBody Map<String, Object> request) {
+        // Z-03 门禁：RENEW/DESTROY 在 approval.required 开启且非 admin/运营方时需走申请单；START/STOP/SNAPSHOT 不设门禁
+        String action = String.valueOf(request.get("action"));
+        if ("RENEW".equals(action) || "DESTROY".equals(action)) {
+            gate.assertDirectActionAllowed(action);
+        }
         return SecretPadResponse.success(service.sandboxAction(request));
     }
 

@@ -206,6 +206,14 @@ secretpad:
     alerts:
       # 单用户配额使用率告警阈值（%）
       quota-warning-percent: ${DATA_SANDBOX_ALERT_QUOTA_PERCENT:90}
+    # Z-03 沙箱资源申请与审批
+    approval:
+      # 门禁开关：开启时创建/续期/回收必须提交申请单且审批通过才能执行（admin/运营方直通）
+      required: ${SECRETPAD_DATA_SANDBOX_APPROVAL_REQUIRED:true}
+      # 审批通过后自动执行轮询周期（毫秒）
+      executor-interval-ms: ${SECRETPAD_DATA_SANDBOX_APPROVAL_EXECUTOR_INTERVAL:10000}
+      # 执行失败自动重试上限（超过置 FAILED，可人工 RETRY）
+      max-retries: ${SECRETPAD_DATA_SANDBOX_APPROVAL_MAX_RETRIES:3}
   datasync:
     center: true
     p2p: false
