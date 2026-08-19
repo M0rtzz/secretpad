@@ -309,7 +309,7 @@ public class DataDevIT {
         assertTrue(count("select count(1) from ds_unified_log where action='DEV_TASK_LINEAGE' and resource_id=? and detail like '%" + resultDt + "%'", taskId) > 0);
         // 挂载 + 重复挂载冲突
         dataDev.mountResult(Map.of("taskId", taskId, "projectId", "p1"));
-        assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? and source='CREATED' and is_deleted=0", resultDt));
+        assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? and source='IMPORTED' and is_deleted=0", resultDt));
         assertThrows(IllegalStateException.class, () -> dataDev.mountResult(Map.of("taskId", taskId, "projectId", "p1")));
         // DEV 任务不可挂载
         Map<String, Object> devTask = submitSql("it-sql-dev2", "DEV", "SELECT count(*) c FROM src");

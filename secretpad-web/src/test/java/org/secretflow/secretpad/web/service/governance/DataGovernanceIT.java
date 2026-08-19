@@ -581,13 +581,13 @@ public class DataGovernanceIT {
         assertThrows(IllegalArgumentException.class, () -> governance.policyDetail(policyId));
     }
 
-    /** 17. 结果挂载项目（source=CREATED）。 */
+    /** 17. 结果挂载项目（source=IMPORTED，项目数据集树仅按 IMPORTED 查询）。 */
     @Test
     public void mountResultToProject() {
         Map<String, Object> task = submitSamplingOnly("RANDOM", 5);
         String taskId = String.valueOf(task.get("id"));
         governance.mountResult(Map.of("taskId", taskId, "projectId", "p1"));
-        assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? and source='CREATED' and is_deleted=0",
+        assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? and source='IMPORTED' and is_deleted=0",
                 String.valueOf(task.get("result_datatable_id"))));
         // 重复挂载冲突
         assertThrows(IllegalStateException.class, () -> governance.mountResult(Map.of("taskId", taskId, "projectId", "p1")));

@@ -55,7 +55,7 @@ import java.util.UUID;
  * <p>与 {@code DataGovernanceService} 同构：JdbcTemplate + 条件 UPDATE（affected==1）做并发控制，
  * 审计/告警/webhook 复用 {@link DataSandboxMvpService#auditAs} / {@code raiseAlert} / {@code dispatchWebhooks}。
  * 运行模式：DEV 调试运行（同步/取回即返回日志+结果预览，不注册结果表）；PROD 正式运行
- * （注册结果 Kuscia DomainData + 血缘 + 可挂载项目 source=CREATED）。</p>
+ * （注册结果 Kuscia DomainData + 血缘 + 可挂载项目 source=IMPORTED）。</p>
  *
  * <p>执行分发：SQL 在平台内嵌 SQLite（进程内只读，{@link DevSqlEngine}）；JAR/PYTHON 由
  * {@link DevJobExecutor} 在一次性 Kuscia Job 中运行。PYTHON 提交前经 {@link DevDependencyChecker}
@@ -712,7 +712,8 @@ public class DataDevService {
         return jdbc.queryForList(sql.toString(), args.toArray());
     }
 
-    /** 结果数据集挂载项目（source=CREATED），复用 project_datatable 授权表。仅 PROD 结果可挂载。 */
+    /** 结果数据集挂载项目（source=IMPORTED），复用 project_datatable 授权表。仅 PROD 结果可挂载。
+     *  source 须为 IMPORTED，否则项目数据集树（仅按 IMPORTED 查询）不展示挂载结果。 */
     public Map<String, Object> mountResult(Map<String, Object> request) {
         String taskId = required(request, "taskId");
         String projectId = required(request, "projectId");
@@ -731,7 +732,7 @@ public class DataDevService {
         }
         String tableConfigs = buildTableConfigs(taskId);
         jdbc.update("insert into project_datatable(project_id,node_id,datatable_id,table_configs,source,is_deleted) values(?,?,?,?,?,0)",
-                projectId, nodeId, datatableId, tableConfigs, "CREATED");
+                projectId, nodeId, datatableId, tableConfigs, "IMPORTED");
         audit("DEV_RESULT_MOUNT", "DEV_TASK", taskId, "project=" + projectId + " result=" + datatableId, true);
         dispatch("dev.result.mounted", Map.of("taskId", taskId, "projectId", projectId, "datatableId", datatableId));
         return taskDetail(taskId);

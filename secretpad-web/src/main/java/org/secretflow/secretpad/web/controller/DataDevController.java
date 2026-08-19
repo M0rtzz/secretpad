@@ -226,7 +226,7 @@ public class DataDevController {
         return SecretPadResponse.success(service.runLog(taskId, attempt));
     }
 
-    @Operation(summary = "PROD 结果挂载项目（source=CREATED）")
+    @Operation(summary = "PROD 结果挂载项目（source=IMPORTED）")
     @PostMapping("/tasks/mount")
     public SecretPadResponse<Map<String, Object>> mountResult(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.mountResult(request));

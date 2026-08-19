@@ -120,7 +120,7 @@ public class DataGovernanceController {
         return SecretPadResponse.success(service.listResults(nodeId));
     }
 
-    @Operation(summary = "结果数据集挂载项目（source=CREATED）")
+    @Operation(summary = "结果数据集挂载项目（source=IMPORTED）")
     @PostMapping("/tasks/mount")
     public SecretPadResponse<Map<String, Object>> mountResult(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.mountResult(request));
