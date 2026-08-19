@@ -1,0 +1,68 @@
+#
+# Copyright 2026 Ant Group Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Z-05 Python 计算任务运行组件 AppImage：一次性 Kuscia Job + scope=Cluster 结果取回端口。
+# 输入数据 + 用户脚本 + 依赖白名单经 task_input_config（configTemplates 挂载为 /etc/kuscia/py-conf.json）
+# 携带，平台侧 DevJobExecutor 以 createJob(task_input_config=...) 下发（exec_type=PYTHON）；
+# 容器内 python_runner.py 解码 -> 前置 import 守卫 prologue -> python 执行 -> 常驻 :8000 提供 /result。
+# 白名单硬保证：无网络（network_policy + 仅结果 Cluster 端口）、无 pip、仅预装白名单包（numpy/pandas）。
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-python-runner
+spec:
+  configTemplates:
+    pyConf: |-
+      {"task_input_config": "{{.TASK_INPUT_CONFIG}}"}
+  deployTemplates:
+    - name: python-runner
+      replicas: 1
+      spec:
+        containers:
+          - command:
+              - sh
+              - -c
+              - "python /app/python_runner.py --config /etc/kuscia/py-conf.json"
+            configVolumeMounts:
+              - mountPath: /etc/kuscia/py-conf.json
+                subPath: pyConf
+            name: python-runner
+            ports:
+              - name: py
+                port: 8000
+                protocol: HTTP
+                scope: Cluster        # 结果取回通道：平台经 secretpad.gateway Host 头路由访问
+            # 常驻服务：脚本先于 serve_forever 同步执行，失败则容器退出 -> Job Failed
+            readinessProbe:
+              tcpSocket:
+                port: py
+            livenessProbe:
+              tcpSocket:
+                port: py
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: py
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+            workingDir: /app
+        restartPolicy: Never
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

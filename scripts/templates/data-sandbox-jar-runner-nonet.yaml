@@ -1,0 +1,64 @@
+#
+# Copyright 2026 Ant Group Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Z-05 JAR 计算任务运行组件隔离对照变体：jar 端口 scope=Cluster → Domain，
+# Kuscia 不分配集群外可达端点，平台无法经 gateway 取回结果（不可达证明，供 E2E 对照）。
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jar-runner-nonet
+spec:
+  configTemplates:
+    jarConf: |-
+      {"task_input_config": "{{.TASK_INPUT_CONFIG}}"}
+  deployTemplates:
+    - name: jar-runner
+      replicas: 1
+      spec:
+        containers:
+          - command:
+              - sh
+              - -c
+              - "python /app/jar_runner.py --config /etc/kuscia/jar-conf.json"
+            configVolumeMounts:
+              - mountPath: /etc/kuscia/jar-conf.json
+                subPath: jarConf
+            name: jar-runner
+            ports:
+              - name: jar
+                port: 8000
+                protocol: HTTP
+                scope: Domain        # 隔离变体：无 Cluster 端点 = 平台不可达
+            readinessProbe:
+              tcpSocket:
+                port: jar
+            livenessProbe:
+              tcpSocket:
+                port: jar
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: jar
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+            workingDir: /app
+        restartPolicy: Never
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}
