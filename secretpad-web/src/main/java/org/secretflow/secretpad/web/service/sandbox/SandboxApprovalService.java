@@ -19,6 +19,7 @@ import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -66,7 +67,7 @@ public class SandboxApprovalService {
     private int maxRetries;
 
     public SandboxApprovalService(
-            JdbcTemplate jdbc,
+            @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             DataSandboxMvpService service,
             SandboxApprovalGate gate) {

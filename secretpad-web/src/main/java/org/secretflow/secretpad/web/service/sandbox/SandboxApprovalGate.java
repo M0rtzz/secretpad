@@ -91,24 +91,40 @@ public class SandboxApprovalGate {
                 ? nodeId : user.getOwnerId();
     }
 
-    /** 门禁：审批开启且当前用户非 admin/运营方时，直接创建被拒，需提交申请单。 */
+    /**
+     * 门禁直通判定：仅 admin 或平台管理节点（kuscia-system）运维账号可直接创建/续期/回收。
+     * 普通节点用户即使 ownerId 与目标沙箱 owner 相同（申请方本人）也**不能**直通，
+     * 必须提交申请单走两级审批——否则门禁对申请人恒真、形同虚设。
+     */
+    private boolean canBypassDirect() {
+        UserContextDTO user = currentUser();
+        if (user == null) {
+            return false;
+        }
+        if (isAdmin(user)) {
+            return true;
+        }
+        return "kuscia-system".equals(user.getOwnerId()) || "kuscia-system".equals(user.getPlatformNodeId());
+    }
+
+    /** 门禁：审批开启且当前用户非 admin/平台运营方时，直接创建被拒，需提交申请单。 */
     public void assertDirectCreateAllowed() {
         if (!approvalRequired) {
             return;
         }
-        if (isAdminOrOperator(currentUser(), effectiveOwner())) {
+        if (canBypassDirect()) {
             return;
         }
         throw SecretpadException.of(AuthErrorCode.AUTH_FAILED,
                 "创建沙箱需提交申请单审批（GET /approvals/config 查看门禁）");
     }
 
-    /** 门禁：审批开启且当前用户非 admin/运营方时，RENEW/DESTROY 直接操作被拒，需走申请单。 */
+    /** 门禁：审批开启且当前用户非 admin/平台运营方时，RENEW/DESTROY 直接操作被拒，需走申请单。 */
     public void assertDirectActionAllowed(String action) {
         if (!approvalRequired) {
             return;
         }
-        if (isAdminOrOperator(currentUser(), effectiveOwner())) {
+        if (canBypassDirect()) {
             return;
         }
         if ("RENEW".equals(action)) {
