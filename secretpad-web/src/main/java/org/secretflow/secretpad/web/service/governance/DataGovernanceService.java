@@ -39,6 +39,7 @@ import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -87,12 +88,16 @@ public class DataGovernanceService {
     private final DatatableManager datatableManager;
     private final NodeRepository nodeRepository;
     private final DataSandboxMvpService mvp;
+    private final GovernanceCustomExecutor customExecutor;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
 
     @Value("${secretpad.data-sandbox.governance.input-rows:5000}")
     private long maxInputRows;
+
+    @Value("${secretpad.data-sandbox.governance.input-bytes:262144}")
+    private long maxInputBytes;
 
     @Value("${secretpad.data-sandbox.governance.max-retries:3}")
     private int maxRetries;
@@ -103,13 +108,15 @@ public class DataGovernanceService {
             KusciaGrpcClientAdapter kuscia,
             DatatableManager datatableManager,
             NodeRepository nodeRepository,
-            DataSandboxMvpService mvp) {
+            DataSandboxMvpService mvp,
+            GovernanceCustomExecutor customExecutor) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
         this.datatableManager = datatableManager;
         this.nodeRepository = nodeRepository;
         this.mvp = mvp;
+        this.customExecutor = customExecutor;
     }
 
     /* ============================== 权限 ============================== */
@@ -243,10 +250,61 @@ public class DataGovernanceService {
         return submitBuiltinTask(request);
     }
 
-    /** 自定义代码执行（Z-04 受控能力）：由执行组件在一次性 Kuscia Job 中运行，结果取回后注册。 */
+    /**
+     * 自定义代码执行（Z-04 受控能力）：输入子集（行数/字节均受限）随 task_input_config 进入
+     * 一次性 Kuscia Job，由 {@link GovernanceCustomExecutor} 提交并在轮询中取回结果。
+     */
     public Map<String, Object> submitCustomTask(Map<String, Object> request) {
-        // Stage 2 注入 GovernanceCustomExecutor 后启用；未启用时给出明确错误
-        throw new IllegalArgumentException(GOV_PARAM_INVALID + ": 自定义代码执行组件尚未启用");
+        String nodeId = required(request, "nodeId");
+        String datatableId = required(request, "datatableId");
+        String script = required(request, "script");
+        checkSourcePermission(currentUser(), nodeId, datatableId);
+
+        DatatableDTO source = resolveSource(nodeId, datatableId);
+        String relativeUri = source.getRelativeUri();
+        if (!notBlank(relativeUri)) {
+            throw new IllegalArgumentException(GOV_NOT_FOUND + ": 源数据表缺少 relativeUri");
+        }
+        Map<String, Object> policy = resolvePolicyMap(request);
+        Map<String, Object> sampling = resolveSampling(request, policy);
+
+        // 读源 + 行数/字节校验（超限在任务创建前拒绝，不产生任务记录）
+        List<List<String>> parsed = readCsv(nodeId, relativeUri);
+        List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));
+        List<List<String>> data = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
+        if (data.size() > maxInputRows) {
+            throw new IllegalArgumentException(GOV_INPUT_TOO_LARGE + ": 源数据行数 " + data.size() + " 超过上限 " + maxInputRows);
+        }
+        if (header.isEmpty()) {
+            throw new IllegalArgumentException(GOV_PARAM_INVALID + ": 源 CSV 表头为空");
+        }
+        String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+        if (inputB64.length() > maxInputBytes) {
+            throw new IllegalArgumentException(GOV_INPUT_TOO_LARGE + ": 输入数据超过 " + maxInputBytes + " 字节上限");
+        }
+        Map<String, Object> params = new LinkedHashMap<>();
+        if (request.get("params") instanceof Map<?, ?> paramsMap) {
+            params.putAll(castMap(paramsMap));
+        }
+
+        String taskId = createTask(request, "CUSTOM", nodeId, datatableId, relativeUri, policy, sampling, List.of());
+        // 自定义任务快照：脚本全文入 script_content，params/输入行数入 exec_params，输入行数入 source_rows
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("sampling", sampling == null ? new LinkedHashMap<>() : sampling);
+        snapshot.put("masking", new ArrayList<>());
+        snapshot.put("custom", Map.of("params", params, "inputRows", data.size()));
+        jdbc.update("update ds_governance_task set script_content=?,source_rows=?,exec_params=? where id=?",
+                script, data.size(), json(snapshot), taskId);
+        audit("GOVERNANCE_TASK_SUBMIT", "GOVERNANCE_TASK", taskId, "mode=CUSTOM source=" + nodeId + "/" + datatableId, true);
+        dispatch("governance.task.submitted", Map.of("id", taskId, "mode", "CUSTOM"));
+        try {
+            claimTask(taskId);
+            customExecutor.submit(taskId, nodeId, inputB64, script, params);
+        } catch (Exception e) {
+            log.warn("Governance custom task {} submit failed: {}", taskId, e.getMessage(), e);
+            failTask(taskId, e);
+        }
+        return taskDetail(taskId);
     }
 
     /** 内置抽样/脱敏执行流（同步，任务级状态机 PENDING→RUNNING→SUCCEEDED/FAILED）。 */
@@ -368,9 +426,22 @@ public class DataGovernanceService {
                 now(), STATUS_RUNNING, now(), id, STATUS_FAILED);
         audit("GOVERNANCE_TASK_RETRY", "GOVERNANCE_TASK", id, "retry=" + (retries + 1), true);
         try {
-            runBuiltin(id, source, header, data, sampling, masking);
+            if ("CUSTOM".equals(string(task.get("exec_mode")))) {
+                String script = string(task.get("script_content"));
+                String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+                Map<String, Object> params = new LinkedHashMap<>();
+                if (snapshot.get("custom") instanceof Map<?, ?> custom) {
+                    Object customParams = castMap(custom).get("params");
+                    if (customParams instanceof Map<?, ?> p) {
+                        params.putAll(castMap(p));
+                    }
+                }
+                customExecutor.submit(id, nodeId, inputB64, script, params);
+            } else {
+                runBuiltin(id, source, header, data, sampling, masking);
+            }
         } catch (Exception e) {
-            log.warn("Governance builtin retry {} failed: {}", id, e.getMessage(), e);
+            log.warn("Governance retry {} failed: {}", id, e.getMessage(), e);
             failTask(id, e);
         }
         return taskDetail(id);
