@@ -129,12 +129,16 @@ public class DataGovernanceIT {
 
     @BeforeAll
     public void startMock() throws Exception {
-        // 数据目录 + 源 CSV
+        // 数据目录 + 源 CSV（alice + p2p-node 两个数据目录）
         Files.createDirectories(Path.of(DATA_ROOT, "alice"));
+        Files.createDirectories(Path.of(DATA_ROOT, "p2p-node"));
+        byte[] csvBytes;
         try (InputStream in = getClass().getResourceAsStream("/gov/sample_full.csv")) {
             assertNotNull(in, "test resource gov/sample_full.csv missing");
-            Files.copy(in, Path.of(DATA_ROOT, "alice", SOURCE_URI), StandardCopyOption.REPLACE_EXISTING);
+            csvBytes = in.readAllBytes();
         }
+        Files.write(Path.of(DATA_ROOT, "alice", SOURCE_URI), csvBytes);
+        Files.write(Path.of(DATA_ROOT, "p2p-node", SOURCE_URI), csvBytes);
         mockServer = new MockKusciaGrpcServer();
         mockServer.start(MOCK_PORT, KusciaProtocolEnum.NOTLS, List.of(
                 new GovernanceDomainDataService(), new JobService(), new HealthService()));
@@ -154,7 +158,7 @@ public class DataGovernanceIT {
         jdbc.update("delete from ds_governance_task");
         jdbc.update("delete from ds_governance_policy");
         jdbc.update("delete from project_datatable where project_id in ('p1','p2')");
-        jdbc.update("delete from node where node_id in ('alice','carol')");
+        jdbc.update("delete from node where node_id in ('alice','carol','p2p-node')");
         jdbc.update("delete from ds_alert_event where source='GOVERNANCE'");
         jdbc.update("delete from ds_unified_log where resource_type='GOVERNANCE_POLICY' or resource_type='GOVERNANCE_TASK' or action like 'GOVERNANCE%'");
         GovernanceDomainDataService.created.clear();
@@ -477,6 +481,27 @@ public class DataGovernanceIT {
         request.put("masking", List.of());
         Map<String, Object> task = governance.submitBuiltinTask(request);
         assertEquals("SUCCEEDED", String.valueOf(task.get("status")));
+    }
+
+    /** 13b. P2P 模式平台自有数据：node.instId == user.ownerId（如 dev-zgz/ctqkgaov）→ 允许；其他机构被拒。 */
+    @Test
+    public void platformOwnedDataByInstAllowed() {
+        GovernanceDomainDataService.domainId = "p2p-node"; // mock DomainData author 即结果/源 nodeId
+        jdbc.update("insert into node(node_id,name,control_node_id,type,mode,inst_id) values('p2p-node','p2p-node-name','master','normal',0,'alice')");
+        UserContext.setBaseUser(alice()); // ownerId=alice == p2p-node.inst_id
+        Map<String, Object> request = new java.util.LinkedHashMap<>();
+        request.put("nodeId", "p2p-node");
+        request.put("datatableId", SOURCE_DT);
+        request.put("sampling", Map.of("method", "RANDOM", "count", 3));
+        request.put("masking", List.of());
+        Map<String, Object> task = governance.submitBuiltinTask(request);
+        assertEquals("SUCCEEDED", String.valueOf(task.get("status")));
+        assertEquals("p2p-node", String.valueOf(task.get("result_node_id")));
+        // 其他机构（carol）无权访问 p2p-node
+        UserContext.setBaseUser(carol());
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> governance.submitBuiltinTask(request));
+        assertTrue(e.getMessage().contains(DataGovernanceService.GOV_NO_PERMISSION), e.getMessage());
     }
 
     /** 14. 输入超限：压低 input-rows 上限 → 任务创建前即被拒绝（GOV_INPUT_TOO_LARGE），不产生任务记录。 */

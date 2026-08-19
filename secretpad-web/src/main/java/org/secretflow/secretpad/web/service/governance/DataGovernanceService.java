@@ -128,11 +128,11 @@ public class DataGovernanceService {
         if (user == null || !notBlank(user.getOwnerId())) {
             throw noPermission();
         }
-        if (nodeId.equals(user.getOwnerId())) {
-            NodeDO node = nodeRepository.findByNodeId(nodeId);
-            if (node != null) {
-                return;
-            }
+        // 平台自有数据：节点即用户平台节点（EDGE 模式 nodeId == ownerId），
+        // 或节点属于用户所在机构（P2P 模式 node.instId == user.ownerId，如 dev-zgz/ctqkgaov）
+        NodeDO node = nodeRepository.findByNodeId(nodeId);
+        if (node != null && (nodeId.equals(user.getOwnerId()) || user.getOwnerId().equals(node.getInstId()))) {
+            return;
         }
         Set<String> projectIds = user.getProjectIds();
         if (projectIds != null && !projectIds.isEmpty()) {
