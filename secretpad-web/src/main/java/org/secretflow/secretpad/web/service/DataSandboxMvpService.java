@@ -16,6 +16,7 @@ import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
 import org.secretflow.secretpad.web.service.sandbox.SandboxStatusMachine;
+import org.secretflow.secretpad.web.service.sandbox.SecretCipher;
 import org.secretflow.secretpad.web.util.RequestUtils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -33,6 +34,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -43,6 +46,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.time.Duration;
@@ -58,6 +67,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
+import java.net.URLEncoder;
 
 /**
  * Compact application service for the Data Sandbox MVP.
@@ -73,10 +87,13 @@ public class DataSandboxMvpService {
     private static final Set<String> NETWORK_POLICIES = Set.of("INTERNAL_ONLY", "ALLOW_LIST", "NO_NETWORK");
     private static final Set<String> LOG_TYPES = Set.of("OPERATION", "AUDIT", "LOGIN", "SYSTEM");
     private static final Set<String> MODEL_STATES = Set.of("MODEL_REVIEW", "RESOURCE_REVIEW", "APPROVED", "REJECTED", "PUBLISHED");
+    private static final long MAX_CONFIG_BACKUP_BYTES = 256L * 1024 * 1024;
+    private static final long MAX_ARTIFACT_BACKUP_BYTES = 512L * 1024 * 1024;
 
     private final JdbcTemplate jdbc;
     private final ObjectMapper objectMapper;
     private final KusciaGrpcClientAdapter kuscia;
+    private final SecretCipher secretCipher;
     private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
     @Value("${secretpad.node-id:kuscia-system}")
@@ -91,6 +108,12 @@ public class DataSandboxMvpService {
     @Value("${secretpad.data-sandbox.backup-root:/nas/Misc/data-sandbox/backups}")
     private String backupRoot;
 
+    @Value("${secretpad.data-sandbox.config-root:/app/config}")
+    private String configRoot;
+
+    @Value("${secretpad.data-sandbox.artifact-root:/app/data}")
+    private String artifactRoot;
+
     @Value("${secretpad.data-sandbox.dev-endpoint.token-ttl-minutes:30}")
     private int devTokenTtlMinutes;
 
@@ -103,10 +126,12 @@ public class DataSandboxMvpService {
     public DataSandboxMvpService(
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
-            KusciaGrpcClientAdapter kuscia) {
+            KusciaGrpcClientAdapter kuscia,
+            SecretCipher secretCipher) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
+        this.secretCipher = secretCipher;
     }
 
     /** Kuscia 运行时是否启用（供 Z-03 审批执行引擎判断 CREATE/SPEC_CHANGE 可否拉起）。 */
@@ -668,12 +693,13 @@ public class DataSandboxMvpService {
     /* ------------------------------- Integrations ------------------------------- */
 
     public Map<String, Object> integrationOverview() {
-        List<Map<String, Object>> clients = jdbc.queryForList("select id,name,client_id,scopes,enabled,last_used_at,created_by,created_at from ds_api_client order by created_at desc");
+        List<Map<String, Object>> clients = jdbc.queryForList("select id,name,client_id,scopes,enabled,last_used_at,secret_version,rotated_at,expires_at,created_by,created_at from ds_api_client order by created_at desc");
         List<Map<String, Object>> webhooks = jdbc.queryForList("select id,name,url,events,enabled,created_by,created_at,updated_at from ds_webhook order by created_at desc");
         List<Map<String, Object>> deliveries = jdbc.queryForList("select * from ds_webhook_delivery order by created_at desc limit 100");
         Map<String, Object> oidc = new HashMap<>(requireRow("select * from ds_oidc_config where id=1"));
         oidc.put("has_client_secret", notBlank(string(oidc.remove("client_secret"))));
-        return Map.of("clients", clients, "webhooks", webhooks, "deliveries", deliveries, "oidc", oidc,
+        List<Map<String, Object>> mappings = jdbc.queryForList("select * from ds_oidc_role_mapping order by created_at desc");
+        return Map.of("clients", clients, "webhooks", webhooks, "deliveries", deliveries, "oidc", oidc, "oidcMappings", mappings,
                 "openapi", "/swagger-ui/index.html", "openapiJson", "/v3/api-docs");
     }
 
@@ -682,10 +708,12 @@ public class DataSandboxMvpService {
         String id = "cli-" + shortId();
         String clientId = "ds_" + shortId() + shortId();
         String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
-        jdbc.update("insert into ds_api_client(id,name,client_id,secret_hash,scopes,enabled,created_by,created_at) values(?,?,?,?,?,1,?,?)",
-                id, required(request, "name"), clientId, sha256(secret.getBytes(StandardCharsets.UTF_8)), value(request, "scopes", "sandbox:read"), actor(), now());
+        int validityDays = Math.max(1, Math.min(nonNegativeInt(request, "validityDays", 90), 3650));
+        jdbc.update("insert into ds_api_client(id,name,client_id,secret_hash,scopes,enabled,expires_at,created_by,created_at) values(?,?,?,?,?,1,?,?,?)",
+                id, required(request, "name"), clientId, sha256(secret.getBytes(StandardCharsets.UTF_8)), value(request, "scopes", "sandbox:read"),
+                LocalDateTime.now().plusDays(validityDays).toString(), actor(), now());
         audit("AUDIT", "API_CLIENT_CREATE", "API_CLIENT", id, "", true);
-        Map<String, Object> result = new HashMap<>(requireRow("select id,name,client_id,scopes,enabled,created_by,created_at from ds_api_client where id=?", id));
+        Map<String, Object> result = new HashMap<>(requireRow("select id,name,client_id,scopes,enabled,secret_version,expires_at,created_by,created_at from ds_api_client where id=?", id));
         result.put("client_secret", secret);
         result.put("notice", "客户端密钥只显示一次，请立即保存");
         return result;
@@ -715,16 +743,32 @@ public class DataSandboxMvpService {
     }
 
     @Transactional
+    public Map<String, Object> rotateApiClient(String id) {
+        Map<String, Object> client = requireRow("select id,name,client_id,scopes,enabled,secret_version from ds_api_client where id=?", id);
+        if (number(client.get("enabled"), 0) != 1) throw new IllegalStateException("已吊销凭证不能轮换");
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
+        jdbc.update("update ds_api_client set secret_hash=?,secret_version=secret_version+1,rotated_at=?,expires_at=? where id=?",
+                sha256(secret.getBytes(StandardCharsets.UTF_8)), now(), LocalDateTime.now().plusDays(90).toString(), id);
+        audit("AUDIT", "API_CLIENT_ROTATE", "API_CLIENT", id, "version=" + ((int) number(client.get("secret_version"), 1) + 1), true);
+        Map<String, Object> result = new LinkedHashMap<>(requireRow("select id,name,client_id,scopes,enabled,secret_version,rotated_at from ds_api_client where id=?", id));
+        result.put("client_secret", secret);
+        result.put("notice", "新密钥只显示一次，旧密钥已立即失效");
+        return result;
+    }
+
+    @Transactional
     public Map<String, Object> saveWebhook(Map<String, Object> request) {
         String url = required(request, "url");
         validateHttpUrl(url);
         String id = value(request, "id", "wh-" + shortId());
         String now = now();
-        int changed = jdbc.update("update ds_webhook set name=?,url=?,events=?,secret=?,enabled=?,updated_at=? where id=?",
-                required(request, "name"), url, value(request, "events", "sandbox.created"), value(request, "secret", ""), bool(request, "enabled", true) ? 1 : 0, now, id);
+        String requestedSecret = value(request, "secret", "");
+        String storedSecret = notBlank(requestedSecret) ? secretCipher.encrypt(requestedSecret) : "";
+        int changed = jdbc.update("update ds_webhook set name=?,url=?,events=?,secret=case when ?='' then secret else ? end,enabled=?,updated_at=? where id=?",
+                required(request, "name"), url, value(request, "events", "sandbox.created"), storedSecret, storedSecret, bool(request, "enabled", true) ? 1 : 0, now, id);
         if (changed == 0) {
             jdbc.update("insert into ds_webhook(id,name,url,events,secret,enabled,created_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
-                    id, required(request, "name"), url, value(request, "events", "sandbox.created"), value(request, "secret", ""), bool(request, "enabled", true) ? 1 : 0, actor(), now, now);
+                    id, required(request, "name"), url, value(request, "events", "sandbox.created"), storedSecret, bool(request, "enabled", true) ? 1 : 0, actor(), now, now);
         }
         audit("AUDIT", "WEBHOOK_SAVE", "WEBHOOK", id, url, true);
         return requireRow("select id,name,url,events,enabled,created_by,created_at,updated_at from ds_webhook where id=?", id);
@@ -742,12 +786,31 @@ public class DataSandboxMvpService {
     @Transactional
     public Map<String, Object> saveOidc(Map<String, Object> request) {
         Map<String, Object> current = requireRow("select * from ds_oidc_config where id=1");
-        String secret = value(request, "clientSecret", string(current.get("client_secret")));
+        String requestedSecret = value(request, "clientSecret", "");
+        String secret = notBlank(requestedSecret) ? secretCipher.encrypt(requestedSecret) : string(current.get("client_secret"));
         jdbc.update("update ds_oidc_config set issuer=?,client_id=?,client_secret=?,scopes=?,enabled=?,discovery_status='UNTESTED',discovery_message='',updated_by=?,updated_at=? where id=1",
                 value(request, "issuer", ""), value(request, "clientId", ""), secret,
                 value(request, "scopes", "openid profile email"), bool(request, "enabled", false) ? 1 : 0, actor(), now());
         audit("AUDIT", "OIDC_CONFIG_UPDATE", "OIDC", "1", "issuer=" + value(request, "issuer", ""), true);
         return integrationOverview().get("oidc") instanceof Map<?, ?> map ? castMap(map) : Map.of();
+    }
+
+    @Transactional
+    public Map<String, Object> saveOidcRoleMapping(Map<String, Object> request) {
+        String id = value(request, "id", "oidc-map-" + shortId());
+        String now = now();
+        int changed = jdbc.update("update ds_oidc_role_mapping set claim_name=?,claim_value=?,platform_role=?,owner_id=?,enabled=?,updated_at=? where id=?",
+                value(request, "claimName", "groups"), required(request, "claimValue"), required(request, "platformRole"), value(request, "ownerId", ""), bool(request, "enabled", true) ? 1 : 0, now, id);
+        if (changed == 0) jdbc.update("insert into ds_oidc_role_mapping(id,claim_name,claim_value,platform_role,owner_id,enabled,created_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                id, value(request, "claimName", "groups"), required(request, "claimValue"), required(request, "platformRole"), value(request, "ownerId", ""), bool(request, "enabled", true) ? 1 : 0, actor(), now, now);
+        audit("AUDIT", "OIDC_ROLE_MAPPING_SAVE", "OIDC_MAPPING", id, json(redact(request)), true);
+        return requireRow("select * from ds_oidc_role_mapping where id=?", id);
+    }
+
+    @Transactional
+    public void deleteOidcRoleMapping(String id) {
+        jdbc.update("delete from ds_oidc_role_mapping where id=?", id);
+        audit("AUDIT", "OIDC_ROLE_MAPPING_DELETE", "OIDC_MAPPING", id, "", true);
     }
 
     @Transactional
@@ -770,6 +833,48 @@ public class DataSandboxMvpService {
         return Map.of("status", status, "message", message, "discoveryUrl", discovery);
     }
 
+    /** 返回 OIDC 授权地址，具体 token 交换由部署方的 IdP 回调适配器完成。 */
+    public Map<String, Object> oidcLogin(String redirectUri) {
+        validateHttpUrl(redirectUri);
+        Map<String, Object> config = requireRow("select * from ds_oidc_config where id=1 and enabled=1");
+        String issuer = string(config.get("issuer")).replaceAll("/$", "");
+        validateHttpUrl(issuer);
+        String discoveryUrl = issuer + "/.well-known/openid-configuration";
+        try {
+            HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder(URI.create(discoveryUrl)).timeout(Duration.ofSeconds(8)).GET().build(), HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) throw new IllegalStateException("OIDC Discovery HTTP " + response.statusCode());
+            String authorizationEndpoint = string(objectMapper.readTree(response.body()).path("authorization_endpoint").asText());
+            if (!notBlank(authorizationEndpoint)) throw new IllegalStateException("Discovery 未返回 authorization_endpoint");
+            validateHttpUrl(authorizationEndpoint);
+            String state = UUID.randomUUID().toString();
+            String query = "response_type=code&client_id=" + encode(string(config.get("client_id")))
+                    + "&scope=" + encode(value(config, "scopes", "openid profile email"))
+                    + "&redirect_uri=" + encode(redirectUri)
+                    + "&state=" + encode(state);
+            return Map.of("status", "SUCCESS", "authorizationUrl", authorizationEndpoint + (authorizationEndpoint.contains("?") ? "&" : "?") + query, "state", state);
+        } catch (Exception e) {
+            throw new IllegalStateException("生成 OIDC 登录地址失败: " + e.getMessage(), e);
+        }
+    }
+
+    /** 将已由 IdP 验证的 claims 映射为平台角色，供回调适配器和联调工具复用。 */
+    public Map<String, Object> mapOidcClaims(Map<String, Object> claims) {
+        List<Map<String, Object>> matched = new ArrayList<>();
+        for (Map<String, Object> mapping : jdbc.queryForList("select * from ds_oidc_role_mapping where enabled=1 order by created_at")) {
+            String claim = string(claims.get(string(mapping.get("claim_name"))));
+            if (claim.contains(string(mapping.get("claim_value")))) {
+                matched.add(Map.of("role", string(mapping.get("platform_role")), "ownerId", string(mapping.get("owner_id")), "mappingId", string(mapping.get("id"))));
+            }
+        }
+        boolean authenticated = !matched.isEmpty();
+        audit("AUDIT", "OIDC_ROLE_RESOLVE", "OIDC", "claims", "matched=" + matched.size(), authenticated);
+        return Map.of("authenticated", authenticated, "roles", matched, "claims", redact(claims));
+    }
+
+    private static String encode(String value) {
+        return URLEncoder.encode(string(value), StandardCharsets.UTF_8);
+    }
+
     /* ------------------------------- Z-07 tenancy, billing and trusted exchange ------------------------------- */
 
     public List<Map<String, Object>> listTenants() {
@@ -784,7 +889,7 @@ public class DataSandboxMvpService {
         String secret = value(request, "signingSecret", Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes()));
         String now = now();
         jdbc.update("insert into ds_tenant(id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,signing_secret,created_by,created_at,updated_at) values(?,?,?,'PENDING','',?,?,?,?,?,?,?,?)",
-                id, name, ownerId, positive(request, "cpuCores", 4), positive(request, "memoryGb", 16), nonNegativeInt(request, "gpuCount", 0), positive(request, "storageGb", 100), secret, actor(), now, now);
+                id, name, ownerId, positive(request, "cpuCores", 4), positive(request, "memoryGb", 16), nonNegativeInt(request, "gpuCount", 0), positive(request, "storageGb", 100), secretCipher.encrypt(secret), actor(), now, now);
         audit("OPERATION", "TENANT_OPEN", "TENANT", id, name, true);
         dispatchWebhooks("tenant.opened", Map.of("tenantId", id, "ownerId", ownerId, "name", name));
         Map<String, Object> result = new LinkedHashMap<>(requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant where id=?", id));
@@ -918,7 +1023,7 @@ public class DataSandboxMvpService {
         return requireRow("select id,tenant_id,direction,event_type,idempotency_key,payload_hash,signature,status,attempts,last_error,created_at,updated_at from ds_trusted_exchange where id=?", id);
     }
 
-    private String tenantSecret(String tenantId) { return string(requireRow("select signing_secret from ds_tenant where id=?", tenantId).get("signing_secret")); }
+    private String tenantSecret(String tenantId) { return secretCipher.decrypt(string(requireRow("select signing_secret from ds_tenant where id=?", tenantId).get("signing_secret"))); }
 
     private String hmacSha256(String secret, String payload) {
         try { Mac mac = Mac.getInstance("HmacSHA256"); mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256")); return java.util.HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8))); }
@@ -933,12 +1038,17 @@ public class DataSandboxMvpService {
         counts.put("runningSandboxes", count("select count(1) from ds_sandbox where deleted=0 and status='RUNNING'"));
         counts.put("pendingApprovals", count("select count(1) from ds_model_approval where status in ('MODEL_REVIEW','RESOURCE_REVIEW')"));
         // Z-03：沙箱资源申请单待处理数（含待审/已批准待执行/执行中）
-        counts.put("pendingSandboxApprovals", count("select count(1) from ds_sandbox_approval where deleted=0 and status in ('DATA_PROVIDER_REVIEW','OPERATOR_REVIEW','APPROVED','EXECUTING')"));
+        // Older installations may not have the optional sandbox-approval migration yet.
+        counts.put("pendingSandboxApprovals", tableExists("ds_sandbox_approval")
+                ? count("select count(1) from ds_sandbox_approval where deleted=0 and status in ('DATA_PROVIDER_REVIEW','OPERATOR_REVIEW','APPROVED','EXECUTING')")
+                : 0);
         counts.put("openAlerts", count("select count(1) from ds_alert_event where status='OPEN'"));
         counts.put("failedCallbacks", count("select count(1) from ds_webhook_delivery where status='FAILED'"));
         return Map.of("status", "UP", "counts", counts, "kusciaIntegrationEnabled", kusciaEnabled,
                 "snapshotRoot", snapshotRoot, "backupRoot", backupRoot,
                 "backups", jdbc.queryForList("select * from ds_backup order by created_at desc limit 50"),
+                "recoveryPoints", jdbc.queryForList("select * from ds_recovery_point order by created_at desc limit 50"),
+                "securityScans", jdbc.queryForList("select id,status,critical_count,warning_count,created_by,created_at from ds_security_scan order by created_at desc limit 20"),
                 "tickets", jdbc.queryForList("select * from ds_support_ticket order by updated_at desc limit 50"));
     }
 
@@ -946,16 +1056,40 @@ public class DataSandboxMvpService {
     public Map<String, Object> createBackup() {
         String id = "bak-" + shortId();
         Path dir = Path.of(backupRoot, id).normalize();
-        Path target = dir.resolve("secretpad.sqlite");
+        Path target = dir.resolve("data-sandbox-backup.zip");
+        Path manifest = dir.resolve("manifest.json");
         String created = now();
-        jdbc.update("insert into ds_backup(id,backup_type,status,artifact_path,created_by,created_at) values(?,'FULL','RUNNING',?,?,?)", id, target.toString(), actor(), created);
+        Map<String, Object> scope = Map.of(
+                "database", true, "configurationAndCertificates", true,
+                "sandboxMetadata", true, "artifacts", true);
+        jdbc.update("insert into ds_backup(id,backup_type,status,artifact_path,scope_json,manifest_path,created_by,created_at) values(?,'FULL','RUNNING',?,?,?,?,?)",
+                id, target.toString(), json(scope), manifest.toString(), actor(), created);
         try {
             Files.createDirectories(dir);
             Path source = databasePath();
-            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
-            String checksum = sha256(Files.readAllBytes(target));
-            Files.writeString(dir.resolve("metadata.json"), json(Map.of("backupId", id, "createdAt", created, "source", source.toString(), "sha256", checksum)), StandardCharsets.UTF_8);
+            jdbc.execute("pragma wal_checkpoint(FULL)");
+            Map<String, Object> backupManifest = new LinkedHashMap<>();
+            backupManifest.put("backupId", id);
+            backupManifest.put("createdAt", created);
+            backupManifest.put("scope", scope);
+            backupManifest.put("sourceDatabase", source.toString());
+            List<Map<String, Object>> archivedFiles = new ArrayList<>();
+            try (OutputStream output = Files.newOutputStream(target); ZipOutputStream zip = new ZipOutputStream(output)) {
+                addFileToZip(zip, source, "database/secretpad.sqlite", archivedFiles);
+                addJsonToZip(zip, "metadata/sandboxes.json", jdbc.queryForList("select * from ds_sandbox where deleted=0"), archivedFiles);
+                addJsonToZip(zip, "metadata/images.json", jdbc.queryForList("select * from ds_sandbox_image"), archivedFiles);
+                addDirectoryToZip(zip, Path.of(configRoot), "configuration", MAX_CONFIG_BACKUP_BYTES, archivedFiles);
+                addDirectoryToZip(zip, Path.of(artifactRoot), "artifacts", MAX_ARTIFACT_BACKUP_BYTES, archivedFiles);
+                backupManifest.put("files", archivedFiles);
+                addJsonToZip(zip, "metadata/manifest.json", backupManifest, archivedFiles);
+            }
+            String checksum = digestFile(target);
+            backupManifest.put("archiveSha256", checksum);
+            backupManifest.put("archiveSize", Files.size(target));
+            Files.writeString(manifest, json(backupManifest), StandardCharsets.UTF_8);
             jdbc.update("update ds_backup set status='COMPLETED',size_bytes=?,checksum=?,completed_at=? where id=?", Files.size(target), checksum, now(), id);
+            jdbc.update("insert into ds_recovery_point(id,backup_id,point_type,status,artifact_path,checksum,created_by,created_at) values(?,?,'MANUAL','AVAILABLE',?,?,?,?)",
+                    "rp-" + shortId(), id, target.toString(), checksum, actor(), now());
             audit("OPERATION", "BACKUP_CREATE", "BACKUP", id, target.toString(), true);
         } catch (Exception e) {
             jdbc.update("update ds_backup set status='FAILED',message=?,completed_at=? where id=?", truncate(e.getMessage(), 900), now(), id);
@@ -966,14 +1100,16 @@ public class DataSandboxMvpService {
 
     @Transactional
     public Map<String, Object> stageRestore(String backupId) {
-        Map<String, Object> backup = requireRow("select * from ds_backup where id=? and status='COMPLETED'", backupId);
+        Map<String, Object> backup = requireRow("select * from ds_backup where id=? and status in ('COMPLETED','RESTORE_STAGED')", backupId);
         Path source = Path.of(string(backup.get("artifact_path"))).normalize();
         Path pending = databasePath().resolveSibling("restore-pending.sqlite");
         try {
-            String actual = sha256(Files.readAllBytes(source));
+            String actual = digestFile(source);
             if (!Objects.equals(actual, string(backup.get("checksum")))) throw new IllegalStateException("备份校验和不一致");
-            Files.copy(source, pending, StandardCopyOption.REPLACE_EXISTING);
+            extractBackupDatabase(source, pending);
+            verifySqlite(pending);
             jdbc.update("update ds_backup set status='RESTORE_STAGED',message=? where id=?", "已暂存，重启时由 data-sandbox-package 完成切换", backupId);
+            jdbc.update("update ds_recovery_point set status='STAGED' where backup_id=?", backupId);
             audit("AUDIT", "RESTORE_STAGE", "BACKUP", backupId, pending.toString(), true);
             return Map.of("status", "RESTORE_STAGED", "pendingFile", pending.toString(), "message", "恢复文件已校验并暂存，请使用部署包 restore 命令安全重启切换");
         } catch (IOException e) {
@@ -981,11 +1117,52 @@ public class DataSandboxMvpService {
         }
     }
 
+    @Transactional
+    public Map<String, Object> verifyBackup(String backupId) {
+        Map<String, Object> result = inspectBackup(backupId, false);
+        jdbc.update("update ds_backup set verified_at=?,message=? where id=?", now(), "备份校验通过", backupId);
+        jdbc.update("update ds_recovery_point set verified_at=? where backup_id=?", now(), backupId);
+        audit("AUDIT", "BACKUP_VERIFY", "BACKUP", backupId, json(result), true);
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> drillRecovery(String backupId) {
+        try {
+            Map<String, Object> result = inspectBackup(backupId, true);
+            String report = json(result);
+            jdbc.update("update ds_backup set drill_status='PASSED',drill_report=? where id=?", truncate(report, 2000), backupId);
+            jdbc.update("update ds_recovery_point set drill_status='PASSED',drill_report=?,verified_at=? where backup_id=?", truncate(report, 2000), now(), backupId);
+            audit("AUDIT", "RECOVERY_DRILL", "BACKUP", backupId, report, true);
+            return result;
+        } catch (RuntimeException e) {
+            jdbc.update("update ds_backup set drill_status='FAILED',drill_report=? where id=?", truncate(e.getMessage(), 2000), backupId);
+            jdbc.update("update ds_recovery_point set drill_status='FAILED',drill_report=? where backup_id=?", truncate(e.getMessage(), 2000), backupId);
+            audit("AUDIT", "RECOVERY_DRILL", "BACKUP", backupId, e.getMessage(), false);
+            throw e;
+        }
+    }
+
+    public Map<String, Object> rollbackRecoveryPoint(String recoveryPointId) {
+        Map<String, Object> point = requireRow("select * from ds_recovery_point where id=?", recoveryPointId);
+        return stageRestore(string(point.get("backup_id")));
+    }
+
     public Map<String, Object> diagnostics() {
         List<Map<String, Object>> checks = new ArrayList<>();
         checks.add(check("DATABASE", true, "SQLite query OK, tables=" + count("select count(1) from sqlite_master where type='table'")));
         checks.add(pathCheck("SNAPSHOT_STORAGE", Path.of(snapshotRoot)));
         checks.add(pathCheck("BACKUP_STORAGE", Path.of(backupRoot)));
+        long unhealthyTasks = count("select count(1) from ds_sandbox where deleted=0 and status in ('ERROR','STARTING','STOPPING')");
+        checks.add(check("TASK_HEALTH", unhealthyTasks == 0, unhealthyTasks + " 个沙箱任务处于异常或过渡状态"));
+        checks.add(certificateCheck(Path.of(configRoot, "certs")));
+        long expiredCredentials = count("select count(1) from ds_api_client where enabled=1 and expires_at<>'' and expires_at<?", now());
+        checks.add(check("API_CREDENTIALS", expiredCredentials == 0, expiredCredentials + " 个调用凭证已过期"));
+        long unverifiedBackups = count("select count(1) from ds_backup where status in ('COMPLETED','RESTORE_STAGED') and verified_at='' ");
+        checks.add(check("RECOVERY_POINTS", unverifiedBackups == 0, unverifiedBackups + " 个备份尚未校验"));
+        long failedTransfers = count("select count(1) from ds_webhook_delivery where status='FAILED'")
+                + count("select count(1) from ds_trusted_exchange where status='FAILED'");
+        checks.add(check("INTEGRATION_TASKS", failedTransfers == 0, failedTransfers + " 个对接任务失败"));
         if (kusciaEnabled) {
             try {
                 var response = kuscia.healthZ(Health.HealthRequest.newBuilder().build());
@@ -999,6 +1176,33 @@ public class DataSandboxMvpService {
         boolean ok = checks.stream().noneMatch(it -> "FAILED".equals(it.get("status")));
         audit("SYSTEM", "DIAGNOSTICS_RUN", "SYSTEM", nodeId, "checks=" + checks.size(), ok);
         return Map.of("status", ok ? "HEALTHY" : "DEGRADED", "time", now(), "checks", checks);
+    }
+
+    @Transactional
+    public Map<String, Object> runSecurityScan() {
+        List<Map<String, Object>> findings = new ArrayList<>();
+        addSecretFinding(findings, "ds_webhook", "secret");
+        addSecretFinding(findings, "ds_oidc_config", "client_secret");
+        addSecretFinding(findings, "ds_tenant", "signing_secret");
+        addCountFinding(findings, "EXPIRED_API_CREDENTIAL", "HIGH",
+                count("select count(1) from ds_api_client where enabled=1 and expires_at<>'' and expires_at<?", now()),
+                "轮换或吊销已过期的 API 调用凭证");
+        addCountFinding(findings, "UNVERIFIED_BACKUP", "MEDIUM",
+                count("select count(1) from ds_backup where status in ('COMPLETED','RESTORE_STAGED') and verified_at=''"),
+                "执行备份校验和恢复演练");
+        addCountFinding(findings, "OPEN_CRITICAL_ALERT", "HIGH",
+                count("select count(1) from ds_alert_event where status='OPEN' and severity in ('CRITICAL','HIGH')"),
+                "处理告警并记录修复与复测结果");
+        long critical = findings.stream().filter(item -> "HIGH".equals(item.get("severity"))).count();
+        long warning = findings.size() - critical;
+        String status = critical > 0 ? "ACTION_REQUIRED" : warning > 0 ? "REVIEW_REQUIRED" : "PASSED";
+        String id = "scan-" + shortId();
+        Map<String, Object> report = Map.of("scanId", id, "status", status, "time", now(), "findings", findings,
+                "workflow", List.of("识别", "分派", "修复", "复测", "关闭"));
+        jdbc.update("insert into ds_security_scan(id,status,critical_count,warning_count,report_json,created_by,created_at) values(?,?,?,?,?,?,?)",
+                id, status, critical, warning, truncate(json(report), 8000), actor(), now());
+        audit("AUDIT", "SECURITY_SCAN", "SYSTEM", nodeId, "findings=" + findings.size(), critical == 0);
+        return report;
     }
 
     /**
@@ -1591,7 +1795,7 @@ public class DataSandboxMvpService {
             try {
                 HttpRequest request = HttpRequest.newBuilder(URI.create(string(webhook.get("url")))).timeout(Duration.ofSeconds(8))
                         .header("Content-Type", "application/json").header("X-Data-Sandbox-Event", event)
-                        .header("X-Data-Sandbox-Signature", sha256((string(webhook.get("secret")) + payload).getBytes(StandardCharsets.UTF_8)))
+                        .header("X-Data-Sandbox-Signature", sha256((secretCipher.decrypt(string(webhook.get("secret"))) + payload).getBytes(StandardCharsets.UTF_8)))
                         .POST(HttpRequest.BodyPublishers.ofString(payload)).build();
                 HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
                 code = response.statusCode();
@@ -1617,6 +1821,156 @@ public class DataSandboxMvpService {
         }
     }
 
+    private Map<String, Object> certificateCheck(Path root) {
+        if (!Files.isDirectory(root)) {
+            return Map.of("name", "CERTIFICATES", "status", "SKIPPED", "message", "证书目录不存在: " + root);
+        }
+        int total = 0;
+        int invalid = 0;
+        long nearestDays = Long.MAX_VALUE;
+        try (Stream<Path> paths = Files.walk(root)) {
+            for (Path path : paths.filter(Files::isRegularFile).toList()) {
+                String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+                if (!(name.endsWith(".crt") || name.endsWith(".cer") || name.endsWith(".pem"))) continue;
+                try (InputStream input = Files.newInputStream(path)) {
+                    X509Certificate certificate = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(input);
+                    total++;
+                    long days = Duration.between(java.time.Instant.now(), certificate.getNotAfter().toInstant()).toDays();
+                    nearestDays = Math.min(nearestDays, days);
+                    try {
+                        certificate.checkValidity();
+                        if (days < 30) invalid++;
+                    } catch (Exception e) {
+                        invalid++;
+                    }
+                } catch (Exception ignored) {
+                    // PEM files may contain private keys or bundles; only parseable certificates are assessed.
+                }
+            }
+        } catch (IOException e) {
+            return check("CERTIFICATES", false, e.getMessage());
+        }
+        if (total == 0) return Map.of("name", "CERTIFICATES", "status", "SKIPPED", "message", "未发现可解析的 X.509 证书");
+        return check("CERTIFICATES", invalid == 0, "证书=" + total + ", 异常或 30 天内到期=" + invalid + ", 最近到期=" + nearestDays + " 天");
+    }
+
+    private Map<String, Object> inspectBackup(String backupId, boolean drill) {
+        Map<String, Object> backup = requireRow("select * from ds_backup where id=? and status in ('COMPLETED','RESTORE_STAGED')", backupId);
+        Path archive = Path.of(string(backup.get("artifact_path"))).normalize();
+        try {
+            String actual = digestFile(archive);
+            if (!MessageDigest.isEqual(actual.getBytes(StandardCharsets.UTF_8), string(backup.get("checksum")).getBytes(StandardCharsets.UTF_8))) {
+                throw new IllegalStateException("备份校验和不一致");
+            }
+            Path tempDb = Files.createTempFile("data-sandbox-verify-", ".sqlite");
+            try {
+                extractBackupDatabase(archive, tempDb);
+                String integrity = verifySqlite(tempDb);
+                if (archive.toString().endsWith(".zip")) {
+                    try (ZipFile zip = new ZipFile(archive.toFile())) {
+                        for (String required : List.of("database/secretpad.sqlite", "metadata/sandboxes.json", "metadata/images.json", "metadata/manifest.json")) {
+                            if (zip.getEntry(required) == null) throw new IllegalStateException("备份缺少必要条目: " + required);
+                        }
+                    }
+                }
+                return Map.of("status", "PASSED", "backupId", backupId, "mode", drill ? "RECOVERY_DRILL" : "VERIFY",
+                        "checksum", actual, "databaseIntegrity", integrity, "checkedAt", now());
+            } finally {
+                Files.deleteIfExists(tempDb);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("备份检查失败: " + e.getMessage(), e);
+        }
+    }
+
+    private void extractBackupDatabase(Path archive, Path target) throws IOException {
+        if (!archive.toString().endsWith(".zip")) {
+            Files.copy(archive, target, StandardCopyOption.REPLACE_EXISTING);
+            return;
+        }
+        try (ZipFile zip = new ZipFile(archive.toFile())) {
+            ZipEntry entry = zip.getEntry("database/secretpad.sqlite");
+            if (entry == null || entry.isDirectory()) throw new IllegalStateException("备份中不存在数据库文件");
+            try (InputStream input = zip.getInputStream(entry); OutputStream output = Files.newOutputStream(target)) {
+                input.transferTo(output);
+            }
+        }
+    }
+
+    private String verifySqlite(Path database) {
+        try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + database);
+             Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("pragma integrity_check")) {
+            String status = result.next() ? result.getString(1) : "no result";
+            if (!"ok".equalsIgnoreCase(status)) throw new IllegalStateException("SQLite 完整性检查失败: " + status);
+            return status;
+        } catch (Exception e) {
+            throw new IllegalStateException("SQLite 完整性检查失败: " + e.getMessage(), e);
+        }
+    }
+
+    private void addFileToZip(ZipOutputStream zip, Path source, String entryName, List<Map<String, Object>> files) throws IOException {
+        ZipEntry entry = new ZipEntry(entryName);
+        entry.setTime(Files.getLastModifiedTime(source).toMillis());
+        zip.putNextEntry(entry);
+        try (InputStream input = Files.newInputStream(source)) { input.transferTo(zip); }
+        zip.closeEntry();
+        files.add(Map.of("path", entryName, "size", Files.size(source)));
+    }
+
+    private void addJsonToZip(ZipOutputStream zip, String entryName, Object value, List<Map<String, Object>> files) throws IOException {
+        byte[] content = json(value).getBytes(StandardCharsets.UTF_8);
+        zip.putNextEntry(new ZipEntry(entryName));
+        zip.write(content);
+        zip.closeEntry();
+        files.add(Map.of("path", entryName, "size", content.length));
+    }
+
+    private void addDirectoryToZip(ZipOutputStream zip, Path root, String prefix, long maxBytes, List<Map<String, Object>> files) throws IOException {
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        if (!Files.isDirectory(normalizedRoot)) return;
+        long remaining = maxBytes;
+        try (Stream<Path> paths = Files.walk(normalizedRoot)) {
+            for (Path path : paths.filter(Files::isRegularFile).filter(item -> !Files.isSymbolicLink(item)).sorted().toList()) {
+                long size = Files.size(path);
+                if (size > remaining) continue;
+                String relative = normalizedRoot.relativize(path.toAbsolutePath().normalize()).toString().replace('\\', '/');
+                if (relative.startsWith("../") || relative.equals("..")) continue;
+                addFileToZip(zip, path, prefix + "/" + relative, files);
+                remaining -= size;
+            }
+        }
+    }
+
+    private String digestFile(Path path) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = Files.newInputStream(path)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) >= 0) if (read > 0) digest.update(buffer, 0, read);
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private void addSecretFinding(List<Map<String, Object>> findings, String table, String column) {
+        long plaintext = jdbc.queryForList("select " + column + " from " + table).stream()
+                .map(item -> string(item.get(column)))
+                .filter(DataSandboxMvpService::notBlank)
+                .filter(value -> !secretCipher.encrypted(value))
+                .count();
+        addCountFinding(findings, "UNENCRYPTED_SECRET_" + table.toUpperCase(Locale.ROOT), "HIGH", plaintext,
+                "重新保存相关配置以迁移为 AES-GCM 密文，并轮换原密钥");
+    }
+
+    private void addCountFinding(List<Map<String, Object>> findings, String code, String severity, long count, String remediation) {
+        if (count > 0) findings.add(Map.of("code", code, "severity", severity, "affected", count,
+                "remediation", remediation, "status", "OPEN"));
+    }
+
     private Map<String, Object> check(String name, boolean passed, String message) {
         return Map.of("name", name, "status", passed ? "PASSED" : "FAILED", "message", string(message));
     }
@@ -1638,6 +1992,10 @@ public class DataSandboxMvpService {
     private long count(String sql, Object... args) {
         Long value = jdbc.queryForObject(sql, Long.class, args);
         return value == null ? 0 : value;
+    }
+
+    private boolean tableExists(String tableName) {
+        return count("select count(1) from sqlite_master where type='table' and name=?", tableName) > 0;
     }
 
     private String actor() {
@@ -1688,6 +2046,16 @@ public class DataSandboxMvpService {
     private String json(Object value) {
         try { return objectMapper.writeValueAsString(value); }
         catch (JsonProcessingException e) { return String.valueOf(value); }
+    }
+
+    private Map<String, Object> redact(Map<String, Object> source) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        source.forEach((key, item) -> {
+            String normalized = key.toLowerCase(Locale.ROOT);
+            result.put(key, normalized.contains("secret") || normalized.contains("password") || normalized.contains("token")
+                    || normalized.contains("signature") ? "***" : item);
+        });
+        return result;
     }
 
     private static String csv(Object value) {
