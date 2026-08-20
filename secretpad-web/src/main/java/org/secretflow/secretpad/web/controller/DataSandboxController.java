@@ -46,6 +46,40 @@ public class DataSandboxController {
         this.gate = gate;
     }
 
+    @Operation(summary = "智能建模组件目录、预设、项目与真实执行记录")
+    @GetMapping("/modeling")
+    public SecretPadResponse<Map<String, Object>> modeling() {
+        return SecretPadResponse.success(service.modelingOverview());
+    }
+
+    @GetMapping("/modeling/components/detail")
+    public SecretPadResponse<Map<String, Object>> modelingComponent(@RequestParam String code) {
+        return SecretPadResponse.success(service.modelingComponent(code));
+    }
+
+    @PostMapping("/modeling/profiles/save")
+    public SecretPadResponse<Map<String, Object>> saveModelingProfile(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveModelingProfile(request));
+    }
+
+    @PostMapping("/modeling/profiles/delete")
+    public SecretPadResponse<Void> deleteModelingProfile(@RequestBody Map<String, Object> request) {
+        service.deleteModelingProfile(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
+    @PostMapping("/modeling/components/validate")
+    public SecretPadResponse<Map<String, Object>> validateModeling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.validateModeling(request));
+    }
+
+    @GetMapping("/modeling/runs")
+    public SecretPadResponse<List<Map<String, Object>>> modelingRuns(
+            @RequestParam(defaultValue = "") String ownerId,
+            @RequestParam(defaultValue = "") String projectId) {
+        return SecretPadResponse.success(service.modelingRuns(ownerId, projectId));
+    }
+
     @Operation(summary = "查询沙箱")
     @GetMapping("/sandboxes")
     public SecretPadResponse<List<Map<String, Object>>> sandboxes(
@@ -177,12 +211,8 @@ public class DataSandboxController {
     @GetMapping("/logs/export")
     public ResponseEntity<byte[]> exportLogs(
             @RequestParam(defaultValue = "") String type,
-            @RequestParam(defaultValue = "") String level,
-            @RequestParam(defaultValue = "") String actor,
-            @RequestParam(defaultValue = "") String keyword,
-            @RequestParam(defaultValue = "") String start,
-            @RequestParam(defaultValue = "") String end) {
-        byte[] content = service.exportLogs(type, level, actor, keyword, start, end);
+            @RequestParam(defaultValue = "") String keyword) {
+        byte[] content = service.exportLogs(type, keyword);
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(new MediaType("text", "csv", StandardCharsets.UTF_8));
         headers.setContentDisposition(ContentDisposition.attachment().filename("data-sandbox-logs-" + LocalDate.now() + ".csv").build());
@@ -217,6 +247,11 @@ public class DataSandboxController {
         return SecretPadResponse.success();
     }
 
+    @PostMapping("/integrations/clients/rotate")
+    public SecretPadResponse<Map<String, Object>> rotateClient(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.rotateApiClient(String.valueOf(request.get("id"))));
+    }
+
     @PostMapping("/integrations/webhooks/save")
     public SecretPadResponse<Map<String, Object>> saveWebhook(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.saveWebhook(request));
@@ -242,6 +277,104 @@ public class DataSandboxController {
         return SecretPadResponse.success(service.testOidc());
     }
 
+    @GetMapping("/integrations/oidc/login")
+    public SecretPadResponse<Map<String, Object>> oidcLogin(@RequestParam String redirectUri) {
+        return SecretPadResponse.success(service.oidcLogin(redirectUri));
+    }
+
+    @GetMapping("/integrations/oidc/callback")
+    public SecretPadResponse<Map<String, Object>> oidcCallback(
+            @RequestParam(defaultValue = "") String code,
+            @RequestParam(defaultValue = "") String state) {
+        if (code.isBlank()) {
+            return SecretPadResponse.success(Map.of("status", "FAILED", "message", "OIDC 未返回授权码"));
+        }
+        // Token exchange/session binding is completed by the deployment gateway; never persist the code.
+        return SecretPadResponse.success(Map.of("status", "RECEIVED", "state", state, "message", "授权码已收到，请由认证网关完成令牌交换"));
+    }
+
+    @PostMapping("/integrations/oidc/map-claims")
+    public SecretPadResponse<Map<String, Object>> mapOidcClaims(@RequestBody Map<String, Object> claims) {
+        return SecretPadResponse.success(service.mapOidcClaims(claims));
+    }
+
+    @PostMapping("/integrations/oidc/mappings/save")
+    public SecretPadResponse<Map<String, Object>> saveOidcMapping(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveOidcRoleMapping(request));
+    }
+
+    @PostMapping("/integrations/oidc/mappings/delete")
+    public SecretPadResponse<Void> deleteOidcMapping(@RequestBody Map<String, Object> request) {
+        service.deleteOidcRoleMapping(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
+    @Operation(summary = "租户开通与资源规格")
+    @GetMapping("/tenants")
+    public SecretPadResponse<List<Map<String, Object>>> tenants() {
+        return SecretPadResponse.success(service.listTenants());
+    }
+
+    @PostMapping("/tenants/open")
+    public SecretPadResponse<Map<String, Object>> openTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.openTenant(request));
+    }
+
+    @PostMapping("/tenants/resize")
+    public SecretPadResponse<Map<String, Object>> resizeTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.resizeTenant(request));
+    }
+
+    @PostMapping("/tenants/deploy")
+    public SecretPadResponse<Map<String, Object>> deployTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.deployTenant(request));
+    }
+
+    @GetMapping("/billing/usage")
+    public SecretPadResponse<List<Map<String, Object>>> usage(@RequestParam String tenantId) {
+        return SecretPadResponse.success(service.tenantUsage(tenantId));
+    }
+
+    @PostMapping("/billing/calculate")
+    public SecretPadResponse<Map<String, Object>> calculateBilling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.calculateBilling(request));
+    }
+
+    @PostMapping("/billing/report")
+    public SecretPadResponse<Map<String, Object>> reportBilling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.reportBilling(request));
+    }
+
+    @GetMapping("/trusted/exchanges")
+    public SecretPadResponse<List<Map<String, Object>>> exchanges(@RequestParam(defaultValue = "") String tenantId) {
+        return SecretPadResponse.success(service.listTrustedExchanges(tenantId));
+    }
+
+    @PostMapping("/trusted/push")
+    public SecretPadResponse<Map<String, Object>> trustedPush(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.trustedPush(request));
+    }
+
+    @PostMapping("/trusted/callback")
+    public SecretPadResponse<Map<String, Object>> trustedCallback(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.trustedCallback(request));
+    }
+
+    @PostMapping("/trusted/verify")
+    public SecretPadResponse<Map<String, Object>> trustedVerify(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.verifyTrustedSignature(request));
+    }
+
+    @GetMapping("/trusted/policies")
+    public SecretPadResponse<List<Map<String, Object>>> policies(@RequestParam String tenantId) {
+        return SecretPadResponse.success(service.listAccessPolicies(tenantId));
+    }
+
+    @PostMapping("/trusted/policies/save")
+    public SecretPadResponse<Map<String, Object>> savePolicy(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveAccessPolicy(request));
+    }
+
     @Operation(summary = "运维总览")
     @GetMapping("/operations")
     public SecretPadResponse<Map<String, Object>> operations() {
@@ -258,9 +391,29 @@ public class DataSandboxController {
         return SecretPadResponse.success(service.stageRestore(String.valueOf(request.get("id"))));
     }
 
+    @PostMapping("/operations/backups/verify")
+    public SecretPadResponse<Map<String, Object>> verifyBackup(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.verifyBackup(String.valueOf(request.get("id"))));
+    }
+
+    @PostMapping("/operations/backups/drill")
+    public SecretPadResponse<Map<String, Object>> drillRecovery(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.drillRecovery(String.valueOf(request.get("id"))));
+    }
+
+    @PostMapping("/operations/recovery-points/rollback")
+    public SecretPadResponse<Map<String, Object>> rollbackRecoveryPoint(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.rollbackRecoveryPoint(String.valueOf(request.get("id"))));
+    }
+
     @PostMapping("/operations/diagnostics")
     public SecretPadResponse<Map<String, Object>> diagnostics() {
         return SecretPadResponse.success(service.diagnostics());
+    }
+
+    @PostMapping("/operations/security/scan")
+    public SecretPadResponse<Map<String, Object>> securityScan() {
+        return SecretPadResponse.success(service.runSecurityScan());
     }
 
     @Operation(summary = "沙箱资源限制生效校验（期望值 + 运维核对指引）")

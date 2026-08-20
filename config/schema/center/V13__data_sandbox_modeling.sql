@@ -1,0 +1,40 @@
+-- Intelligent modeling catalog limited to the nine acceptance components.
+create table if not exists ds_modeling_component (
+    code varchar(64) primary key,
+    name varchar(128) not null,
+    category varchar(64) not null,
+    runtime_app varchar(64) not null default 'secretflow',
+    runtime_code varchar(128) not null,
+    version varchar(32) not null default '1.0.0',
+    description varchar(1024) default '',
+    parameter_schema_json text not null default '[]',
+    default_params_json text not null default '{}',
+    default_resources_json text not null default '{}',
+    composite_steps_json text not null default '[]',
+    enabled integer not null default 1,
+    created_at varchar(32) not null,
+    updated_at varchar(32) not null
+);
+
+create table if not exists ds_modeling_profile (
+    id varchar(64) primary key,
+    owner_id varchar(128) not null,
+    component_code varchar(64) not null,
+    name varchar(128) not null,
+    params_json text not null default '{}',
+    resources_json text not null default '{}',
+    created_by varchar(128) default '',
+    created_at varchar(32) not null,
+    updated_at varchar(32) not null
+);
+create unique index if not exists uk_ds_modeling_profile on ds_modeling_profile(owner_id, component_code, name);
+
+insert or ignore into ds_modeling_component values ('DATA_ALIGNMENT','数据对齐','DATA_PREPARATION','secretflow','data_prep/psi','1.0.0','基于隐私集合求交完成多方样本对齐','[{"name":"protocol","label":"对齐协议","type":"select","options":["PROTOCOL_ECDH","PROTOCOL_RR22","PROTOCOL_KKRT"]},{"name":"sortResult","label":"结果排序","type":"boolean"}]','{"protocol":"PROTOCOL_ECDH","sortResult":true}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('LOGISTIC_REGRESSION','逻辑回归','MODEL_TRAINING','secretflow','ml.train/ss_sgd_train','1.0.0','安全逻辑回归训练','[{"name":"epochs","label":"迭代轮数","type":"number","min":1,"max":10000},{"name":"learningRate","label":"学习率","type":"number","min":0.000001,"max":10},{"name":"batchSize","label":"批大小","type":"number","min":1,"max":100000}]','{"regType":"logistic","epochs":10,"learningRate":0.1,"batchSize":1024,"penalty":"l2"}','{"cpuCores":4,"memoryGb":8,"gpuCount":0,"storageGb":20,"timeoutSeconds":7200}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('LINEAR_REGRESSION','线性回归','MODEL_TRAINING','secretflow','ml.train/ss_sgd_train','1.0.0','安全线性回归训练','[{"name":"epochs","label":"迭代轮数","type":"number","min":1,"max":10000},{"name":"learningRate","label":"学习率","type":"number","min":0.000001,"max":10},{"name":"batchSize","label":"批大小","type":"number","min":1,"max":100000}]','{"regType":"linear","epochs":10,"learningRate":0.1,"batchSize":1024,"penalty":"l2"}','{"cpuCores":4,"memoryGb":8,"gpuCount":0,"storageGb":20,"timeoutSeconds":7200}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('OUTLIER_HANDLING','异常值处理','PREPROCESSING','secretflow','preprocessing/fillna','1.0.0','将指定异常值识别为空值并按策略替换','[{"name":"floatOutliers","label":"浮点异常值（逗号分隔）","type":"text"},{"name":"intOutliers","label":"整数异常值（逗号分隔）","type":"text"},{"name":"strategy","label":"替换策略","type":"select","options":["mean","median","most_frequent","constant"]}]','{"floatOutliers":"","intOutliers":"","strategy":"mean"}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('MISSING_VALUE_HANDLING','缺失值处理','PREPROCESSING','secretflow','preprocessing/fillna','1.0.0','按均值、中位数、众数或常量填充缺失值','[{"name":"strategy","label":"填充策略","type":"select","options":["mean","median","most_frequent","constant"]},{"name":"fillValue","label":"常量填充值","type":"text"},{"name":"nanIsNull","label":"将 NaN 视为空值","type":"boolean"}]','{"strategy":"mean","fillValue":"0","nanIsNull":true}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('UNIQUE_VALUE_FILTER','唯一值筛选','PREPROCESSING','secretflow','data_filter/feature_filter','1.0.0','先统计字段唯一性，再删除用户确认的单一值或高基数字段','[{"name":"dropFeatures","label":"删除字段（逗号分隔）","type":"text"},{"name":"uniqueRatioThreshold","label":"唯一值比例阈值","type":"number","min":0,"max":1}]','{"dropFeatures":"","uniqueRatioThreshold":1.0}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','["stats/table_statistics","data_filter/feature_filter"]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('FEATURE_BINNING','特征分箱','PREPROCESSING','secretflow','preprocessing/vert_binning','1.0.0','支持等频和等距特征分箱','[{"name":"binningMethod","label":"分箱方法","type":"select","options":["quantile","eq_range"]},{"name":"binNum","label":"分箱数量","type":"number","min":2,"max":100}]','{"binningMethod":"quantile","binNum":10,"reportRules":true}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('STANDARDIZATION','标准化','PREPROCESSING','secretflow','preprocessing/feature_calculate','1.0.0','对选定数值特征执行 Z-Score 标准化','[{"name":"method","label":"标准化方法","type":"select","options":["STANDARDIZE","NORMALIZATION"]},{"name":"features","label":"处理字段（逗号分隔）","type":"text"}]','{"method":"STANDARDIZE","features":""}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
+insert or ignore into ds_modeling_component values ('CORRELATION','相关系数','STATISTICS','secretflow','stats/ss_pearsonr','1.0.0','安全计算特征 Pearson 相关系数矩阵','[{"name":"features","label":"分析字段（逗号分隔）","type":"text"}]','{"features":""}','{"cpuCores":2,"memoryGb":4,"gpuCount":0,"storageGb":10,"timeoutSeconds":3600}','[]',1,datetime('now'),datetime('now'));
