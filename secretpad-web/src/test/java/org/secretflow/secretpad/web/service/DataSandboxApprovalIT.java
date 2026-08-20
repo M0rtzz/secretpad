@@ -142,6 +142,11 @@ public class DataSandboxApprovalIT {
         jdbc.update("delete from ds_sandbox_snapshot");
         jdbc.update("delete from ds_resource_allocation");
         jdbc.update("delete from ds_alert_event");
+        jdbc.update("delete from project_node where project_id='p1'");
+        jdbc.update("delete from project where project_id='p1'");
+        jdbc.update("insert into project(project_id,name,owner_id,is_deleted) values('p1','Approval IT','alice',0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','alice',0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','carol',0)");
         jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at=''");
         jdbc.update("update ds_resource_quota set cpu_cores=16,memory_gb=64,gpu_count=4,storage_gb=1024 where owner_id='alice'");
         JobService.State.createJobCode = KusciaAPIConstants.OK;
@@ -213,7 +218,7 @@ public class DataSandboxApprovalIT {
 
     private String createSandbox() {
         Map<String, Object> created = service.createSandbox(Map.of(
-                "name", "apr-sbx", "ownerId", "alice", "imageId", IMAGE_ID,
+                "name", "apr-sbx", "ownerId", "alice", "projectId", "p1", "imageId", IMAGE_ID,
                 "networkPolicy", "INTERNAL_ONLY", "cpuCores", 1, "memoryGb", 2, "gpuCount", 0,
                 "storageGb", 10, "validDays", 7));
         return String.valueOf(created.get("id"));
@@ -457,6 +462,31 @@ public class DataSandboxApprovalIT {
         assertEquals(1, ((Number) sbx.get("deleted")).intValue());
         // 全部分配行按 DESTROY 释放（CPU/MEMORY/STORAGE 三条）
         assertEquals(3L, count("select count(1) from ds_resource_allocation where sandbox_id=? and released_by='DESTROY'", sandboxId));
+    }
+
+    /** 历史沙箱没有项目关联时，仅允许创建人在所属节点直接提交回收申请。 */
+    @Test
+    public void recycleLegacySandboxWithoutProject() {
+        String sandboxId = createSandbox();
+        jdbc.update("update ds_sandbox set project_id='' where id=?", sandboxId);
+
+        String id = String.valueOf(approvalService.submit(createPayload("RECYCLE", sandboxId)).get("id"));
+        assertEquals("APPROVED", approvalStatus(id));
+        assertEquals("", String.valueOf(jdbc.queryForMap(
+                "select project_snapshot_at from ds_sandbox_approval where id=?", id).get("project_snapshot_at")));
+
+        approvalService.executeApprovals();
+
+        assertEquals("COMPLETED", approvalStatus(id));
+        Map<String, Object> sandbox = jdbc.queryForMap("select status,deleted from ds_sandbox where id=?", sandboxId);
+        assertEquals("DESTROYED", String.valueOf(sandbox.get("status")));
+        assertEquals(1, ((Number) sandbox.get("deleted")).intValue());
+
+        String otherSandboxId = createSandbox();
+        jdbc.update("update ds_sandbox set project_id='' where id=?", otherSandboxId);
+        Map<String, Object> renew = createPayload("RENEW", otherSandboxId);
+        renew.put("days", 7);
+        assertThrows(IllegalArgumentException.class, () -> approvalService.submit(renew));
     }
 
     /** 9. 卡死兜底：EXECUTING 超 10 分钟未更新 → 回退 APPROVED（自动重试），已达上限 → FAILED。 */

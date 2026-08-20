@@ -150,7 +150,12 @@ public class SandboxApprovalService {
         String projectId = "CREATE".equals(type)
                 ? required(request, "projectId")
                 : string(requireSandbox(sandboxId).get("project_id"));
-        requireProjectMembership(projectId, applicantNodeId);
+        // 兼容新版项目模型启用前创建的历史沙箱：这些记录的 project_id 为空或项目已不存在。
+        // 仅 RECYCLE 可跳过项目审批，并仍由下方的节点归属与创建人校验保护；其他变更继续强制关联有效项目。
+        boolean legacyRecycle = "RECYCLE".equals(type) && !projectExists(projectId);
+        if (!legacyRecycle) {
+            requireProjectMembership(projectId, applicantNodeId);
+        }
         if ("CREATE".equals(type)) {
             validateCreatePayload(request);
             validateDatasetAssets(projectId, request.get("datasetAssetIds"));
@@ -165,12 +170,13 @@ public class SandboxApprovalService {
 
         String id = "apr-" + shortId();
         String now = now();
-        List<String> voters = projectVoters(projectId, applicantNodeId);
+        List<String> voters = legacyRecycle ? List.of() : projectVoters(projectId, applicantNodeId);
         String initialStatus = voters.isEmpty() ? "APPROVED" : "DATA_PROVIDER_REVIEW";
         jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,approved_at,created_at,updated_at,deleted,project_id,applicant_node_id,project_snapshot_at) "
                         + "values(?,?,?,?,?,?,?,?,1,'','','','',0,?,?,?,?,0,?,?,?)",
                 id, type, sandboxId, ownerId, operator(), json(new LinkedHashMap<>(request)), initialStatus, initialStatus,
-                now, voters.isEmpty() ? now : "", now, now, projectId, applicantNodeId, projectSnapshot(projectId));
+                now, voters.isEmpty() ? now : "", now, now, projectId, applicantNodeId,
+                legacyRecycle ? "" : projectSnapshot(projectId));
         voters.forEach(voter -> jdbc.update("insert into ds_sandbox_approval_vote(approval_id,voter_node_id,status,voter,comment,voted_at) values(?,?,'PENDING','','','')", id, voter));
         history(id, "SUBMIT", "", initialStatus, value(request, "reason", ""));
         service.audit("AUDIT", "SANDBOX_APPROVAL_SUBMIT", "SANDBOX_APPROVAL", id,
@@ -597,12 +603,17 @@ public class SandboxApprovalService {
     }
 
     private void requireProjectMembership(String projectId, String memberNodeId) {
-        if (count("select count(1) from project where project_id=? and is_deleted=0", projectId) == 0) {
+        if (!projectExists(projectId)) {
             throw new IllegalArgumentException("项目不存在: " + projectId);
         }
         if (count("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0", projectId, memberNodeId) == 0) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前节点不是该项目参与方");
         }
+    }
+
+    private boolean projectExists(String projectId) {
+        return notBlank(projectId)
+                && count("select count(1) from project where project_id=? and is_deleted=0", projectId) > 0;
     }
 
     private List<String> projectVoters(String projectId, String applicantNodeId) {
