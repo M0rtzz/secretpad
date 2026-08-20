@@ -56,6 +56,7 @@ public class P2pDataSyncProducerTemplate extends AbstractDataSyncProducerTemplat
             case "ProjectGraphNodeDO" -> filterProjectGraphNode(event);
             case "ProjectJobDO" -> filterProjectJobDO(event);
             case "ProjectDatatableDO" -> filterProjectDatatableDO(event);
+            case "ProjectAssetDO" -> filterProjectAssetDO(event);
             case "VoteRequestDO" -> filterVoteRequestDO(event);
             case "VoteInviteDO" -> filterVoteInviteDO(event);
             case "ProjectApprovalConfigDO" -> filterProjectApprovalConfigDO(event);
@@ -189,6 +190,11 @@ public class P2pDataSyncProducerTemplate extends AbstractDataSyncProducerTemplat
         ProjectDatatableDO source = (ProjectDatatableDO) event.getSource();
         String nodeId = source.getNodeId();
         return !nodeIds.contains(nodeId);
+    }
+
+    private boolean filterProjectAssetDO(EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event) {
+        ProjectAssetDO source = (ProjectAssetDO) event.getSource();
+        return !nodeIds.contains(source.getProviderNodeId());
     }
 
     private boolean filterVoteRequestDO(EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event) {

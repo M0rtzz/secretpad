@@ -43,6 +43,8 @@ data:
     - org.secretflow.secretpad.persistence.entity.ProjectGraphNodeDO
     - org.secretflow.secretpad.persistence.entity.ProjectJobDO
     - org.secretflow.secretpad.persistence.entity.ProjectDatatableDO
+    - org.secretflow.secretpad.persistence.entity.ProjectAssetDO
+    - org.secretflow.secretpad.persistence.entity.SandboxApprovalSyncDO
     - org.secretflow.secretpad.persistence.entity.VoteRequestDO
     - org.secretflow.secretpad.persistence.entity.VoteInviteDO
     - org.secretflow.secretpad.persistence.entity.ProjectApprovalConfigDO

@@ -29,13 +29,16 @@ public class DataComputeService {
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
     private final SandboxApprovalService approvals;
+    private final DataAssetService assets;
 
     public DataComputeService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc,
                               ObjectMapper mapper,
-                              SandboxApprovalService approvals) {
+                              SandboxApprovalService approvals,
+                              DataAssetService assets) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.approvals = approvals;
+        this.assets = assets;
     }
 
     public List<Map<String, Object>> overview() {
@@ -73,11 +76,12 @@ public class DataComputeService {
                         + "from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id "
                         + "left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 "
                         + "where m.sandbox_id=? and m.deleted=0 order by m.created_at", sandboxId));
-        result.put("availableAssets", jdbc.queryForList(
-                "select a.*,pa.attached_at,n.name provider_node_name from ds_project_asset pa join ds_data_asset a on a.id=pa.asset_id "
-                        + "left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 "
-                        + "where pa.project_id=? and pa.deleted=0 and a.deleted=0 and a.status='ACTIVE' and a.data_stage='PROCESSED' "
-                        + "and (a.valid_until='' or a.valid_until is null or a.valid_until>=?) order by pa.attached_at desc", projectId, now()));
+        result.put("availableAssets", assets.projectAssets(projectId).stream()
+                .filter(asset -> "ACTIVE".equals(string(asset.get("status"))))
+                .filter(asset -> "PROCESSED".equals(string(asset.get("data_stage"))))
+                .filter(asset -> string(asset.get("valid_until")).isBlank()
+                        || string(asset.get("valid_until")).compareTo(now()) >= 0)
+                .toList());
         result.put("canUse", matchesNode(string(sandbox.get("owner_id"))) && Objects.equals(actor(), string(sandbox.get("created_by"))));
         return result;
     }

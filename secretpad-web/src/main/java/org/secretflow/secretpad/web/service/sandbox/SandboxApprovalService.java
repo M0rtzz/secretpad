@@ -14,6 +14,8 @@ import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
+import org.secretflow.secretpad.persistence.entity.SandboxApprovalSyncDO;
+import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
 
@@ -36,6 +38,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Z-03 沙箱资源申请与审批：申请单 CRUD、两级审批动作、权限/并发/幂等控制、审批历史与执行引擎。
@@ -62,6 +65,8 @@ public class SandboxApprovalService {
     private final DataSandboxMvpService service;
     private final SandboxApprovalGate gate;
     private final MinioAssetStorage assetStorage;
+    private final SandboxApprovalSyncRepository approvalSyncRepository;
+    private final Map<String, Integer> appliedSnapshotHashes = new ConcurrentHashMap<>();
 
     @Value("${secretpad.node-id:kuscia-system}")
     private String nodeId;
@@ -74,17 +79,20 @@ public class SandboxApprovalService {
             ObjectMapper objectMapper,
             DataSandboxMvpService service,
             SandboxApprovalGate gate,
-            MinioAssetStorage assetStorage) {
+            MinioAssetStorage assetStorage,
+            SandboxApprovalSyncRepository approvalSyncRepository) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.service = service;
         this.gate = gate;
         this.assetStorage = assetStorage;
+        this.approvalSyncRepository = approvalSyncRepository;
     }
 
     /* ------------------------------- 申请单查询 ------------------------------- */
 
     public List<Map<String, Object>> listApprovals(String status, String type, String keyword) {
+        applySyncedApprovals();
         String current = operator();
         String currentNode = gate.effectiveOwner();
         StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?)");
@@ -110,6 +118,7 @@ public class SandboxApprovalService {
     }
 
     public Map<String, Object> approval(String id) {
+        applySyncedApprovals();
         Map<String, Object> data = requireApproval(id);
         assertApprovalVisible(data);
         data.put("history", approvalHistory(id));
@@ -118,6 +127,7 @@ public class SandboxApprovalService {
     }
 
     public List<Map<String, Object>> approvalHistory(String id) {
+        applySyncedApprovals();
         assertApprovalVisible(requireApproval(id));
         return jdbc.queryForList("select * from ds_sandbox_approval_history where approval_id=? order by id desc", id);
     }
@@ -183,6 +193,7 @@ public class SandboxApprovalService {
                 type + " reason=" + value(request, "reason", ""), true);
         service.dispatchWebhooks("sandbox.approval.submitted",
                 Map.of("approvalId", id, "approvalType", type, "ownerId", ownerId, "sandboxId", sandboxId));
+        publishSnapshot(id);
         return approval(id);
     }
 
@@ -194,6 +205,7 @@ public class SandboxApprovalService {
      */
     @Transactional
     public Map<String, Object> approvalAction(Map<String, Object> request) {
+        applySyncedApprovals();
         String id = required(request, "id");
         String action = required(request, "action").toUpperCase(Locale.ROOT);
         if (!APPROVAL_ACTIONS.contains(action)) {
@@ -242,6 +254,7 @@ public class SandboxApprovalService {
             // 已认领为 EXECUTING，同步执行（结果由 executeOne 落库）
             executeOne(id);
         }
+        publishSnapshot(id);
         return approval(id);
     }
 
@@ -254,8 +267,10 @@ public class SandboxApprovalService {
      */
     @Scheduled(fixedDelayString = "${secretpad.data-sandbox.approval.executor-interval-ms:10000}")
     public void executeApprovals() {
+        applySyncedApprovals();
         for (Map<String, Object> row : jdbc.queryForList(
-                "select id from ds_sandbox_approval where status='APPROVED' and deleted=0 order by approved_at asc limit 20")) {
+                "select id from ds_sandbox_approval where status='APPROVED' and applicant_node_id=? and deleted=0 order by approved_at asc limit 20",
+                nodeId)) {
             String id = string(row.get("id"));
             int claimed = jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,updated_at=? "
                             + "where id=? and status='APPROVED' and deleted=0",
@@ -305,6 +320,7 @@ public class SandboxApprovalService {
                 string(approval.get("approval_type")) + " " + string(approval.get("sandbox_id")), true);
         service.dispatchWebhooks("sandbox.approval.completed",
                 Map.of("approvalId", id, "approvalType", approval.get("approval_type"), "sandboxId", approval.get("sandbox_id")));
+        publishSnapshot(id);
     }
 
     /** 失败重试：retry_count+1；达到上限置 FAILED + 告警；否则回退 APPROVED 由下个轮询周期自动重试。 */
@@ -325,10 +341,12 @@ public class SandboxApprovalService {
             service.raiseAlert("WARNING", "SANDBOX", "沙箱申请执行失败",
                     "申请单 " + id + " (" + approval.get("approval_type") + ") 执行失败：" + error,
                     "approval:" + id + ":failed");
+            publishSnapshot(id);
         } else {
             jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',updated_at=? where id=?", now(), id);
             history(id, "RETRY", "EXECUTING", "APPROVED", "自动重试：" + error);
             service.auditAs("AUDIT", "WARN", engineActor(), "SANDBOX_APPROVAL_RETRY", "SANDBOX_APPROVAL", id, error, true);
+            publishSnapshot(id);
         }
     }
 
@@ -344,10 +362,12 @@ public class SandboxApprovalService {
                         "执行超时（10 分钟未完成）", now(), now(), id);
                 history(id, "FAIL", "EXECUTING", "FAILED", "执行超时");
                 service.auditAs("AUDIT", "ERROR", engineActor(), "SANDBOX_APPROVAL_STUCK", "SANDBOX_APPROVAL", id, "EXECUTING 超时转 FAILED", false);
+                publishSnapshot(id);
             } else {
                 jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',updated_at=? where id=?", now(), id);
                 history(id, "RETRY", "EXECUTING", "APPROVED", "卡死回退自动重试");
                 service.auditAs("AUDIT", "WARN", engineActor(), "SANDBOX_APPROVAL_STUCK", "SANDBOX_APPROVAL", id, "EXECUTING 超时回退 APPROVED", true);
+                publishSnapshot(id);
             }
         }
     }
@@ -510,9 +530,10 @@ public class SandboxApprovalService {
     private void syncDatasetMounts(String sandboxId, Map<String, Object> payload) {
         List<String> assetIds = stringList(payload.get("datasetAssetIds"));
         String sandboxNode = string(jdbc.queryForObject("select owner_id from ds_sandbox where id=?", String.class, sandboxId));
+        String projectId = string(jdbc.queryForObject("select project_id from ds_sandbox where id=?", String.class, sandboxId));
         jdbc.update("update ds_sandbox_dataset_mount set deleted=1,status='DETACHED',updated_at=? where sandbox_id=? and deleted=0", now(), sandboxId);
         for (String assetId : assetIds) {
-            Map<String, Object> asset = requireRow("select * from ds_data_asset where id=? and deleted=0", assetId);
+            Map<String, Object> asset = projectAsset(projectId, assetId);
             String mountId = "mnt-" + shortId();
             String provider = string(asset.get("provider_node_id"));
             String checksum = metadataChecksum(asset.get("metadata_json"));
@@ -528,6 +549,97 @@ public class SandboxApprovalService {
     }
 
     /* ------------------------------- 内部工具 ------------------------------- */
+
+    /**
+     * Materialize project-scoped approval snapshots received through SecretPad's P2P data sync.
+     * The JDBC approval tables remain the workflow store; this synchronized envelope makes the
+     * same request, votes and history visible and actionable on every project participant.
+     */
+    @SuppressWarnings("unchecked")
+    private void applySyncedApprovals() {
+        for (SandboxApprovalSyncDO sync : approvalSyncRepository.findAll()) {
+            try {
+                String approvalId = sync.getUpk() == null ? "" : sync.getUpk().getApprovalId();
+                int snapshotHash = sync.getSnapshotJson().hashCode();
+                if (Objects.equals(appliedSnapshotHashes.get(approvalId), snapshotHash)) continue;
+                Map<String, Object> snapshot = objectMapper.readValue(sync.getSnapshotJson(), Map.class);
+                Map<String, Object> approval = castMap((Map<?, ?>) snapshot.get("approval"));
+                String id = string(approval.get("id"));
+                if (!notBlank(id)) continue;
+                List<Map<String, Object>> existing = jdbc.queryForList(
+                        "select updated_at from ds_sandbox_approval where id=? and deleted=0", id);
+                if (!existing.isEmpty()
+                        && string(existing.get(0).get("updated_at")).compareTo(string(approval.get("updated_at"))) > 0) {
+                    continue;
+                }
+                upsertSyncedApproval(approval);
+                jdbc.update("delete from ds_sandbox_approval_vote where approval_id=?", id);
+                for (Map<String, Object> vote : mapList(snapshot.get("votes"))) {
+                    jdbc.update("insert into ds_sandbox_approval_vote(approval_id,voter_node_id,status,voter,comment,voted_at) values(?,?,?,?,?,?)",
+                            id, vote.get("voter_node_id"), vote.get("status"), value(vote, "voter", ""),
+                            value(vote, "comment", ""), value(vote, "voted_at", ""));
+                }
+                jdbc.update("delete from ds_sandbox_approval_history where approval_id=?", id);
+                for (Map<String, Object> history : mapList(snapshot.get("history"))) {
+                    jdbc.update("insert into ds_sandbox_approval_history(approval_id,action,from_status,to_status,operator,comment,created_at) values(?,?,?,?,?,?,?)",
+                            id, history.get("action"), value(history, "from_status", ""), history.get("to_status"),
+                            history.get("operator"), value(history, "comment", ""), history.get("created_at"));
+                }
+                appliedSnapshotHashes.put(id, snapshotHash);
+            } catch (Exception e) {
+                log.warn("Ignore malformed sandbox approval sync snapshot {}", sync.getUpk(), e);
+            }
+        }
+    }
+
+    private void upsertSyncedApproval(Map<String, Object> approval) {
+        String id = string(approval.get("id"));
+        int changed = jdbc.update("update ds_sandbox_approval set approval_type=?,sandbox_id=?,owner_id=?,submitter=?,payload_json=?,status=?,current_stage=?,version=?,executor=?,reviewer=?,review_comment=?,last_error=?,retry_count=?,submitted_at=?,approved_at=?,completed_at=?,created_at=?,updated_at=?,deleted=?,project_id=?,applicant_node_id=?,project_snapshot_at=? where id=?",
+                approval.get("approval_type"), value(approval, "sandbox_id", ""), approval.get("owner_id"), approval.get("submitter"),
+                value(approval, "payload_json", "{}"), approval.get("status"), approval.get("current_stage"), intValue(approval.get("version"), 1),
+                value(approval, "executor", ""), value(approval, "reviewer", ""), value(approval, "review_comment", ""), value(approval, "last_error", ""),
+                intValue(approval.get("retry_count"), 0), approval.get("submitted_at"), value(approval, "approved_at", ""), value(approval, "completed_at", ""),
+                approval.get("created_at"), approval.get("updated_at"), intValue(approval.get("deleted"), 0), approval.get("project_id"),
+                approval.get("applicant_node_id"), value(approval, "project_snapshot_at", ""), id);
+        if (changed == 0) {
+            jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,approved_at,completed_at,created_at,updated_at,deleted,project_id,applicant_node_id,project_snapshot_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    id, approval.get("approval_type"), value(approval, "sandbox_id", ""), approval.get("owner_id"), approval.get("submitter"),
+                    value(approval, "payload_json", "{}"), approval.get("status"), approval.get("current_stage"), intValue(approval.get("version"), 1),
+                    value(approval, "executor", ""), value(approval, "reviewer", ""), value(approval, "review_comment", ""), value(approval, "last_error", ""),
+                    intValue(approval.get("retry_count"), 0), approval.get("submitted_at"), value(approval, "approved_at", ""), value(approval, "completed_at", ""),
+                    approval.get("created_at"), approval.get("updated_at"), intValue(approval.get("deleted"), 0), approval.get("project_id"),
+                    approval.get("applicant_node_id"), value(approval, "project_snapshot_at", ""));
+        }
+    }
+
+    private void publishSnapshot(String approvalId) {
+        Map<String, Object> approval = requireApproval(approvalId);
+        String projectId = string(approval.get("project_id"));
+        if (!notBlank(projectId)) return;
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("approval", approval);
+        snapshot.put("votes", jdbc.queryForList("select * from ds_sandbox_approval_vote where approval_id=? order by voter_node_id", approvalId));
+        snapshot.put("history", jdbc.queryForList("select * from ds_sandbox_approval_history where approval_id=? order by id", approvalId));
+        SandboxApprovalSyncDO.UPK upk = new SandboxApprovalSyncDO.UPK(approvalId);
+        SandboxApprovalSyncDO sync = approvalSyncRepository.findById(upk).orElseGet(SandboxApprovalSyncDO::new);
+        sync.setUpk(upk);
+        sync.setProjectId(projectId);
+        sync.setApplicantNodeId(string(approval.get("applicant_node_id")));
+        String snapshotJson = json(snapshot);
+        sync.setSnapshotJson(snapshotJson);
+        sync.setGmtModified(LocalDateTime.now(java.time.ZoneOffset.UTC).truncatedTo(java.time.temporal.ChronoUnit.SECONDS));
+        approvalSyncRepository.saveAndFlush(sync);
+        appliedSnapshotHashes.put(approvalId, snapshotJson.hashCode());
+    }
+
+    private List<Map<String, Object>> mapList(Object value) {
+        if (!(value instanceof Iterable<?> iterable)) return List.of();
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object item : iterable) {
+            if (item instanceof Map<?, ?> map) result.add(castMap(map));
+        }
+        return result;
+    }
 
     private int conditionalUpdate(String id, String from, String action, String to, String comment) {
         String now = now();
@@ -626,13 +738,34 @@ public class SandboxApprovalService {
 
     private void validateDatasetAssets(String projectId, Object selected) {
         for (String assetId : stringList(selected)) {
-            Map<String, Object> asset = requireRow("select * from ds_data_asset where id=? and deleted=0 and status='ACTIVE'", assetId);
+            Map<String, Object> asset = projectAsset(projectId, assetId);
+            if (!"ACTIVE".equals(string(asset.get("status")))) {
+                throw new IllegalArgumentException("数据不存在或不可用: " + assetId);
+            }
             if (!"PROCESSED".equals(string(asset.get("data_stage")))) throw new IllegalArgumentException("沙箱只能挂载抽样脱敏后的数据: " + assetId);
             if (count("select count(1) from ds_project_asset where project_id=? and asset_id=? and deleted=0", projectId, assetId) == 0) {
                 throw new IllegalArgumentException("数据未挂载到所选项目: " + assetId);
             }
             String validUntil = string(asset.get("valid_until"));
             if (notBlank(validUntil) && validUntil.compareTo(now()) < 0) throw new IllegalArgumentException("数据已过有效期: " + assetId);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> projectAsset(String projectId, String assetId) {
+        List<Map<String, Object>> local = jdbc.queryForList(
+                "select * from ds_data_asset where id=? and deleted=0", assetId);
+        if (!local.isEmpty()) return new LinkedHashMap<>(local.get(0));
+        List<Map<String, Object>> shared = jdbc.queryForList(
+                "select asset_json,provider_node_id from ds_project_asset where project_id=? and asset_id=? and deleted=0 and coalesce(is_deleted,0)=0",
+                projectId, assetId);
+        if (shared.isEmpty()) throw new IllegalArgumentException("数据不存在: " + assetId);
+        try {
+            Map<String, Object> snapshot = objectMapper.readValue(string(shared.get(0).get("asset_json")), Map.class);
+            snapshot.put("provider_node_id", shared.get(0).get("provider_node_id"));
+            return snapshot;
+        } catch (Exception e) {
+            throw new IllegalStateException("项目数据元数据损坏: " + assetId, e);
         }
     }
 

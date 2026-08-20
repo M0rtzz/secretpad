@@ -117,7 +117,7 @@ public class DataSandboxMvpService {
     /* ------------------------------- Sandbox ------------------------------- */
 
     public List<Map<String, Object>> listSandboxes(String ownerId, String keyword, String status) {
-        StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0");
+        StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref,n.name owner_node_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id left join node n on (n.node_id=s.owner_id or n.inst_id=s.owner_id) and n.is_deleted=0 where s.deleted=0");
         List<Object> args = new ArrayList<>();
         if (notBlank(ownerId)) {
             sql.append(" and (s.owner_id=? or exists (select 1 from project_node pn where pn.project_id=s.project_id and pn.node_id=? and pn.is_deleted=0))");
@@ -157,8 +157,8 @@ public class DataSandboxMvpService {
         ensureQuota(ownerId);
         assertCapacity(ownerId, cpu, memory, gpu, storage);
         String now = now();
-        jdbc.update("insert into ds_sandbox(id,name,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
-                id, name, ownerId, value(request, "projectId", ""), imageId,
+        jdbc.update("insert into ds_sandbox(id,name,description,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
+                id, name, value(request, "description", ""), ownerId, value(request, "projectId", ""), imageId,
                 LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
                 value(request, "createdBy", actor()), now, now);
         audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);

@@ -68,6 +68,8 @@ public class JpaSyncDataService {
     private final NodeRepository nodeRepository;
     private final NodeRouteRepository nodeRouteRepository;
     private final ProjectDatatableRepository projectDatatableRepository;
+    private final ProjectAssetRepository projectAssetRepository;
+    private final SandboxApprovalSyncRepository sandboxApprovalSyncRepository;
     private final ProjectFedTableRepository projectFedTableRepository;
     private final ProjectGraphNodeRepository projectGraphNodeRepository;
     private final ProjectGraphRepository projectGraphRepository;
@@ -109,6 +111,8 @@ public class JpaSyncDataService {
         doAndRepository.put(NodeDO.class.getTypeName(), nodeRepository);
         doAndRepository.put(NodeRouteDO.class.getTypeName(), nodeRouteRepository);
         doAndRepository.put(ProjectDatatableDO.class.getTypeName(), projectDatatableRepository);
+        doAndRepository.put(ProjectAssetDO.class.getTypeName(), projectAssetRepository);
+        doAndRepository.put(SandboxApprovalSyncDO.class.getTypeName(), sandboxApprovalSyncRepository);
         doAndRepository.put(ProjectFedTableDO.class.getTypeName(), projectFedTableRepository);
         doAndRepository.put(ProjectGraphNodeDO.class.getTypeName(), projectGraphNodeRepository);
         doAndRepository.put(ProjectGraphDO.class.getTypeName(), projectGraphRepository);

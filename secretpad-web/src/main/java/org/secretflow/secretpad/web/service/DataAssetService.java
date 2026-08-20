@@ -9,6 +9,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
+import org.secretflow.secretpad.persistence.entity.ProjectAssetDO;
+import org.secretflow.secretpad.persistence.repository.ProjectAssetRepository;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -28,11 +30,14 @@ public class DataAssetService {
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
     private final MinioAssetStorage storage;
+    private final ProjectAssetRepository projectAssetRepository;
 
-    public DataAssetService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc, ObjectMapper mapper, MinioAssetStorage storage) {
+    public DataAssetService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc, ObjectMapper mapper,
+            MinioAssetStorage storage, ProjectAssetRepository projectAssetRepository) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.storage = storage;
+        this.projectAssetRepository = projectAssetRepository;
     }
 
     @Transactional
@@ -127,16 +132,73 @@ public class DataAssetService {
             args.add("%" + q + "%"); args.add("%" + q + "%");
         }
         sql.append(" order by a.created_at desc");
-        return jdbc.queryForList(sql.toString(), args.toArray());
+        List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
+        rows.forEach(asset -> asset.put("owned", matchesOwner(String.valueOf(asset.get("provider_node_id")))));
+        List<Map<String, Object>> shared = jdbc.queryForList(
+                "select pa.*,n.name provider_node_name from ds_project_asset pa "
+                        + "join project_node pn on pn.project_id=pa.project_id and pn.node_id=? and pn.is_deleted=0 "
+                        + "left join node n on (n.node_id=pa.provider_node_id or n.inst_id=pa.provider_node_id) and n.is_deleted=0 "
+                        + "where pa.deleted=0 and coalesce(pa.is_deleted,0)=0 and pa.asset_json<>'' and pa.asset_json<>'{}' "
+                        + "and not exists(select 1 from ds_data_asset a where a.id=pa.asset_id and a.deleted=0)",
+                owner);
+        for (Map<String, Object> attachment : shared) {
+            Map<String, Object> asset = parseMap(attachment.get("asset_json"));
+            if (asset.isEmpty()) continue;
+            if (!q.isEmpty() && !String.valueOf(asset.getOrDefault("name", "")).toLowerCase(Locale.ROOT).contains(q)
+                    && !String.valueOf(asset.getOrDefault("id", "")).toLowerCase(Locale.ROOT).contains(q)) continue;
+            asset.put("provider_node_id", attachment.get("provider_node_id"));
+            asset.put("provider_node_name", attachment.get("provider_node_name"));
+            asset.put("attached_project_id", attachment.get("project_id"));
+            asset.put("owned", false);
+            rows.add(asset);
+        }
+        return rows;
     }
 
     public Map<String, Object> detail(String id) {
         return requireVisible(id);
     }
 
+    @Transactional
     public List<Map<String, Object>> projectAssets(String projectId) {
-        requireProjectMember(projectId);
-        return jdbc.queryForList("select a.*,pa.attached_at,pa.expires_at attached_expires_at,n.name provider_node_name from ds_project_asset pa join ds_data_asset a on a.id=pa.asset_id left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 where pa.project_id=? and pa.deleted=0 and a.deleted=0 order by pa.attached_at desc", projectId);
+        requireProjectParticipant(projectId);
+        List<Map<String, Object>> attachments = jdbc.queryForList(
+                "select pa.*,n.name provider_node_name from ds_project_asset pa "
+                        + "left join node n on (n.node_id=pa.provider_node_id or n.inst_id=pa.provider_node_id) and n.is_deleted=0 "
+                        + "where pa.project_id=? and pa.deleted=0 and coalesce(pa.is_deleted,0)=0 order by pa.attached_at desc",
+                projectId);
+        List<Map<String, Object>> result = new ArrayList<>();
+        boolean snapshotsBackfilled = false;
+        for (Map<String, Object> attachment : attachments) {
+            Map<String, Object> asset = parseMap(attachment.get("asset_json"));
+            if (asset.isEmpty()) {
+                List<Map<String, Object>> local = jdbc.queryForList(
+                        "select * from ds_data_asset where id=? and deleted=0", attachment.get("asset_id"));
+                if (!local.isEmpty()) {
+                    asset.putAll(local.get(0));
+                    if (matchesOwner(String.valueOf(attachment.get("provider_node_id")))) {
+                        Map<String, Object> snapshot = new LinkedHashMap<>(asset);
+                        snapshot.put("schema_columns", schemaColumns(asset));
+                        projectAssetRepository.findById(new ProjectAssetDO.UPK(
+                                projectId, String.valueOf(attachment.get("asset_id"))))
+                                .ifPresent(projectAsset -> {
+                                    projectAsset.setAssetJson(json(snapshot));
+                                    projectAssetRepository.save(projectAsset);
+                                });
+                        snapshotsBackfilled = true;
+                    }
+                }
+            }
+            if (asset.isEmpty()) continue;
+            asset.put("attached_at", attachment.get("attached_at"));
+            asset.put("attached_expires_at", attachment.get("expires_at"));
+            asset.put("provider_node_id", attachment.get("provider_node_id"));
+            asset.put("provider_node_name", attachment.get("provider_node_name"));
+            asset.put("owned", matchesOwner(String.valueOf(attachment.get("provider_node_id"))));
+            result.add(asset);
+        }
+        if (snapshotsBackfilled) projectAssetRepository.flush();
+        return result;
     }
 
     public List<Map<String, Object>> sandboxMounts(String sandboxId) {
@@ -148,16 +210,25 @@ public class DataAssetService {
     @Transactional
     public List<Map<String, Object>> attachProjectAssets(Map<String, Object> request) {
         String projectId = required(request, "projectId");
-        requireProjectMember(projectId);
+        requireProjectParticipant(projectId);
         Object selected = request.get("assetIds");
         if (!(selected instanceof Iterable<?> iterable)) throw new IllegalArgumentException("assetIds 必须是数组");
         for (Object item : iterable) {
             String assetId = String.valueOf(item);
             Map<String, Object> asset = require(assetId);
             requireProvider(asset);
-            int changed = jdbc.update("update ds_project_asset set provider_node_id=?,attached_by=?,attached_at=?,expires_at=?,deleted=0 where project_id=? and asset_id=?", owner(), actor(), now(), asset.get("valid_until"), projectId, assetId);
-            if (changed == 0) jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,attached_by,attached_at,expires_at,deleted) values(?,?,?,?,?,?,0)", projectId, assetId, owner(), actor(), now(), asset.get("valid_until"));
+            Map<String, Object> snapshot = new LinkedHashMap<>(asset);
+            snapshot.put("schema_columns", schemaColumns(asset));
+            projectAssetRepository.save(ProjectAssetDO.builder()
+                    .upk(new ProjectAssetDO.UPK(projectId, assetId))
+                    .providerNodeId(owner())
+                    .assetJson(json(snapshot))
+                    .attachedBy(actor())
+                    .attachedAt(now())
+                    .expiresAt(String.valueOf(asset.getOrDefault("valid_until", "")))
+                    .build());
         }
+        projectAssetRepository.flush();
         return projectAssets(projectId);
     }
 
@@ -254,6 +325,12 @@ public class DataAssetService {
     private Map<String,Object> require(String id) { List<Map<String,Object>> r=jdbc.queryForList("select * from ds_data_asset where id=? and deleted=0",id); if(r.isEmpty()) throw new NoSuchElementException("数据不存在"); return r.get(0); }
     private void requireProvider(Map<String,Object> a){ if(!matchesOwner(String.valueOf(a.get("provider_node_id")))) throw new SecurityException("仅数据提供方可删除"); }
     private void requireProjectMember(String projectId){if(c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())==0)throw new SecurityException("当前节点不是项目成员");}
+    private void requireProjectParticipant(String projectId){
+        boolean member=c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())>0;
+        boolean initiator=c("select count(1) from project where project_id=? and owner_id in (?,?) and is_deleted=0",projectId,owner(),legacyOwner())>0;
+        boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action='REVIEWING'",projectId,owner(),legacyOwner())>0;
+        if(!member&&!initiator&&!invitee)throw new SecurityException("当前节点不是项目参与方");
+    }
     private long c(String sql,Object...args){Long n=jdbc.queryForObject(sql,Long.class,args);return n==null?0:n;}
     private String owner(){UserContextDTO u=UserContext.getUserOrNotExist();if(u==null)return "kuscia-system";return u.getPlatformNodeId()!=null&&!u.getPlatformNodeId().isBlank()?u.getPlatformNodeId():(u.getOwnerId()==null?"kuscia-system":u.getOwnerId());}
     private String legacyOwner(){UserContextDTO u=UserContext.getUserOrNotExist();return u==null||u.getOwnerId()==null?owner():u.getOwnerId();}
@@ -261,6 +338,12 @@ public class DataAssetService {
     private String actor(){UserContextDTO u=UserContext.getUserOrNotExist();return u==null||u.getName()==null?"system":u.getName();}
     private String now(){return LocalDateTime.now().toString();}
     private String json(Object o){try{return mapper.writeValueAsString(o);}catch(Exception e){throw new IllegalArgumentException(e);}}
+    @SuppressWarnings("unchecked")
+    private Map<String,Object> parseMap(Object value){try{if(value==null||String.valueOf(value).isBlank()||"{}".equals(String.valueOf(value)))return new LinkedHashMap<>();return new LinkedHashMap<>(mapper.readValue(String.valueOf(value),Map.class));}catch(Exception e){return new LinkedHashMap<>();}}
+    private List<String> schemaColumns(Map<String,Object> asset){
+        if(!"TABULAR".equals(String.valueOf(asset.get("modality")))||String.valueOf(asset.getOrDefault("storage_uri","")).isBlank())return List.of();
+        try(BufferedReader reader=new BufferedReader(new InputStreamReader(storage.open(String.valueOf(asset.get("storage_uri"))),StandardCharsets.UTF_8))){String header=reader.readLine();return header==null?List.of():csvFields(header);}catch(IOException e){return List.of();}
+    }
     private String required(Map<String,Object> m,String k){String v=value(m,k);if(v.isBlank())throw new IllegalArgumentException(k+" 不能为空");return v;}
     private String value(Map<String,Object> m,String k){return String.valueOf(m.getOrDefault(k,""));}
     private boolean bool(Object o){return Boolean.TRUE.equals(o)||"true".equalsIgnoreCase(String.valueOf(o))||"1".equals(String.valueOf(o));}
