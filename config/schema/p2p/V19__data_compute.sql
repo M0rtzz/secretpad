@@ -1,0 +1,47 @@
+-- Sandbox-scoped data computation, custom components, canvases and reports.
+alter table ds_dev_artifact add column project_id varchar(128) not null default '';
+alter table ds_dev_artifact add column sandbox_id varchar(64) not null default '';
+alter table ds_dev_task add column project_id varchar(128) not null default '';
+alter table ds_dev_task add column sandbox_id varchar(64) not null default '';
+alter table ds_dev_task add column source_asset_id varchar(64) not null default '';
+alter table ds_dev_task add column source_mount_id varchar(64) not null default '';
+alter table ds_dev_task add column result_asset_id varchar(64) not null default '';
+alter table ds_model add column sandbox_id varchar(64) not null default '';
+alter table ds_model add column input_schema text not null default '[]';
+alter table ds_model add column output_schema text not null default '[]';
+
+create index if not exists idx_da_sandbox on ds_dev_artifact(sandbox_id, deleted);
+create index if not exists idx_dt_sandbox on ds_dev_task(sandbox_id, created_at, deleted);
+create index if not exists idx_dm_sandbox on ds_model(sandbox_id, deleted);
+
+create table if not exists ds_custom_component (
+ id varchar(64) primary key, model_id varchar(64) not null,
+ project_id varchar(128) not null, sandbox_id varchar(64) not null,
+ code varchar(128) not null unique, name varchar(128) not null,
+ artifact_id varchar(64) not null, artifact_version_id varchar(64) not null,
+ runtime_type varchar(16) not null, input_schema text not null default '[]',
+ output_schema text not null default '[]', params_schema text not null default '[]',
+ status varchar(16) not null default 'ENABLED', created_by varchar(128) not null,
+ created_at varchar(64) not null, updated_at varchar(64) not null, deleted integer default 0
+);
+create index if not exists idx_custom_component_scope on ds_custom_component(project_id,sandbox_id,status,deleted);
+
+create table if not exists ds_compute_canvas (
+ id varchar(64) primary key, project_id varchar(128) not null,
+ sandbox_id varchar(64) not null, name varchar(128) not null,
+ description text, graph_json text not null default '{}', version integer not null default 1,
+ status varchar(16) not null default 'DRAFT', created_by varchar(128) not null,
+ created_at varchar(64) not null, updated_at varchar(64) not null, deleted integer default 0
+);
+create index if not exists idx_compute_canvas_scope on ds_compute_canvas(sandbox_id,updated_at,deleted);
+
+create table if not exists ds_compute_report (
+ id varchar(64) primary key, project_id varchar(128) not null,
+ sandbox_id varchar(64) not null, canvas_id varchar(64) not null default '',
+ run_id varchar(128) not null default '', component_id varchar(128) not null default '',
+ report_type varchar(64) not null, name varchar(256) not null,
+ payload_json text not null default '{}', input_versions_json text not null default '[]',
+ algorithm_version varchar(128) not null default '', created_by varchar(128) not null,
+ created_at varchar(64) not null, deleted integer default 0
+);
+create index if not exists idx_compute_report_scope on ds_compute_report(sandbox_id,created_at,deleted);

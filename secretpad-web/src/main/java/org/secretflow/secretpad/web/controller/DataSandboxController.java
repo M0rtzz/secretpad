@@ -217,6 +217,11 @@ public class DataSandboxController {
         return SecretPadResponse.success();
     }
 
+    @PostMapping("/integrations/clients/rotate")
+    public SecretPadResponse<Map<String, Object>> rotateClient(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.rotateApiClient(String.valueOf(request.get("id"))));
+    }
+
     @PostMapping("/integrations/webhooks/save")
     public SecretPadResponse<Map<String, Object>> saveWebhook(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.saveWebhook(request));
@@ -240,6 +245,57 @@ public class DataSandboxController {
     @PostMapping("/integrations/oidc/test")
     public SecretPadResponse<Map<String, Object>> testOidc() {
         return SecretPadResponse.success(service.testOidc());
+    }
+
+    @PostMapping("/integrations/oidc/mappings/save")
+    public SecretPadResponse<Map<String, Object>> saveOidcMapping(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveOidcMapping(request));
+    }
+
+    @PostMapping("/integrations/oidc/mappings/delete")
+    public SecretPadResponse<Void> deleteOidcMapping(@RequestBody Map<String, Object> request) {
+        service.deleteOidcMapping(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
+    @GetMapping("/tenants")
+    public SecretPadResponse<List<Map<String, Object>>> tenants() {
+        return SecretPadResponse.success(service.tenants());
+    }
+
+    @PostMapping("/tenants/open")
+    public SecretPadResponse<Map<String, Object>> openTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.openTenant(request));
+    }
+
+    @PostMapping("/tenants/resize")
+    public SecretPadResponse<Map<String, Object>> resizeTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.resizeTenant(request));
+    }
+
+    @PostMapping("/tenants/deploy")
+    public SecretPadResponse<Map<String, Object>> deployTenant(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.deployTenant(String.valueOf(request.get("tenantId"))));
+    }
+
+    @GetMapping("/billing/usage")
+    public SecretPadResponse<List<Map<String, Object>>> billingUsage(@RequestParam String tenantId) {
+        return SecretPadResponse.success(service.billingUsage(tenantId));
+    }
+
+    @PostMapping("/billing/calculate")
+    public SecretPadResponse<Map<String, Object>> calculateBilling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.calculateBilling(request));
+    }
+
+    @GetMapping("/trusted/exchanges")
+    public SecretPadResponse<List<Map<String, Object>>> trustedExchanges(@RequestParam(defaultValue = "") String tenantId) {
+        return SecretPadResponse.success(service.trustedExchanges(tenantId));
+    }
+
+    @PostMapping("/trusted/push")
+    public SecretPadResponse<Map<String, Object>> trustedPush(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.trustedPush(request));
     }
 
     @Operation(summary = "运维总览")

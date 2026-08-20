@@ -69,6 +69,9 @@ public class ProjectDO extends BaseAggregationRoot<ProjectDO> {
      */
     private String computeMode;
 
+    @Column(name = "development_modes", length = 256)
+    private String developmentModes;
+
     @Column(name = "compute_func", length = 64)
     private String computeFunc;
     /**

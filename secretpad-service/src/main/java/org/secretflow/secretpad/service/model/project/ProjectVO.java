@@ -109,6 +109,9 @@ public class ProjectVO {
      */
     private String computeFunc;
 
+    /** SQL/Python/function ecosystem/JAR capability tags. */
+    private List<String> developmentModes;
+
     /**
      * project vote id
      */

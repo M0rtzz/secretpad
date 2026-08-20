@@ -50,8 +50,9 @@ public class ModelController {
     @GetMapping("")
     public SecretPadResponse<List<Map<String, Object>>> list(
             @RequestParam(defaultValue = "") String status,
-            @RequestParam(defaultValue = "") String keyword) {
-        return SecretPadResponse.success(service.listModels(status, keyword));
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "") String sandboxId) {
+        return SecretPadResponse.success(service.listModels(status, keyword, sandboxId));
     }
 
     @Operation(summary = "模型详情（+当前审批 + 测试 + API）")

@@ -56,6 +56,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Compact application service for the Data Sandbox MVP.
@@ -118,7 +120,8 @@ public class DataSandboxMvpService {
         StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id where s.deleted=0");
         List<Object> args = new ArrayList<>();
         if (notBlank(ownerId)) {
-            sql.append(" and s.owner_id=?");
+            sql.append(" and (s.owner_id=? or exists (select 1 from project_node pn where pn.project_id=s.project_id and pn.node_id=? and pn.is_deleted=0))");
+            args.add(ownerId);
             args.add(ownerId);
         }
         if (notBlank(keyword)) {
@@ -157,7 +160,7 @@ public class DataSandboxMvpService {
         jdbc.update("insert into ds_sandbox(id,name,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
                 id, name, ownerId, value(request, "projectId", ""), imageId,
                 LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
-                actor(), now, now);
+                value(request, "createdBy", actor()), now, now);
         audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);
         // Z-02：创建即按规格预占资源（RESERVED），占住容量直到绑定或释放
         Map<String, Object> created = sandbox(id);
@@ -173,6 +176,9 @@ public class DataSandboxMvpService {
         String action = required(request, "action").toUpperCase(Locale.ROOT);
         Map<String, Object> sandbox = sandbox(id);
         String status = string(sandbox.get("status"));
+        if (Set.of("START", "STOP", "SNAPSHOT").contains(action)) {
+            requireCreator(sandbox);
+        }
         String error = "";
         switch (action) {
             case "START" -> {
@@ -256,7 +262,7 @@ public class DataSandboxMvpService {
      */
     public Map<String, Object> generateDevToken(String sandboxId) {
         Map<String, Object> sandbox = sandbox(sandboxId);
-        requireOwner(sandbox);
+        requireCreator(sandbox);
         // Z-02 网络隔离：NO_NETWORK 沙箱不暴露任何集群外端点，开发跳板一并拒绝
         if ("NO_NETWORK".equals(string(sandbox.get("network_policy")))) {
             throw new IllegalStateException("NO_NETWORK 沙箱不提供开发端点");
@@ -332,18 +338,13 @@ public class DataSandboxMvpService {
         return endpoint;
     }
 
-    /** 仅沙箱 owner、所在节点运维账号（platformNodeId 与沙箱 owner 一致）或平台管理员可进入开发环境。 */
-    private void requireOwner(Map<String, Object> sandbox) {
+    /** Development environments are private to the account that created them. */
+    private void requireCreator(Map<String, Object> sandbox) {
         UserContextDTO user = UserContext.getUserOrNotExist();
         if (user == null) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权访问该沙箱的开发环境");
         }
-        boolean admin = "kuscia-system".equals(user.getOwnerId()) && "admin".equals(user.getName());
-        String sandboxOwner = string(sandbox.get("owner_id"));
-        // 沙箱 owner 与登录账号 ownerId 相同，或该账号是其所在节点（platformNodeId）的运维账号
-        boolean isOwner = Objects.equals(user.getOwnerId(), sandboxOwner)
-                || Objects.equals(user.getPlatformNodeId(), sandboxOwner);
-        if (!admin && !isOwner) {
+        if (!Objects.equals(user.getName(), string(sandbox.get("created_by")))) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权访问该沙箱的开发环境");
         }
     }
@@ -666,12 +667,14 @@ public class DataSandboxMvpService {
     /* ------------------------------- Integrations ------------------------------- */
 
     public Map<String, Object> integrationOverview() {
-        List<Map<String, Object>> clients = jdbc.queryForList("select id,name,client_id,scopes,enabled,last_used_at,created_by,created_at from ds_api_client order by created_at desc");
+        List<Map<String, Object>> clients = jdbc.queryForList("select id,name,client_id,scopes,enabled,last_used_at,secret_version,created_by,created_at from ds_api_client order by created_at desc");
         List<Map<String, Object>> webhooks = jdbc.queryForList("select id,name,url,events,enabled,created_by,created_at,updated_at from ds_webhook order by created_at desc");
         List<Map<String, Object>> deliveries = jdbc.queryForList("select * from ds_webhook_delivery order by created_at desc limit 100");
         Map<String, Object> oidc = new HashMap<>(requireRow("select * from ds_oidc_config where id=1"));
         oidc.put("has_client_secret", notBlank(string(oidc.remove("client_secret"))));
+        List<Map<String, Object>> oidcMappings = jdbc.queryForList("select * from ds_oidc_role_mapping order by created_at desc");
         return Map.of("clients", clients, "webhooks", webhooks, "deliveries", deliveries, "oidc", oidc,
+                "oidcMappings", oidcMappings,
                 "openapi", "/swagger-ui/index.html", "openapiJson", "/v3/api-docs");
     }
 
@@ -710,6 +713,135 @@ public class DataSandboxMvpService {
     public void revokeApiClient(String id) {
         jdbc.update("update ds_api_client set enabled=0 where id=?", id);
         audit("AUDIT", "API_CLIENT_REVOKE", "API_CLIENT", id, "", true);
+    }
+
+    @Transactional
+    public Map<String, Object> rotateApiClient(String id) {
+        Map<String, Object> client = requireRow("select * from ds_api_client where id=? and enabled=1", id);
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
+        jdbc.update("update ds_api_client set secret_hash=?,secret_version=secret_version+1 where id=?",
+                sha256(secret.getBytes(StandardCharsets.UTF_8)), id);
+        audit("AUDIT", "API_CLIENT_ROTATE", "API_CLIENT", id, "", true);
+        Map<String, Object> result = new LinkedHashMap<>(client);
+        result.remove("secret_hash");
+        result.put("client_secret", secret);
+        result.put("secret_version", number(client.get("secret_version"), 1) + 1);
+        result.put("notice", "新密钥只显示一次，旧密钥已立即失效");
+        return result;
+    }
+
+    public List<Map<String, Object>> tenants() {
+        return jdbc.queryForList("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant order by created_at desc");
+    }
+
+    @Transactional
+    public Map<String, Object> openTenant(Map<String, Object> request) {
+        String id = "ten-" + shortId();
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
+        String created = now();
+        jdbc.update("insert into ds_tenant(id,name,owner_id,status,cpu_cores,memory_gb,gpu_count,storage_gb,signing_secret,created_by,created_at,updated_at) values(?,?,?,'CREATED',?,?,0,?,?,?,?,?)",
+                id, required(request, "name"), value(request, "ownerId", currentOwner()),
+                Math.max(1, nonNegativeInt(request, "cpuCores", 4)), Math.max(1, nonNegativeInt(request, "memoryGb", 16)),
+                Math.max(1, nonNegativeInt(request, "storageGb", 100)), sha256(secret.getBytes(StandardCharsets.UTF_8)), actor(), created, created);
+        audit("AUDIT", "TENANT_OPEN", "TENANT", id, "", true);
+        Map<String, Object> result = new LinkedHashMap<>(requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant where id=?", id));
+        result.put("signingSecret", secret);
+        result.put("notice", "签名密钥只显示一次，请立即保存");
+        return result;
+    }
+
+    @Transactional
+    public Map<String, Object> resizeTenant(Map<String, Object> request) {
+        String id = required(request, "tenantId");
+        Map<String, Object> old = requireRow("select * from ds_tenant where id=?", id);
+        jdbc.update("update ds_tenant set cpu_cores=?,memory_gb=?,storage_gb=?,updated_at=? where id=?",
+                Math.max(1, nonNegativeInt(request, "cpuCores", (int) number(old.get("cpu_cores"), 4))),
+                Math.max(1, nonNegativeInt(request, "memoryGb", (int) number(old.get("memory_gb"), 16))),
+                Math.max(1, nonNegativeInt(request, "storageGb", (int) number(old.get("storage_gb"), 100))), now(), id);
+        audit("AUDIT", "TENANT_RESIZE", "TENANT", id, json(request), true);
+        return requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> deployTenant(String id) {
+        requireRow("select id from ds_tenant where id=?", id);
+        jdbc.update("update ds_tenant set status='ACTIVE',updated_at=? where id=?", now(), id);
+        audit("OPERATION", "TENANT_DEPLOY", "TENANT", id, "MVP tenant activated", true);
+        return requireRow("select id,name,owner_id,status,deploy_endpoint,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at from ds_tenant where id=?", id);
+    }
+
+    public List<Map<String, Object>> billingUsage(String tenantId) {
+        return jdbc.queryForList("select * from ds_usage_meter where tenant_id=? order by created_at desc", tenantId);
+    }
+
+    @Transactional
+    public Map<String, Object> calculateBilling(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        Map<String, Object> tenant = requireRow("select * from ds_tenant where id=?", tenantId);
+        double cpu = number(tenant.get("cpu_cores"), 0) * 0.05;
+        double memory = number(tenant.get("memory_gb"), 0) * 0.01;
+        double storage = number(tenant.get("storage_gb"), 0) * 0.001;
+        double amount = Math.round((cpu + memory + storage) * 100.0) / 100.0;
+        String id = "bill-" + shortId();
+        String created = now();
+        jdbc.update("insert into ds_billing_record(id,tenant_id,period_start,period_end,amount,currency,status,created_at) values(?,?,?,?,?,?,'CALCULATED',?)",
+                id, tenantId, value(request, "periodStart", created), value(request, "periodEnd", created), amount, value(request, "currency", "CNY"), created);
+        audit("AUDIT", "BILLING_CALCULATE", "TENANT", tenantId, "amount=" + amount, true);
+        return requireRow("select * from ds_billing_record where id=?", id);
+    }
+
+    public List<Map<String, Object>> trustedExchanges(String tenantId) {
+        if (notBlank(tenantId)) return jdbc.queryForList("select * from ds_trusted_exchange where tenant_id=? order by created_at desc limit 200", tenantId);
+        return jdbc.queryForList("select * from ds_trusted_exchange order by created_at desc limit 200");
+    }
+
+    @Transactional
+    public Map<String, Object> trustedPush(Map<String, Object> request) {
+        String tenantId = required(request, "tenantId");
+        String key = required(request, "idempotencyKey");
+        String secret = required(request, "signingSecret");
+        Map<String, Object> tenant = requireRow("select * from ds_tenant where id=?", tenantId);
+        if (!MessageDigest.isEqual(string(tenant.get("signing_secret")).getBytes(StandardCharsets.UTF_8),
+                sha256(secret.getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8))) {
+            throw new SecurityException("租户签名密钥无效");
+        }
+        List<Map<String, Object>> existing = jdbc.queryForList("select * from ds_trusted_exchange where tenant_id=? and idempotency_key=?", tenantId, key);
+        if (!existing.isEmpty()) return existing.get(0);
+        String event = required(request, "eventType");
+        String payload = value(request, "payload", "{}");
+        String signature = hmac(secret, tenantId + "\n" + event + "\n" + key + "\n" + payload);
+        String id = "tx-" + shortId();
+        String created = now();
+        jdbc.update("insert into ds_trusted_exchange(id,tenant_id,direction,event_type,idempotency_key,payload,payload_hash,signature,status,attempts,last_error,created_at,updated_at) values(?,?,'OUTBOUND',?,?,?,?,?,'SUCCESS',1,'',?,?)",
+                id, tenantId, event, key, payload, sha256(payload.getBytes(StandardCharsets.UTF_8)), signature, created, created);
+        audit("AUDIT", "TRUSTED_PUSH", "TRUSTED_EXCHANGE", id, "tenant=" + tenantId, true);
+        return requireRow("select * from ds_trusted_exchange where id=?", id);
+    }
+
+    @Transactional
+    public Map<String, Object> saveOidcMapping(Map<String, Object> request) {
+        String id = value(request, "id", "oidcm-" + shortId());
+        String updated = now();
+        int changed = jdbc.update("update ds_oidc_role_mapping set claim_name=?,claim_value=?,platform_role=?,owner_id=?,enabled=?,updated_at=? where id=?",
+                required(request, "claimName"), required(request, "claimValue"), required(request, "platformRole"),
+                value(request, "ownerId", ""), bool(request, "enabled", true) ? 1 : 0, updated, id);
+        if (changed == 0) jdbc.update("insert into ds_oidc_role_mapping(id,claim_name,claim_value,platform_role,owner_id,enabled,created_by,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+                id, required(request, "claimName"), required(request, "claimValue"), required(request, "platformRole"), value(request, "ownerId", ""), bool(request, "enabled", true) ? 1 : 0, actor(), updated, updated);
+        return requireRow("select * from ds_oidc_role_mapping where id=?", id);
+    }
+
+    public void deleteOidcMapping(String id) {
+        jdbc.update("delete from ds_oidc_role_mapping where id=?", id);
+    }
+
+    private String hmac(String secret, String content) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            return java.util.HexFormat.of().formatHex(mac.doFinal(content.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("生成签名失败", e);
+        }
     }
 
     @Transactional
@@ -1138,8 +1270,16 @@ public class DataSandboxMvpService {
                 appImage = appImage + "-nonet";
             }
             String jobId = ("ds-" + string(sandbox.get("id"))).replace("_", "-").toLowerCase(Locale.ROOT);
+            Job.JobResource.Builder resources = Job.JobResource.newBuilder()
+                    .setCpu(String.valueOf(sandbox.get("cpu_cores")))
+                    .setMemory(sandbox.get("memory_gb") + "Gi")
+                    .setEphemeralStorage(sandbox.get("storage_gb") + "Gi");
+            if (number(sandbox.get("gpu_count"), 0) > 0) {
+                resources.setGpu(String.valueOf(sandbox.get("gpu_count")));
+            }
             Job.Party party = Job.Party.newBuilder().setDomainId(nodeId).setRole("server")
-                    .setResources(Job.JobResource.newBuilder().setCpu(String.valueOf(sandbox.get("cpu_cores"))).setMemory(sandbox.get("memory_gb") + "Gi")).build();
+                    .setResources(resources)
+                    .build();
             Job.Task task = Job.Task.newBuilder().setTaskId(jobId + "-task").setAlias("data-sandbox")
                     .setAppImage(appImage).addParties(party).setTaskInputConfig("{}").build();
             Job.CreateJobResponse response = kuscia.createJob(Job.CreateJobRequest.newBuilder().setJobId(jobId).setInitiator(nodeId).setMaxParallelism(1).addTasks(task)

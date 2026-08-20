@@ -72,8 +72,9 @@ public class DataDevController {
     @GetMapping("/artifacts")
     public SecretPadResponse<List<Map<String, Object>>> listArtifacts(
             @RequestParam(defaultValue = "") String type,
-            @RequestParam(defaultValue = "") String keyword) {
-        return SecretPadResponse.success(service.listArtifacts(type, keyword));
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "") String sandboxId) {
+        return SecretPadResponse.success(service.listArtifacts(type, keyword, sandboxId));
     }
 
     @Operation(summary = "制品详情（含版本列表）")
@@ -173,8 +174,9 @@ public class DataDevController {
             @RequestParam(defaultValue = "") String status,
             @RequestParam(defaultValue = "") String runMode,
             @RequestParam(defaultValue = "") String execType,
-            @RequestParam(defaultValue = "") String keyword) {
-        return SecretPadResponse.success(service.listTasks(status, runMode, execType, keyword));
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam(defaultValue = "") String sandboxId) {
+        return SecretPadResponse.success(service.listTasks(status, runMode, execType, keyword, sandboxId));
     }
 
     @Operation(summary = "任务详情（含血缘链 + runLogs 摘要）")

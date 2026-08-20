@@ -23,6 +23,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.*;
 import org.hibernate.sql.Update;
+import java.util.List;
 
 /**
  * Create project request
@@ -64,5 +65,8 @@ public class CreateProjectRequest {
     private String teeNodeId;
 
     private String computeFunc = ProjectConstants.ComputeFuncEnum.ALL.name();
+
+    /** Project-facing development capability tags. */
+    private List<String> developmentModes;
 
 }

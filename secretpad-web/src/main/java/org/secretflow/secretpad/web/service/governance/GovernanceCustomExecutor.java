@@ -17,6 +17,7 @@ import org.secretflow.secretpad.common.util.UUIDUtils;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.DataAssetService;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -77,6 +78,7 @@ public class GovernanceCustomExecutor {
     private final ObjectMapper objectMapper;
     private final KusciaGrpcClientAdapter kuscia;
     private final DataSandboxMvpService mvp;
+    private final DataAssetService dataAssetService;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -106,11 +108,13 @@ public class GovernanceCustomExecutor {
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             KusciaGrpcClientAdapter kuscia,
-            DataSandboxMvpService mvp) {
+            DataSandboxMvpService mvp,
+            DataAssetService dataAssetService) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
         this.mvp = mvp;
+        this.dataAssetService = dataAssetService;
     }
 
     /* ------------------------------- 提交 ------------------------------- */
@@ -299,8 +303,8 @@ public class GovernanceCustomExecutor {
         }
         List<String> header = new ArrayList<>(parsed.get(0));
         List<List<String>> rows = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
-        String resultUri = writeResultCsv(nodeId, taskId, header, rows);
-        String domainDataId = registerResultDomainData(nodeId, taskId, resultUri, header);
+        Map<String,Object> resultAsset=dataAssetService.registerGovernedResult(taskId,nodeId,body);
+        String domainDataId=string(resultAsset.get("datatable_id"));
         int affected = jdbc.update("update ds_governance_task set status=?,result_node_id=?,result_datatable_id=?,"
                         + "source_rows=?,result_rows=?,finished_at=?,updated_at=? where id=? and status=?",
                 STATUS_SUCCEEDED, nodeId, domainDataId, num(task.get("source_rows")), rows.size(), now(), now(), taskId, STATUS_RUNNING);

@@ -84,11 +84,26 @@ public class SandboxApprovalGate {
         return user != null && user.getName() != null && user.getName().equals(submitter);
     }
 
-    /** 当前用户可操作的目标 owner：未登录/无 ownerId 时回退节点（与 Service.currentOwner 一致）。 */
+    /** 当前节点 ID。P2P 用户的 ownerId 是机构 ID，项目成员关系使用 platformNodeId。 */
     public String effectiveOwner() {
         UserContextDTO user = UserContext.getUserOrNotExist();
-        return user == null || user.getOwnerId() == null || user.getOwnerId().isBlank()
-                ? nodeId : user.getOwnerId();
+        if (user == null) {
+            return nodeId;
+        }
+        if (user.getPlatformNodeId() != null && !user.getPlatformNodeId().isBlank()) {
+            return user.getPlatformNodeId();
+        }
+        return user.getOwnerId() == null || user.getOwnerId().isBlank() ? nodeId : user.getOwnerId();
+    }
+
+    /** 兼容历史记录：旧沙箱 owner_id 保存的是机构 ID，新记录保存节点 ID。 */
+    public boolean matchesCurrentNode(String storedIdentity) {
+        UserContextDTO user = UserContext.getUserOrNotExist();
+        if (user == null || storedIdentity == null) {
+            return Objects.equals(nodeId, storedIdentity);
+        }
+        return Objects.equals(user.getPlatformNodeId(), storedIdentity)
+                || Objects.equals(user.getOwnerId(), storedIdentity);
     }
 
     /**
@@ -112,9 +127,6 @@ public class SandboxApprovalGate {
         if (!approvalRequired) {
             return;
         }
-        if (canBypassDirect()) {
-            return;
-        }
         throw SecretpadException.of(AuthErrorCode.AUTH_FAILED,
                 "创建沙箱需提交申请单审批（GET /approvals/config 查看门禁）");
     }
@@ -122,9 +134,6 @@ public class SandboxApprovalGate {
     /** 门禁：审批开启且当前用户非 admin/平台运营方时，RENEW/DESTROY 直接操作被拒，需走申请单。 */
     public void assertDirectActionAllowed(String action) {
         if (!approvalRequired) {
-            return;
-        }
-        if (canBypassDirect()) {
             return;
         }
         if ("RENEW".equals(action)) {

@@ -80,6 +80,8 @@ message Party {
 message JobResource {
   string cpu = 1; // hard ceiling of CPU/virtual cores that the containers of certain party can use
   string memory = 2; // limited RAMs that the containers of certain party can use
+  string gpu = 4; // NVIDIA GPU count
+  string ephemeral_storage = 5; // writable storage limit, for example 20Gi
 }
 
 message DeleteJobRequest {

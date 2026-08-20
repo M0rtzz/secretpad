@@ -215,6 +215,7 @@ public class ProjectServiceImpl implements ProjectService {
             Integer jobCount = projectJobRepository.countByProjectId(projectDO.getProjectId());
             return ProjectVO.builder().projectId(projectDO.getProjectId()).projectName(projectDO.getName())
                     .description(projectDO.getDescription()).computeMode(projectDO.getComputeMode())
+                    .developmentModes(developmentModes(projectDO))
                     .teeNodeId(ObjectUtils.isEmpty(projectDO.getProjectInfo()) ? null : projectDO.getProjectInfo().getTeeDomainId())
                     .nodes(pnps.stream().map(it -> ProjectNodeVO.from(it, null)).collect(Collectors.toList()))
                     .graphCount(graphCount).jobCount(jobCount).gmtCreate(DateTimes.toRfc3339(projectDO.getGmtCreate()))
@@ -241,6 +242,7 @@ public class ProjectServiceImpl implements ProjectService {
                 dtoMap.values().stream().collect(Collectors.groupingBy(DatatableDTO::getNodeId));
         return ProjectVO.builder().projectId(project.getProjectId()).projectName(project.getName())
                 .description(project.getDescription()).computeMode(project.getComputeMode())
+                .developmentModes(developmentModes(project))
                 .teeNodeId(ObjectUtils.isEmpty(project.getProjectInfo()) ? "" : project.getProjectInfo().getTeeDomainId())
                 .nodes(pnps.stream()
                         .map(it -> ProjectNodeVO.from(it, nodeDtos.get(it.getProjectNodeDO().getUpk().getNodeId())))
@@ -604,6 +606,9 @@ public class ProjectServiceImpl implements ProjectService {
         String ownerId = UserContext.getUser().getOwnerId();
         ProjectDO projectDO =
                 ProjectDO.Factory.newP2PProject(request.getName(), request.getDescription(), request.getComputeMode(), request.getComputeFunc(), ProjectInfoDO.builder().teeDomainId(request.getTeeNodeId()).build(), ownerId);
+        if (request.getDevelopmentModes() != null) {
+            projectDO.setDevelopmentModes(String.join(",", request.getDevelopmentModes()));
+        }
         projectRepository.save(projectDO);
         return projectDO.getProjectId();
     }
@@ -645,6 +650,7 @@ public class ProjectServiceImpl implements ProjectService {
             partyVoteInfoVOS.forEach(e -> e.setPartyName(instMap.get(e.getPartyId())));
             return ProjectVO.builder().projectId(projectId).projectName(projectDO.getName())
                     .description(projectDO.getDescription()).computeMode(projectDO.getComputeMode())
+                    .developmentModes(developmentModes(projectDO))
                     .teeNodeId(ObjectUtils.isEmpty(projectDO.getProjectInfo()) ? null : projectDO.getProjectInfo().getTeeDomainId())
                     .nodes(pnps.stream().map(it -> ProjectNodeVO.from(it, null)).collect(Collectors.toList()))
                     .insts(pips.stream().map(ProjectInstVO::from).collect(Collectors.toList()))
@@ -998,7 +1004,13 @@ public class ProjectServiceImpl implements ProjectService {
                 .build();
     }
 
+    private List<String> developmentModes(ProjectDO project) {
+        if (StringUtils.isBlank(project.getDevelopmentModes())) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(project.getDevelopmentModes().split(","))
+                .filter(StringUtils::isNotBlank).collect(Collectors.toList());
+    }
+
 }
-
-
 

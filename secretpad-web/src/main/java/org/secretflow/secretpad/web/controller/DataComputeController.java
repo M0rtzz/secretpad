@@ -1,0 +1,24 @@
+/* Copyright 2026 Ant Group Co., Ltd. Licensed under the Apache License, Version 2.0. */
+package org.secretflow.secretpad.web.controller;
+
+import org.secretflow.secretpad.service.model.common.SecretPadResponse;
+import org.secretflow.secretpad.web.service.DataComputeService;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/v1alpha1/data-compute")
+public class DataComputeController {
+    private final DataComputeService service;
+    public DataComputeController(DataComputeService service){this.service=service;}
+    @GetMapping("/overview") public SecretPadResponse<List<Map<String,Object>>> overview(){return SecretPadResponse.success(service.overview());}
+    @GetMapping("/context") public SecretPadResponse<Map<String,Object>> context(@RequestParam String sandboxId){return SecretPadResponse.success(service.context(sandboxId));}
+    @PostMapping("/mount-requests") public SecretPadResponse<Map<String,Object>> requestMount(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.requestMount(request));}
+    @GetMapping("/mount-requests") public SecretPadResponse<List<Map<String,Object>>> mountRequests(@RequestParam(defaultValue="") String status){return SecretPadResponse.success(service.mountRequests(status));}
+    @GetMapping("/components") public SecretPadResponse<List<Map<String,Object>>> components(@RequestParam String sandboxId){return SecretPadResponse.success(service.components(sandboxId));}
+    @PostMapping("/components/publish") public SecretPadResponse<Map<String,Object>> publish(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.publishComponent(request));}
+    @GetMapping("/canvases") public SecretPadResponse<List<Map<String,Object>>> canvases(@RequestParam String sandboxId){return SecretPadResponse.success(service.canvases(sandboxId));}
+    @PostMapping("/canvases/save") public SecretPadResponse<Map<String,Object>> saveCanvas(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.saveCanvas(request));}
+    @GetMapping("/reports") public SecretPadResponse<List<Map<String,Object>>> reports(@RequestParam String sandboxId,@RequestParam(defaultValue="") String type){return SecretPadResponse.success(service.reports(sandboxId,type));}
+}

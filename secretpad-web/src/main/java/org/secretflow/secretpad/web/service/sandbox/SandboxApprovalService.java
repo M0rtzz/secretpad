@@ -15,6 +15,7 @@ import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.MinioAssetStorage;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -24,6 +25,7 @@ import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -50,7 +52,7 @@ import java.util.UUID;
 @Service
 public class SandboxApprovalService {
 
-    private static final Set<String> APPROVAL_TYPES = Set.of("CREATE", "RENEW", "SPEC_CHANGE", "RECYCLE");
+    private static final Set<String> APPROVAL_TYPES = Set.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE");
     private static final Set<String> APPROVAL_ACTIONS = Set.of("APPROVE", "REJECT", "RESUBMIT", "RETRY", "CANCEL");
     private static final Set<String> NETWORK_POLICIES = Set.of("INTERNAL_ONLY", "ALLOW_LIST", "NO_NETWORK");
     private static final Set<String> OPEN_STATUSES = Set.of("DATA_PROVIDER_REVIEW", "OPERATOR_REVIEW", "APPROVED", "EXECUTING");
@@ -59,6 +61,7 @@ public class SandboxApprovalService {
     private final ObjectMapper objectMapper;
     private final DataSandboxMvpService service;
     private final SandboxApprovalGate gate;
+    private final MinioAssetStorage assetStorage;
 
     @Value("${secretpad.node-id:kuscia-system}")
     private String nodeId;
@@ -70,50 +73,59 @@ public class SandboxApprovalService {
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             DataSandboxMvpService service,
-            SandboxApprovalGate gate) {
+            SandboxApprovalGate gate,
+            MinioAssetStorage assetStorage) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.service = service;
         this.gate = gate;
+        this.assetStorage = assetStorage;
     }
 
     /* ------------------------------- 申请单查询 ------------------------------- */
 
     public List<Map<String, Object>> listApprovals(String status, String type, String keyword) {
-        StringBuilder sql = new StringBuilder("select * from ds_sandbox_approval where deleted=0");
-        List<Object> args = new ArrayList<>();
+        String current = operator();
+        String currentNode = gate.effectiveOwner();
+        StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?)");
+        List<Object> args = new ArrayList<>(List.of(current, currentNode, currentNode));
         if (notBlank(status)) {
-            sql.append(" and status=?");
+            sql.append(" and a.status=?");
             args.add(status.toUpperCase(Locale.ROOT));
         }
         if (notBlank(type)) {
-            sql.append(" and approval_type=?");
+            sql.append(" and a.approval_type=?");
             args.add(type.toUpperCase(Locale.ROOT));
         }
         if (notBlank(keyword)) {
-            sql.append(" and (lower(id) like ? or lower(submitter) like ?)");
+            sql.append(" and (lower(a.id) like ? or lower(a.submitter) like ?)");
             String q = "%" + keyword.toLowerCase(Locale.ROOT) + "%";
             args.add(q);
             args.add(q);
         }
-        sql.append(" order by created_at desc");
-        return jdbc.queryForList(sql.toString(), args.toArray());
+        sql.append(" order by a.created_at desc");
+        List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
+        rows.forEach(row -> row.put("direction", current.equals(String.valueOf(row.get("submitter"))) || currentNode.equals(String.valueOf(row.get("applicant_node_id"))) ? "OUTGOING" : "INCOMING"));
+        return rows;
     }
 
     public Map<String, Object> approval(String id) {
         Map<String, Object> data = requireApproval(id);
+        assertApprovalVisible(data);
         data.put("history", approvalHistory(id));
+        data.put("votes", jdbc.queryForList("select * from ds_sandbox_approval_vote where approval_id=? order by voter_node_id", id));
         return data;
     }
 
     public List<Map<String, Object>> approvalHistory(String id) {
+        assertApprovalVisible(requireApproval(id));
         return jdbc.queryForList("select * from ds_sandbox_approval_history where approval_id=? order by id desc", id);
     }
 
     /** 门禁与重试配置，供前端感知 required 状态。 */
     public Map<String, Object> approvalConfig() {
         return Map.of("required", gate.isApprovalRequired(),
-                "types", List.of("CREATE", "RENEW", "SPEC_CHANGE", "RECYCLE"),
+                "types", List.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE"),
                 "maxRetries", maxRetries);
     }
 
@@ -123,33 +135,44 @@ public class SandboxApprovalService {
      * 提交申请单：校验类型/沙箱/镜像/规格，幂等（同 owner 同类型进行中不重复），
      * 落库 DATA_PROVIDER_REVIEW 并写 SUBMIT 历史、审计与 webhook。
      */
+    @Transactional
     public Map<String, Object> submit(Map<String, Object> request) {
         String type = required(request, "approvalType").toUpperCase(Locale.ROOT);
         if (!APPROVAL_TYPES.contains(type)) {
             throw new IllegalArgumentException("不支持的申请类型: " + type);
         }
         String sandboxId = "CREATE".equals(type) ? "" : required(request, "sandboxId");
-        String ownerId;
-        if (notBlank(value(request, "ownerId", ""))) {
-            ownerId = value(request, "ownerId", "");
-        } else if (!"CREATE".equals(type)) {
-            ownerId = sandboxOwner(sandboxId);
-        } else {
-            ownerId = gate.effectiveOwner();
+        String applicantNodeId = gate.effectiveOwner();
+        String ownerId = "CREATE".equals(type) ? applicantNodeId : sandboxOwner(sandboxId);
+        if (!"CREATE".equals(type) && !gate.matchesCurrentNode(ownerId)) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "只能为当前所属节点提交沙箱申请");
         }
+        String projectId = "CREATE".equals(type)
+                ? required(request, "projectId")
+                : string(requireSandbox(sandboxId).get("project_id"));
+        requireProjectMembership(projectId, applicantNodeId);
         if ("CREATE".equals(type)) {
             validateCreatePayload(request);
+            validateDatasetAssets(projectId, request.get("datasetAssetIds"));
         } else {
             ensureSandboxActive(sandboxId);
+            assertSandboxCreator(sandboxId);
+            if ("DATA_CHANGE".equals(type)) {
+                validateDatasetAssets(projectId, request.get("datasetAssetIds"));
+            }
         }
         assertNoOpenApproval(type, ownerId, sandboxId);
 
         String id = "apr-" + shortId();
         String now = now();
-        jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,created_at,updated_at,deleted) "
-                        + "values(?,?,?,?,?,?,'DATA_PROVIDER_REVIEW','DATA_PROVIDER_REVIEW',1,'','','','',0,?,?,?,0)",
-                id, type, sandboxId, ownerId, operator(), json(new LinkedHashMap<>(request)), now, now, now);
-        history(id, "SUBMIT", "", "DATA_PROVIDER_REVIEW", value(request, "reason", ""));
+        List<String> voters = projectVoters(projectId, applicantNodeId);
+        String initialStatus = voters.isEmpty() ? "APPROVED" : "DATA_PROVIDER_REVIEW";
+        jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,approved_at,created_at,updated_at,deleted,project_id,applicant_node_id,project_snapshot_at) "
+                        + "values(?,?,?,?,?,?,?,?,1,'','','','',0,?,?,?,?,0,?,?,?)",
+                id, type, sandboxId, ownerId, operator(), json(new LinkedHashMap<>(request)), initialStatus, initialStatus,
+                now, voters.isEmpty() ? now : "", now, now, projectId, applicantNodeId, projectSnapshot(projectId));
+        voters.forEach(voter -> jdbc.update("insert into ds_sandbox_approval_vote(approval_id,voter_node_id,status,voter,comment,voted_at) values(?,?,'PENDING','','','')", id, voter));
+        history(id, "SUBMIT", "", initialStatus, value(request, "reason", ""));
         service.audit("AUDIT", "SANDBOX_APPROVAL_SUBMIT", "SANDBOX_APPROVAL", id,
                 type + " reason=" + value(request, "reason", ""), true);
         service.dispatchWebhooks("sandbox.approval.submitted",
@@ -163,6 +186,7 @@ public class SandboxApprovalService {
      * 审批动作：状态机预检 → 角色校验 → 条件 UPDATE（affected==1 才成功，否则并发冲突）→
      * 历史/审计/webhook。RETRY 成功后同步执行（不等轮询）。
      */
+    @Transactional
     public Map<String, Object> approvalAction(Map<String, Object> request) {
         String id = required(request, "id");
         String action = required(request, "action").toUpperCase(Locale.ROOT);
@@ -173,45 +197,37 @@ public class SandboxApprovalService {
         Map<String, Object> approval = requireApproval(id);
         String from = string(approval.get("status"));
         String submitter = string(approval.get("submitter"));
-        String ownerId = string(approval.get("owner_id"));
-        UserContextDTO user = gate.currentUser();
-        SandboxApprovalStateMachine.Action machineAction = SandboxApprovalStateMachine.Action.valueOf(action);
-        if (!SandboxApprovalStateMachine.canTransition(from, machineAction)) {
-            throw new IllegalStateException("当前状态不允许操作: " + action + " (当前 " + from + ")");
-        }
+        assertApprovalVisible(approval);
         switch (action) {
             case "APPROVE", "REJECT" -> {
-                if ("DATA_PROVIDER_REVIEW".equals(from)) {
-                    if (!gate.isDataProvider(user, submitter, ownerId)) {
-                        throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "您不是供数方，无权审核该申请");
-                    }
-                } else if (!gate.isAdminOrOperator(user, ownerId)) {
-                    throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅运营方/管理员可审核该申请");
-                }
+                if (!"DATA_PROVIDER_REVIEW".equals(from)) throw new IllegalStateException("当前申请不在项目成员审核中");
+                vote(id, action, comment);
             }
             case "RESUBMIT" -> {
-                if (!gate.isApplicant(user, submitter)) {
+                if (!Objects.equals(operator(), submitter)) {
                     throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可提交复审");
                 }
+                if (!"REJECTED".equals(from)) throw new IllegalStateException("只有已驳回申请可复审");
+                jdbc.update("update ds_sandbox_approval_vote set status='PENDING',voter='',comment='',voted_at='' where approval_id=?", id);
+                int voters = (int) count("select count(1) from ds_sandbox_approval_vote where approval_id=?", id);
+                String target = voters == 0 ? "APPROVED" : "DATA_PROVIDER_REVIEW";
+                jdbc.update("update ds_sandbox_approval set status=?,current_stage=?,version=version+1,reviewer='',review_comment='',approved_at=?,updated_at=? where id=? and status='REJECTED'", target, target, voters == 0 ? now() : "", now(), id);
             }
             case "CANCEL" -> {
-                if (!gate.isApplicant(user, submitter)) {
+                if (!Objects.equals(operator(), submitter)) {
                     throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可撤回申请");
                 }
+                if (!Set.of("DATA_PROVIDER_REVIEW", "APPROVED").contains(from)) throw new IllegalStateException("当前状态不可撤回");
+                jdbc.update("update ds_sandbox_approval set status='CANCELLED',current_stage='CANCELLED',updated_at=? where id=? and status=?", now(), id, from);
             }
             case "RETRY" -> {
-                if (!gate.isApplicant(user, submitter) && !gate.isAdminOrOperator(user, ownerId)) {
-                    throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人或运营方可重试");
-                }
+                if (!Objects.equals(operator(), submitter)) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可重试");
+                if (!"FAILED".equals(from)) throw new IllegalStateException("只有执行失败申请可重试");
+                jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,retry_count=0,last_error='',updated_at=? where id=? and status='FAILED'", operator(), now(), id);
             }
             default -> throw new IllegalArgumentException("不支持的审批动作: " + action);
         }
-        String to = SandboxApprovalStateMachine.transition(from, machineAction);
-        int changed = conditionalUpdate(id, from, action, to, comment);
-        if (changed != 1) {
-            // 条件 UPDATE 失败 = 状态已被他人先改，并发审批冲突
-            throw new IllegalStateException("该申请单已被他人处理，请刷新");
-        }
+        String to = string(requireApproval(id).get("status"));
         history(id, action, from, to, comment);
         service.audit("AUDIT", "SANDBOX_APPROVAL_" + action, "SANDBOX_APPROVAL", id, comment, true);
         service.dispatchWebhooks("sandbox.approval." + action.toLowerCase(Locale.ROOT),
@@ -259,6 +275,8 @@ public class SandboxApprovalService {
                 case "CREATE" -> execCreate(approval);
                 case "RENEW" -> execRenew(approval);
                 case "SPEC_CHANGE" -> execSpecChange(approval);
+                case "DATA_CHANGE" -> execDataChange(approval);
+                case "CONFIG_CHANGE" -> execConfigChange(approval);
                 case "RECYCLE" -> execRecycle(approval);
                 default -> throw new IllegalStateException("未知申请类型: " + type);
             }
@@ -345,9 +363,11 @@ public class SandboxApprovalService {
         // 异步无 UserContext，必须显式传 ownerId
         Map<String, Object> req = new LinkedHashMap<>(parsePayload(approval));
         req.put("ownerId", string(approval.get("owner_id")));
+        req.put("createdBy", string(approval.get("submitter")));
         Map<String, Object> created = service.createSandbox(req);
         String id = string(created.get("id"));
         jdbc.update("update ds_sandbox_approval set sandbox_id=? where id=?", id, approval.get("id"));
+        syncDatasetMounts(id, req);
         startIfNeeded(created);
     }
 
@@ -446,6 +466,61 @@ public class SandboxApprovalService {
         service.releaseAllocations(sbx, "DESTROY");
     }
 
+    private void execDataChange(Map<String, Object> approval) {
+        String sandboxId = string(approval.get("sandbox_id"));
+        Map<String, Object> sbx = requireSandbox(sandboxId);
+        recreateSandboxJob(sbx, () -> syncDatasetMounts(sandboxId, parsePayload(approval)), "DATA_CHANGE");
+    }
+
+    private void execConfigChange(Map<String, Object> approval) {
+        String sandboxId = string(approval.get("sandbox_id"));
+        Map<String, Object> sbx = requireSandbox(sandboxId);
+        Map<String, Object> payload = parsePayload(approval);
+        String imageId = value(payload, "imageId", string(sbx.get("image_id")));
+        String networkPolicy = value(payload, "networkPolicy", string(sbx.get("network_policy"))).toUpperCase(Locale.ROOT);
+        if (count("select count(1) from ds_sandbox_image where id=? and enabled=1", imageId) == 0) {
+            throw new IllegalArgumentException("环境镜像不存在或未启用: " + imageId);
+        }
+        if (!NETWORK_POLICIES.contains(networkPolicy)) throw new IllegalArgumentException("不支持的网络策略: " + networkPolicy);
+        recreateSandboxJob(sbx, () -> jdbc.update("update ds_sandbox set image_id=?,network_policy=?,updated_at=? where id=?", imageId, networkPolicy, now(), sandboxId), "CONFIG_CHANGE");
+    }
+
+    private void recreateSandboxJob(Map<String, Object> sandbox, Runnable mutation, String reason) {
+        String sandboxId = string(sandbox.get("id"));
+        if (!notBlank(sandboxId) || "DESTROYED".equals(string(sandbox.get("status")))) throw new IllegalStateException("沙箱不可变更");
+        if (notBlank(string(sandbox.get("kuscia_job_id")))) {
+            String stopError = service.stopKuscia(sandbox, reason);
+            if (!stopError.isEmpty()) throw new IllegalStateException("停止旧任务失败: " + stopError);
+            String deleteError = service.deleteKuscia(sandbox);
+            if (!deleteError.isEmpty()) throw new IllegalStateException("删除旧任务失败: " + deleteError);
+        }
+        mutation.run();
+        jdbc.update("update ds_sandbox set kuscia_job_id='',endpoint='',kuscia_job_state='',status='STARTING',intent='START',last_error='',updated_at=? where id=?", now(), sandboxId);
+        Map<String, Object> fresh = service.sandbox(sandboxId);
+        String error = service.startKuscia(fresh);
+        if (!error.isEmpty()) throw new IllegalStateException("重建沙箱任务失败: " + error);
+    }
+
+    private void syncDatasetMounts(String sandboxId, Map<String, Object> payload) {
+        List<String> assetIds = stringList(payload.get("datasetAssetIds"));
+        String sandboxNode = string(jdbc.queryForObject("select owner_id from ds_sandbox where id=?", String.class, sandboxId));
+        jdbc.update("update ds_sandbox_dataset_mount set deleted=1,status='DETACHED',updated_at=? where sandbox_id=? and deleted=0", now(), sandboxId);
+        for (String assetId : assetIds) {
+            Map<String, Object> asset = requireRow("select * from ds_data_asset where id=? and deleted=0", assetId);
+            String mountId = "mnt-" + shortId();
+            String provider = string(asset.get("provider_node_id"));
+            String checksum = metadataChecksum(asset.get("metadata_json"));
+            String stagingUri = string(asset.get("storage_uri"));
+            if (!Objects.equals(provider, sandboxNode)) {
+                stagingUri = assetStorage.encryptedSnapshot(stagingUri, "sandbox-staging/" + sandboxNode + "/" + sandboxId + "/" + assetId + "-v" + intValue(asset.get("version"), 1), checksum);
+            }
+            jdbc.update("insert into ds_sandbox_dataset_mount(id,sandbox_id,asset_id,asset_version,provider_node_id,staging_uri,mount_path,checksum,status,expires_at,created_at,updated_at,deleted) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                    mountId, sandboxId, assetId, intValue(asset.get("version"), 1), provider,
+                    stagingUri, "/data/assets/" + assetId, checksum,
+                    "READY", string(asset.get("valid_until")), now(), now());
+        }
+    }
+
     /* ------------------------------- 内部工具 ------------------------------- */
 
     private int conditionalUpdate(String id, String from, String action, String to, String comment) {
@@ -518,6 +593,83 @@ public class SandboxApprovalService {
         int days = intValue(request.get("validDays"), 7);
         if (days < 1 || days > 365) {
             throw new IllegalArgumentException("validDays 必须在 1-365 之间");
+        }
+    }
+
+    private void requireProjectMembership(String projectId, String memberNodeId) {
+        if (count("select count(1) from project where project_id=? and is_deleted=0", projectId) == 0) {
+            throw new IllegalArgumentException("项目不存在: " + projectId);
+        }
+        if (count("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0", projectId, memberNodeId) == 0) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前节点不是该项目参与方");
+        }
+    }
+
+    private List<String> projectVoters(String projectId, String applicantNodeId) {
+        return jdbc.queryForList("select distinct node_id from project_node where project_id=? and node_id<>? and is_deleted=0 order by node_id", String.class, projectId, applicantNodeId);
+    }
+
+    private String projectSnapshot(String projectId) {
+        return string(jdbc.queryForObject("select gmt_modified from project where project_id=? and is_deleted=0", Object.class, projectId));
+    }
+
+    private void validateDatasetAssets(String projectId, Object selected) {
+        for (String assetId : stringList(selected)) {
+            Map<String, Object> asset = requireRow("select * from ds_data_asset where id=? and deleted=0 and status='ACTIVE'", assetId);
+            if (!"PROCESSED".equals(string(asset.get("data_stage")))) throw new IllegalArgumentException("沙箱只能挂载抽样脱敏后的数据: " + assetId);
+            if (count("select count(1) from ds_project_asset where project_id=? and asset_id=? and deleted=0", projectId, assetId) == 0) {
+                throw new IllegalArgumentException("数据未挂载到所选项目: " + assetId);
+            }
+            String validUntil = string(asset.get("valid_until"));
+            if (notBlank(validUntil) && validUntil.compareTo(now()) < 0) throw new IllegalArgumentException("数据已过有效期: " + assetId);
+        }
+    }
+
+    private void assertSandboxCreator(String sandboxId) {
+        Map<String, Object> sandbox = requireRow("select created_by,owner_id from ds_sandbox where id=? and deleted=0", sandboxId);
+        if (!Objects.equals(operator(), string(sandbox.get("created_by"))) || !gate.matchesCurrentNode(string(sandbox.get("owner_id")))) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "只有沙箱创建人可以提交变更申请");
+        }
+    }
+
+    private void assertApprovalVisible(Map<String, Object> approval) {
+        String currentNode = gate.effectiveOwner();
+        boolean applicant = Objects.equals(operator(), string(approval.get("submitter"))) || Objects.equals(currentNode, string(approval.get("applicant_node_id")));
+        boolean voter = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and voter_node_id=?", approval.get("id"), currentNode) > 0;
+        if (!applicant && !voter) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+    }
+
+    private void vote(String approvalId, String action, String comment) {
+        String voterNode = gate.effectiveOwner();
+        String voteStatus = "APPROVE".equals(action) ? "APPROVED" : "REJECTED";
+        int changed = jdbc.update("update ds_sandbox_approval_vote set status=?,voter=?,comment=?,voted_at=? where approval_id=? and voter_node_id=? and status='PENDING'",
+                voteStatus, operator(), comment, now(), approvalId, voterNode);
+        if (changed != 1) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前节点无待处理投票或已经完成投票");
+        if ("REJECTED".equals(voteStatus)) {
+            jdbc.update("update ds_sandbox_approval set status='REJECTED',current_stage='REJECTED',reviewer=?,review_comment=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), approvalId);
+        } else if (count("select count(1) from ds_sandbox_approval_vote where approval_id=? and status='PENDING'", approvalId) == 0) {
+            jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',reviewer=?,review_comment=?,approved_at=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), now(), approvalId);
+        }
+    }
+
+    private List<String> stringList(Object value) {
+        if (value == null) return List.of();
+        if (value instanceof Iterable<?> iterable) {
+            List<String> result = new ArrayList<>();
+            iterable.forEach(item -> { if (notBlank(string(item))) result.add(string(item)); });
+            return result.stream().distinct().toList();
+        }
+        String raw = string(value);
+        if (!notBlank(raw)) return List.of();
+        return java.util.Arrays.stream(raw.split(",")).map(String::trim).filter(SandboxApprovalService::notBlank).distinct().toList();
+    }
+
+    private String metadataChecksum(Object metadataJson) {
+        try {
+            Object value = objectMapper.readValue(string(metadataJson), Map.class).get("sha256");
+            return string(value);
+        } catch (Exception ignored) {
+            return "";
         }
     }
 

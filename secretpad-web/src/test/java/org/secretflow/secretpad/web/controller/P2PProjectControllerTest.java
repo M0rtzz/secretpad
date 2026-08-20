@@ -99,8 +99,8 @@ public class P2PProjectControllerTest extends ControllerTest {
             Mockito.when(projectApprovalConfigRepository.listProjectApprovalConfigByType("PROJECT_CREATE")).thenReturn(projectApprovalConfigDOS);
             Mockito.when(projectApprovalConfigRepository.findByType("PROJECT_CREATE")).thenReturn(projectApprovalConfigDOS);
             List<ProjectDO> projects = Arrays.asList(
-                    new ProjectDO("project_id_1", "Project 1", "Desc 1", "COMPUTE_MODE_1", "ccc", new ProjectInfoDO("tee_domain_1"), "owner_id_1", 0),
-                    new ProjectDO("project_id_2", "Project 2", "Desc 2", "COMPUTE_MODE_2", "ccc", new ProjectInfoDO("tee_domain_2"), "owner_id_2", 2)
+                    new ProjectDO("project_id_1", "Project 1", "Desc 1", "COMPUTE_MODE_1", null, "ccc", new ProjectInfoDO("tee_domain_1"), "owner_id_1", 0),
+                    new ProjectDO("project_id_2", "Project 2", "Desc 2", "COMPUTE_MODE_2", null, "ccc", new ProjectInfoDO("tee_domain_2"), "owner_id_2", 2)
             );
             Mockito.when(projectRepository.findAllById(anySet())).thenReturn(projects);
             HashSet<VoteRequestDO.PartyVoteInfo> partyVoteInfos1 = new HashSet<>();
@@ -145,8 +145,8 @@ public class P2PProjectControllerTest extends ControllerTest {
             Mockito.when(projectApprovalConfigRepository.listProjectApprovalConfigByType("PROJECT_CREATE")).thenReturn(projectApprovalConfigDOS);
             Mockito.when(projectApprovalConfigRepository.findByType("PROJECT_CREATE")).thenReturn(projectApprovalConfigDOS);
             List<ProjectDO> projects = Arrays.asList(
-                    new ProjectDO("project_id_3", "Project 1", "Desc 1", "COMPUTE_MODE_1", "ccc", new ProjectInfoDO("tee_domain_1"), "owner_id_1", 0),
-                    new ProjectDO("project_id_4", "Project 2", "Desc 2", "COMPUTE_MODE_2", "ccc", new ProjectInfoDO("tee_domain_2"), "owner_id_2", 2)
+                    new ProjectDO("project_id_3", "Project 1", "Desc 1", "COMPUTE_MODE_1", null, "ccc", new ProjectInfoDO("tee_domain_1"), "owner_id_1", 0),
+                    new ProjectDO("project_id_4", "Project 2", "Desc 2", "COMPUTE_MODE_2", null, "ccc", new ProjectInfoDO("tee_domain_2"), "owner_id_2", 2)
             );
             Mockito.when(projectRepository.findAllById(anySet())).thenReturn(projects);
             HashSet<VoteRequestDO.PartyVoteInfo> partyVoteInfos1 = new HashSet<>();

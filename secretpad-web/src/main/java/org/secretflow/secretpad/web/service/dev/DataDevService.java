@@ -170,16 +170,19 @@ public class DataDevService {
         if (!ARTIFACT_TYPES.contains(type)) {
             throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": type 必须是 JAR/SQL/PYTHON");
         }
-        Long dup = count("select count(1) from ds_dev_artifact where name=? and deleted=0", name);
+        String projectId = string(request.get("projectId"));
+        String sandboxId = string(request.get("sandboxId"));
+        if (notBlank(sandboxId)) requireSandboxCreator(sandboxId, projectId);
+        Long dup = count("select count(1) from ds_dev_artifact where name=? and sandbox_id=? and deleted=0", name, sandboxId);
         if (dup > 0) {
             throw new IllegalArgumentException(DevErrors.DEV_STATE_CONFLICT + ": 制品名称已存在: " + name);
         }
         String id = "da-" + shortId();
         String createdBy = actor();
         String now = now();
-        jdbc.update("insert into ds_dev_artifact(id,name,type,description,latest_version,created_by,created_at,updated_at,deleted)"
-                        + " values(?,?,?,?,0,?,?,?,0)",
-                id, name, type, string(request.get("description")), createdBy, now, now);
+        jdbc.update("insert into ds_dev_artifact(id,name,type,description,latest_version,created_by,created_at,updated_at,deleted,project_id,sandbox_id)"
+                        + " values(?,?,?,?,0,?,?,?,0,?,?)",
+                id, name, type, string(request.get("description")), createdBy, now, now, projectId, sandboxId);
         audit("DEV_ARTIFACT_CREATE", "DEV_ARTIFACT", id, "type=" + type, true);
         dispatch("dev.artifact.created", Map.of("id", id, "name", name, "type", type));
         return artifactDetail(id);
@@ -210,9 +213,13 @@ public class DataDevService {
         dispatch("dev.artifact.deleted", Map.of("id", id));
     }
 
-    public List<Map<String, Object>> listArtifacts(String type, String keyword) {
+    public List<Map<String, Object>> listArtifacts(String type, String keyword, String sandboxId) {
         StringBuilder sql = new StringBuilder("select * from ds_dev_artifact where deleted=0");
         List<Object> args = new ArrayList<>();
+        if (notBlank(sandboxId)) {
+            sql.append(" and sandbox_id=?");
+            args.add(sandboxId);
+        }
         if (notBlank(type)) {
             sql.append(" and type=?");
             args.add(type.trim().toUpperCase(Locale.ROOT));
@@ -439,9 +446,24 @@ public class DataDevService {
         if (!EXEC_TYPES.contains(execType)) {
             throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON");
         }
-        String nodeId = required(request, "nodeId");
-        String datatableId = required(request, "datatableId");
-        checkSourcePermission(currentUser(), nodeId, datatableId);
+        String sandboxId = string(request.get("sandboxId"));
+        String mountId = string(request.get("mountId"));
+        String assetId = string(request.get("assetId"));
+        String nodeId;
+        String datatableId;
+        if (notBlank(sandboxId)) {
+            Map<String, Object> mount = requireSandboxMount(sandboxId, mountId, assetId);
+            nodeId = value(mount, "processor_node_id", string(mount.get("provider_node_id")));
+            datatableId = string(mount.get("datatable_id"));
+            if (!notBlank(datatableId)) throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 挂载数据没有可计算的数据表");
+            request.put("projectId", mount.get("project_id"));
+            request.put("mountId", mount.get("id"));
+            request.put("assetId", mount.get("asset_id"));
+        } else {
+            nodeId = required(request, "nodeId");
+            datatableId = required(request, "datatableId");
+            checkSourcePermission(currentUser(), nodeId, datatableId);
+        }
 
         DatatableDTO source = resolveSource(nodeId, datatableId);
         String relativeUri = source.getRelativeUri();
@@ -567,9 +589,13 @@ public class DataDevService {
 
     /* ============================== 任务操作 ============================== */
 
-    public List<Map<String, Object>> listTasks(String status, String runMode, String execType, String keyword) {
+    public List<Map<String, Object>> listTasks(String status, String runMode, String execType, String keyword, String sandboxId) {
         StringBuilder sql = new StringBuilder("select * from ds_dev_task where deleted=0");
         List<Object> args = new ArrayList<>();
+        if (notBlank(sandboxId)) {
+            sql.append(" and sandbox_id=?");
+            args.add(sandboxId);
+        }
         if (notBlank(status)) {
             sql.append(" and status=?");
             args.add(status.trim().toUpperCase(Locale.ROOT));
@@ -874,12 +900,36 @@ public class DataDevService {
         jdbc.update("insert into ds_dev_task(id,name,description,artifact_id,version,run_mode,exec_type,source_node_id,"
                         + "source_datatable_id,source_relative_uri,params,content_snapshot,dependency_names,status,result_node_id,"
                         + "result_datatable_id,result_preview,source_rows,result_rows,error_message,kuscia_job_id,retry_count,"
-                        + "created_by,created_at,updated_at,started_at,finished_at,deleted)"
-                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','','','',0,0,'','',0,?,?,?,?,'',0)",
+                        + "created_by,created_at,updated_at,started_at,finished_at,deleted,project_id,sandbox_id,source_asset_id,source_mount_id,result_asset_id)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','','','',0,0,'','',0,?,?,?,?,'',0,?,?,?,?,'')",
                 taskId, name, string(request.get("description")), artifactId, version, runMode, execType,
                 nodeId, datatableId, relativeUri, json(params), contentSnapshot, json(dependencyNames),
-                actor(), now, now, now);
+                actor(), now, now, now, string(request.get("projectId")), string(request.get("sandboxId")),
+                string(request.get("assetId")), string(request.get("mountId")));
         return taskId;
+    }
+
+    private Map<String, Object> requireSandboxMount(String sandboxId, String mountId, String assetId) {
+        requireSandboxCreator(sandboxId, "");
+        StringBuilder sql = new StringBuilder("select m.*,a.datatable_id,a.processor_node_id,s.project_id from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id join ds_sandbox s on s.id=m.sandbox_id where m.sandbox_id=? and m.deleted=0 and m.status='READY' and a.deleted=0 and a.status='ACTIVE' and a.data_stage='PROCESSED'");
+        List<Object> args = new ArrayList<>(List.of(sandboxId));
+        if (notBlank(mountId)) { sql.append(" and m.id=?"); args.add(mountId); }
+        else if (notBlank(assetId)) { sql.append(" and m.asset_id=?"); args.add(assetId); }
+        else throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 mountId/assetId");
+        Map<String, Object> mount = requireRow(sql.toString(), args.toArray());
+        String expires = string(mount.get("expires_at"));
+        if (notBlank(expires) && expires.compareTo(now()) < 0) throw new IllegalStateException("挂载数据已过期");
+        return mount;
+    }
+
+    private void requireSandboxCreator(String sandboxId, String expectedProjectId) {
+        Map<String, Object> sandbox = requireRow("select * from ds_sandbox where id=? and deleted=0", sandboxId);
+        if (notBlank(expectedProjectId) && !expectedProjectId.equals(string(sandbox.get("project_id")))) throw new IllegalArgumentException("沙箱不属于所选项目");
+        UserContextDTO user = currentUser();
+        String platformNode = user == null ? "" : string(user.getPlatformNodeId());
+        String owner = user == null ? "" : string(user.getOwnerId());
+        if ((!string(sandbox.get("owner_id")).equals(platformNode) && !string(sandbox.get("owner_id")).equals(owner))
+                || !actor().equals(string(sandbox.get("created_by")))) throw new IllegalArgumentException(DevErrors.DEV_NO_PERMISSION + ": 沙箱仅创建人可使用");
     }
 
     /** 认领 PENDING 任务为 RUNNING（条件 UPDATE + affected==1 并发控制）。 */

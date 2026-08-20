@@ -21,6 +21,7 @@ import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.NodeDO;
 import org.secretflow.secretpad.persistence.repository.NodeRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.DataAssetService;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -33,6 +34,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -89,6 +91,7 @@ public class DataGovernanceService {
     private final NodeRepository nodeRepository;
     private final DataSandboxMvpService mvp;
     private final GovernanceCustomExecutor customExecutor;
+    private final DataAssetService dataAssetService;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -109,7 +112,8 @@ public class DataGovernanceService {
             DatatableManager datatableManager,
             NodeRepository nodeRepository,
             DataSandboxMvpService mvp,
-            GovernanceCustomExecutor customExecutor) {
+            GovernanceCustomExecutor customExecutor,
+            DataAssetService dataAssetService) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
@@ -117,6 +121,7 @@ public class DataGovernanceService {
         this.nodeRepository = nodeRepository;
         this.mvp = mvp;
         this.customExecutor = customExecutor;
+        this.dataAssetService = dataAssetService;
     }
 
     /* ============================== 权限 ============================== */
@@ -127,6 +132,9 @@ public class DataGovernanceService {
     public void checkSourcePermission(UserContextDTO user, String nodeId, String datatableId) {
         if (user == null || !notBlank(user.getOwnerId())) {
             throw noPermission();
+        }
+        if (dataAssetService.processingTable(nodeId, datatableId).isPresent()) {
+            return;
         }
         // 平台自有数据：nodeId 即用户平台节点（EDGE 模式 nodeId == ownerId，
         // P2P 模式 nodeId == user.ownerId 即用户所属 kuscia 域，无 node 行也放行）；
@@ -611,9 +619,9 @@ public class DataGovernanceService {
         long sourceRows = data.size();
         List<List<String>> sampled = sampleRows(header, data, sampling);
         GovernanceMaskingExecutor.MaskResult masked = maskRows(header, sampled, masking);
-        String resultUri = writeResultCsv(source.getNodeId(), taskId, masked.header(), masked.rows());
-        String domainDataId = registerResultDomainData(source.getNodeId(), string(taskId), resultUri,
-                masked.header(), source.getSchema());
+        Map<String,Object> resultAsset=dataAssetService.registerGovernedResult(taskId,source.getNodeId(),
+                CsvUtil.toCsv(masked.header(),masked.rows()).getBytes(StandardCharsets.UTF_8));
+        String domainDataId=string(resultAsset.get("datatable_id"));
         long resultRows = masked.rows().size();
         jdbc.update("update ds_governance_task set status=?,result_node_id=?,result_datatable_id=?,source_rows=?,result_rows=?,finished_at=?,updated_at=? where id=? and status=?",
                 STATUS_SUCCEEDED, source.getNodeId(), domainDataId, sourceRows, resultRows, now(), now(), taskId, STATUS_RUNNING);
@@ -691,12 +699,23 @@ public class DataGovernanceService {
     /* ============================== 数据 / 注册 ============================== */
 
     private DatatableDTO resolveSource(String nodeId, String datatableId) {
+        var catalogTable = dataAssetService.processingTable(nodeId, datatableId);
+        if (catalogTable.isPresent()) {
+            return catalogTable.get();
+        }
         return datatableManager.findById(DatatableDTO.NodeDatatableId.from(nodeId, datatableId))
                 .orElseThrow(() -> new IllegalArgumentException(GOV_NOT_FOUND + ": 数据表不存在: " + nodeId + "/" + datatableId));
     }
 
     /** 读源 CSV（复用 DataServiceImpl 的 storeDir+nodeId+relativeUri 解析 + canonical 安全校验 + BOM 剥离）。 */
     private List<List<String>> readCsv(String nodeId, String relativeUri) {
+        if (relativeUri.startsWith("s3://")) {
+            try (InputStream input = dataAssetService.openStored(relativeUri)) {
+                return CsvUtil.parse(new String(input.readAllBytes(), StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                throw new IllegalStateException(GOV_NOT_FOUND + ": 读取 MinIO 源 CSV 失败: " + e.getMessage(), e);
+            }
+        }
         if (relativeUri.contains("..")) {
             throw new IllegalArgumentException(GOV_PARAM_INVALID + ": 非法路径");
         }

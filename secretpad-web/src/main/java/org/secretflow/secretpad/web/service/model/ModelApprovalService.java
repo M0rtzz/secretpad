@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -87,6 +88,7 @@ public class ModelApprovalService {
         String projectId = required(request, "projectId");
         String artifactId = required(request, "artifactId");
         String artifactVersionId = required(request, "artifactVersionId");
+        String sandboxId = string(request.get("sandboxId"));
         String description = string(request.get("description"));
 
         Map<String, Object> artifact = requireArtifact(artifactId);
@@ -97,6 +99,15 @@ public class ModelApprovalService {
         }
         Map<String, Object> version = requireVersion(artifactId, artifactVersionId);
         requireProject(projectId);
+        if (notBlank(sandboxId)) {
+            Map<String, Object> sandbox = requireRow("select * from ds_sandbox where id=? and project_id=? and deleted=0", sandboxId, projectId);
+            if (!Objects.equals(actor(), string(sandbox.get("created_by")))) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_NO_PERMISSION + ": 沙箱仅创建人可注册算法");
+            }
+            if (!sandboxId.equals(string(artifact.get("sandbox_id")))) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID + ": 制品不属于当前沙箱");
+            }
+        }
 
         Long duplicate = count("select count(1) from ds_model where project_id=? and artifact_id=? and deleted=0 and status in (?,?,?,?)",
                 projectId, artifactId, "DRAFT", "APPROVING", "APPROVED", "PUBLISHED");
@@ -113,10 +124,11 @@ public class ModelApprovalService {
         String createdByOwner = currentOwner();
         String now = now();
         jdbc.update("insert into ds_model(id,name,description,project_id,artifact_id,artifact_version_id,node_id,version,status,"
-                        + "created_by,created_by_owner,created_at,updated_at,approved_at,published_at,deleted)"
-                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'','',0)",
+                        + "created_by,created_by_owner,created_at,updated_at,approved_at,published_at,deleted,sandbox_id,input_schema,output_schema)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'','',0,?,?,?)",
                 id, name, description, projectId, artifactId, artifactVersionId, nodeIdOf(projectId, createdByOwner),
-                modelVersion, "DRAFT", createdBy, createdByOwner, now, now);
+                modelVersion, "DRAFT", createdBy, createdByOwner, now, now, sandboxId,
+                string(request.getOrDefault("inputSchema", "[]")), string(request.getOrDefault("outputSchema", "[]")));
         audit("MODEL_REGISTER", "MODEL", id,
                 "artifact=" + artifactId + " v" + version.get("version") + " project=" + projectId, true);
         dispatch("model.registered", Map.of("id", id, "name", name, "artifactId", artifactId, "version", modelVersion));
@@ -152,12 +164,16 @@ public class ModelApprovalService {
         dispatch("model.deleted", Map.of("id", id));
     }
 
-    public List<Map<String, Object>> listModels(String status, String keyword) {
+    public List<Map<String, Object>> listModels(String status, String keyword, String sandboxId) {
         StringBuilder sql = new StringBuilder(
                 "select m.*, a.name artifact_name, a.type artifact_type, v.version artifact_version_no "
                         + "from ds_model m left join ds_dev_artifact a on a.id=m.artifact_id "
                         + "left join ds_dev_artifact_version v on v.id=m.artifact_version_id where m.deleted=0");
         List<Object> args = new ArrayList<>();
+        if (notBlank(sandboxId)) {
+            sql.append(" and m.sandbox_id=?");
+            args.add(sandboxId);
+        }
         if (notBlank(status)) {
             sql.append(" and m.status=?");
             args.add(status.trim().toUpperCase(Locale.ROOT));
@@ -398,6 +414,14 @@ public class ModelApprovalService {
         List<Map<String, Object>> rows = jdbc.queryForList("select * from ds_dev_artifact where id=? and deleted=0", id);
         if (rows.isEmpty()) {
             throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 制品不存在: " + id);
+        }
+        return new LinkedHashMap<>(rows.get(0));
+    }
+
+    private Map<String, Object> requireRow(String sql, Object... args) {
+        List<Map<String, Object>> rows = jdbc.queryForList(sql, args);
+        if (rows.isEmpty()) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 记录不存在");
         }
         return new LinkedHashMap<>(rows.get(0));
     }
