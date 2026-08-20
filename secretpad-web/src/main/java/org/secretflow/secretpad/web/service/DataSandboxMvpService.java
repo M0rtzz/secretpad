@@ -139,6 +139,108 @@ public class DataSandboxMvpService {
         return kusciaEnabled;
     }
 
+    /* --------------------------- Intelligent modeling --------------------------- */
+
+    /** Returns the built-in modeling catalog, user presets, projects and real DAG runs. */
+    public Map<String, Object> modelingOverview() {
+        String owner = currentOwner();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("components", jdbc.queryForList(
+                "select * from ds_modeling_component where enabled=1 order by category,name"));
+        result.put("profiles", jdbc.queryForList(
+                "select * from ds_modeling_profile where owner_id=? order by updated_at desc", owner));
+        result.put("projects", modelingProjects(owner));
+        result.put("runs", modelingRuns(owner, ""));
+        return result;
+    }
+
+    public Map<String, Object> modelingComponent(String code) {
+        if (!notBlank(code)) throw new IllegalArgumentException("code 不能为空");
+        Map<String, Object> component = requireRow(
+                "select * from ds_modeling_component where code=? and enabled=1", code);
+        List<Map<String, Object>> profiles = jdbc.queryForList(
+                "select * from ds_modeling_profile where owner_id=? and component_code=? order by updated_at desc",
+                currentOwner(), code);
+        component.put("profiles", profiles);
+        return component;
+    }
+
+    public Map<String, Object> saveModelingProfile(Map<String, Object> request) {
+        String component = required(request, "componentCode");
+        Map<String, Object> definition = requireRow(
+                "select * from ds_modeling_component where code=? and enabled=1", component);
+        String name = required(request, "name");
+        String params = jsonObject(request.get("params"), definition.get("default_params_json"));
+        String resources = jsonObject(request.get("resources"), definition.get("default_resources_json"));
+        validateModelingJson(definition, params, resources);
+        String id = value(request, "id", shortId());
+        String now = now();
+        jdbc.update("insert into ds_modeling_profile(id,owner_id,component_code,name,params_json,resources_json,created_by,created_at,updated_at) "
+                        + "values(?,?,?,?,?,?,?,?,?) on conflict(owner_id,component_code,name) do update set params_json=excluded.params_json,resources_json=excluded.resources_json,updated_at=excluded.updated_at",
+                id, currentOwner(), component, name, params, resources, actor(), now, now);
+        audit("OPERATION", "MODELING_PROFILE_SAVE", "MODELING_PROFILE", id, json(request), true);
+        return requireRow("select * from ds_modeling_profile where owner_id=? and component_code=? and name=?",
+                currentOwner(), component, name);
+    }
+
+    public void deleteModelingProfile(String id) {
+        jdbc.update("delete from ds_modeling_profile where id=? and owner_id=?", id, currentOwner());
+        audit("OPERATION", "MODELING_PROFILE_DELETE", "MODELING_PROFILE", id, "{}", true);
+    }
+
+    public Map<String, Object> validateModeling(Map<String, Object> request) {
+        String component = required(request, "componentCode");
+        Map<String, Object> definition = requireRow(
+                "select * from ds_modeling_component where code=? and enabled=1", component);
+        String params = jsonObject(request.get("params"), definition.get("default_params_json"));
+        String resources = jsonObject(request.get("resources"), definition.get("default_resources_json"));
+        validateModelingJson(definition, params, resources);
+        return Map.of("valid", true, "componentCode", component, "runtimeApp", definition.get("runtime_app"),
+                "runtimeCode", definition.get("runtime_code"), "params", objectMap(params), "resources", objectMap(resources),
+                "message", "参数和资源配置有效；请进入项目建模页面绑定数据并执行 DAG");
+    }
+
+    public List<Map<String, Object>> modelingRuns(String ownerId, String projectId) {
+        String owner = notBlank(ownerId) ? ownerId : currentOwner();
+        StringBuilder sql = new StringBuilder("select j.project_id,j.job_id,j.name,j.status,j.err_msg,j.graph_id,j.finished_time,j.gmt_create,j.gmt_modified, "
+                + "p.name project_name,(select count(1) from project_job_task t where t.project_id=j.project_id and t.job_id=j.job_id and t.is_deleted=0) task_count "
+                + "from project_job j join project p on p.project_id=j.project_id and p.is_deleted=0 where j.is_deleted=0 and p.owner_id=?");
+        List<Object> args = new ArrayList<>();
+        args.add(owner);
+        if (notBlank(projectId)) { sql.append(" and j.project_id=?"); args.add(projectId); }
+        sql.append(" order by j.gmt_create desc limit 200");
+        return jdbc.queryForList(sql.toString(), args.toArray());
+    }
+
+    private List<Map<String, Object>> modelingProjects(String owner) {
+        return jdbc.queryForList("select project_id,name,compute_mode,compute_func,description,gmt_modified from project where owner_id=? and is_deleted=0 order by gmt_modified desc", owner);
+    }
+
+    private String jsonObject(Object value, Object fallback) {
+        if (value == null) return string(fallback).isBlank() ? "{}" : string(fallback);
+        if (value instanceof String s) { objectMap(s); return s; }
+        return json(value);
+    }
+
+    private Map<String, Object> objectMap(String value) {
+        try {
+            Map<?, ?> parsed = objectMapper.readValue(value, Map.class);
+            return new LinkedHashMap<>((Map<String, Object>) parsed);
+        } catch (Exception e) { throw new IllegalArgumentException("参数必须是 JSON 对象"); }
+    }
+
+    private void validateModelingJson(Map<String, Object> definition, String params, String resources) {
+        objectMap(params);
+        Map<String, Object> resourceMap = objectMap(resources);
+        if (number(resourceMap.get("cpuCores"), 0) <= 0 || number(resourceMap.get("memoryGb"), 0) <= 0
+                || number(resourceMap.get("storageGb"), 0) <= 0 || number(resourceMap.get("timeoutSeconds"), 0) <= 0) {
+            throw new IllegalArgumentException("CPU、内存、存储和超时时间必须大于 0");
+        }
+        if ("MODEL_TRAINING".equals(definition.get("category")) && !params.contains("regType")) {
+            throw new IllegalArgumentException("回归组件缺少 regType");
+        }
+    }
+
     /* ------------------------------- Sandbox ------------------------------- */
 
     public List<Map<String, Object>> listSandboxes(String ownerId, String keyword, String status) {

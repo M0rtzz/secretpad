@@ -46,6 +46,40 @@ public class DataSandboxController {
         this.gate = gate;
     }
 
+    @Operation(summary = "智能建模组件目录、预设、项目与真实执行记录")
+    @GetMapping("/modeling")
+    public SecretPadResponse<Map<String, Object>> modeling() {
+        return SecretPadResponse.success(service.modelingOverview());
+    }
+
+    @GetMapping("/modeling/components/detail")
+    public SecretPadResponse<Map<String, Object>> modelingComponent(@RequestParam String code) {
+        return SecretPadResponse.success(service.modelingComponent(code));
+    }
+
+    @PostMapping("/modeling/profiles/save")
+    public SecretPadResponse<Map<String, Object>> saveModelingProfile(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveModelingProfile(request));
+    }
+
+    @PostMapping("/modeling/profiles/delete")
+    public SecretPadResponse<Void> deleteModelingProfile(@RequestBody Map<String, Object> request) {
+        service.deleteModelingProfile(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
+    @PostMapping("/modeling/components/validate")
+    public SecretPadResponse<Map<String, Object>> validateModeling(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.validateModeling(request));
+    }
+
+    @GetMapping("/modeling/runs")
+    public SecretPadResponse<List<Map<String, Object>>> modelingRuns(
+            @RequestParam(defaultValue = "") String ownerId,
+            @RequestParam(defaultValue = "") String projectId) {
+        return SecretPadResponse.success(service.modelingRuns(ownerId, projectId));
+    }
+
     @Operation(summary = "查询沙箱")
     @GetMapping("/sandboxes")
     public SecretPadResponse<List<Map<String, Object>>> sandboxes(
