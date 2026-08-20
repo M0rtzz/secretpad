@@ -190,6 +190,30 @@ secretpad:
     snapshot-root: ${DATA_SANDBOX_SNAPSHOT_ROOT:/nas/Misc/data-sandbox/snapshots}
     backup-root: ${DATA_SANDBOX_BACKUP_ROOT:/nas/Misc/data-sandbox/backups}
     status-sync-ms: ${DATA_SANDBOX_STATUS_SYNC_MS:30000}
+    dev-endpoint:
+      # 开发端点一次性 token 有效期（分钟），每次进入重置
+      token-ttl-minutes: ${DATA_SANDBOX_DEV_TOKEN_TTL:30}
+      # 开发端点跳板转发超时（秒）
+      proxy-timeout-seconds: ${DATA_SANDBOX_PROXY_TIMEOUT:30}
+    # 节点真实资源指标采集（Kuscia Prometheus 端点 :9091/metrics，node_exporter/DCGM）
+    metrics:
+      # 采集开关；URL 形如 http://<kuscia容器名>:9091
+      enabled: ${DATA_SANDBOX_METRICS_ENABLED:false}
+      url: ${DATA_SANDBOX_METRICS_URL:}
+      # 采集周期（毫秒）
+      interval-ms: ${DATA_SANDBOX_METRICS_INTERVAL:30000}
+    # Z-02 告警阈值
+    alerts:
+      # 单用户配额使用率告警阈值（%）
+      quota-warning-percent: ${DATA_SANDBOX_ALERT_QUOTA_PERCENT:90}
+    # Z-03 沙箱资源申请与审批
+    approval:
+      # 门禁开关：开启时创建/续期/回收必须提交申请单且审批通过才能执行（admin/运营方直通）
+      required: ${SECRETPAD_DATA_SANDBOX_APPROVAL_REQUIRED:true}
+      # 审批通过后自动执行轮询周期（毫秒）
+      executor-interval-ms: ${SECRETPAD_DATA_SANDBOX_APPROVAL_EXECUTOR_INTERVAL:10000}
+      # 执行失败自动重试上限（超过置 FAILED，可人工 RETRY）
+      max-retries: ${SECRETPAD_DATA_SANDBOX_APPROVAL_MAX_RETRIES:3}
   datasync:
     center: true
     p2p: false

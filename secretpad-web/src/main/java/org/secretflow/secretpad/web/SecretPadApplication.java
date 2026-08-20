@@ -16,6 +16,8 @@
 
 package org.secretflow.secretpad.web;
 
+import org.secretflow.secretpad.web.config.SandboxWebSocketConfig;
+
 import com.google.common.collect.Lists;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.Connector;
@@ -33,6 +35,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.MediaType;
 import org.springframework.http.converter.protobuf.ProtobufHttpMessageConverter;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.context.annotation.Import;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -49,6 +52,7 @@ import java.nio.charset.StandardCharsets;
 @SpringBootApplication
 @EnableAsync
 @EnableCaching
+@Import(SandboxWebSocketConfig.class)
 public class SecretPadApplication {
 
     @Value("${server.http-port}")

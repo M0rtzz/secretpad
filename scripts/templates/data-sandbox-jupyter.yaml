@@ -1,0 +1,80 @@
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jupyter
+spec:
+  deployTemplates:
+    - name: jupyter
+      replicas: 1
+      spec:
+        containers:
+          # 容器固定以镜像 USER（uid 1000）运行：kuscia 的 k3s 对 AppImage 的
+          # securityContext 仅支持 privileged，runAsUser 会被忽略。而
+          # scipy-notebook:2024-10-07 镜像 /home/jovyan 属主是内部 uid 100999，
+          # uid 1000 无写权限 → Jupyter 无法创建 runtime 目录。故将 Jupyter 全部
+          # 可写目录指向世界可写的 /tmp，不依赖 home 属主（沙箱无 PV，本就随 pod 重建）。
+          # kuscia 会把 scope=Cluster 的逻辑端口（8888）重映射为分配的端口，并通过
+          # KUSCIA_PORT_WEB_NUMBER 注入容器（此处容器端口实际为分配值如 20081），
+          # 容器必须监听该 env 端口，Headless Service/探针/Dev 代理才能连通。
+          # base_url 指向跳板代理前缀：SecretPad 跳板把 /proxy/{sandboxId}/ 之后的
+          # 完整路径（含前缀）转发给 Jupyter，Jupyter 内所有相对链接/WebSocket 才会
+          # 落回跳板路径（配合 tcpSocket 探针，避免 base_url 下 httpGet 404）。
+          # workspace 用 /tmp 而非 /home/jovyan：scipy-notebook 镜像 /home/jovyan
+          # 属主是内部 uid 100999，容器以 uid 1000 运行无法写入（见上方注释）。
+          - command:
+              - /bin/sh
+              - -c
+              - >-
+                sandbox_id="${HOSTNAME#ds-}";
+                sandbox_id="${sandbox_id%-task-server-0}";
+                mkdir -p /tmp/workspace;
+                cd /tmp/workspace;
+                exec python3 -m jupyter lab
+                --ServerApp.ip=0.0.0.0
+                --ServerApp.port="${KUSCIA_PORT_WEB_NUMBER:-8888}"
+                --ServerApp.base_url="/api/v1alpha1/data-sandbox/proxy/${sandbox_id}/"
+                --ServerApp.root_dir=/tmp/workspace
+                --ServerApp.token=
+                --ServerApp.password=
+                --ServerApp.allow_origin=*
+                --no-browser
+                --allow-root
+            name: jupyter
+            env:
+              - name: HOME
+                value: /tmp
+              - name: JUPYTER_RUNTIME_DIR
+                value: /tmp/jupyter-runtime
+              - name: JUPYTER_DATA_DIR
+                value: /tmp/jupyter-data
+              - name: JUPYTER_CONFIG_DIR
+                value: /tmp/jupyter-config
+              - name: JUPYTERLAB_SETTINGS_DIR
+                value: /tmp/jupyter-lab
+            # scope=Cluster 的端口由 Kuscia 分配集群外可达地址并回填 endpoints，
+            # 沙箱状态同步据此写入 ds_sandbox.endpoint（开发端点跳板的数据来源）。
+            # 容器内不设 Jupyter token：Kuscia 集群内可达，鉴权全部收敛在 SecretPad 跳板层。
+            ports:
+              - name: web
+                port: 8888
+                protocol: HTTP
+                scope: Cluster
+            readinessProbe:
+              tcpSocket:
+                port: web
+            livenessProbe:
+              tcpSocket:
+                port: web
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: web
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+            workingDir: /tmp
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

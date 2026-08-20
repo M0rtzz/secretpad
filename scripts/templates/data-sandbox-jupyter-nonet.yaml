@@ -1,0 +1,55 @@
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jupyter-nonet
+spec:
+  deployTemplates:
+    - name: jupyter
+      replicas: 1
+      spec:
+        containers:
+          # 与 base 变体同款：镜像固定以 uid 1000 运行而 /home/jovyan 属主是 uid 100999，
+          # Jupyter 可写目录全部指向世界可写的 /tmp；监听 kuscia 分配端口，避免硬编码 8888
+          # 在非首端口沙箱上监听错误端口导致探针失败。
+          - command:
+              - sh
+              - -c
+              - "exec start-notebook.sh --ServerApp.ip=0.0.0.0 --ServerApp.port=${KUSCIA_PORT_WEB_NUMBER:-8888} --ServerApp.token= --ServerApp.password= --no-browser --NotebookApp.allow_origin=*"
+            name: jupyter
+            env:
+              - name: HOME
+                value: /tmp
+              - name: JUPYTER_RUNTIME_DIR
+                value: /tmp/jupyter-runtime
+              - name: JUPYTER_DATA_DIR
+                value: /tmp/jupyter-data
+              - name: JUPYTER_CONFIG_DIR
+                value: /tmp/jupyter-config
+              - name: JUPYTERLAB_SETTINGS_DIR
+                value: /tmp/jupyter-lab
+            # NO_NETWORK 隔离变体：无 scope=Cluster 端口（不产生集群外可达端点），
+            # 探针降级为端口级（TCP），避免 HTTP 就绪检查依赖外网可达性。
+            ports:
+              - name: web
+                port: 8888
+                protocol: HTTP
+                scope: Domain
+            readinessProbe:
+              tcpSocket:
+                port: web
+            livenessProbe:
+              tcpSocket:
+                port: web
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: web
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+            workingDir: /home/jovyan
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

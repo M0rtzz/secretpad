@@ -1,0 +1,45 @@
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jar
+spec:
+  deployTemplates:
+    - name: jar
+      replicas: 1
+      spec:
+        containers:
+          # 保留原始命令：同事 30234b8 的 `java -cp /opt/data-sandbox JavaSandboxServer`
+          # 依赖其运行时镜像内置该 classpath；zgz 的 jar 镜像为 eclipse-temurin:17-jre
+          # 无此文件，采纳会致容器崩溃。jar 命令与开发端点代理无关，维持可验证基线。
+          - command:
+              - sh
+              - -c
+              - exec java -jar ${APP_JAR:-/app/app.jar}
+            name: jar
+            # 与 ds_sandbox_image.dev_port_name='app' 对应：scope=Cluster 端口由 Kuscia
+            # 分配集群外可达地址并回填 endpoints，供开发端点跳板访问。
+            workingDir: /app
+            ports:
+              - name: app
+                port: 8080
+                protocol: HTTP
+                scope: Cluster
+            # JAR 应用的就绪路径未知，仅做端口级探测
+            readinessProbe:
+              tcpSocket:
+                port: app
+            livenessProbe:
+              tcpSocket:
+                port: app
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: app
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

@@ -1,0 +1,41 @@
+apiVersion: kuscia.secretflow/v1alpha1
+kind: AppImage
+metadata:
+  name: data-sandbox-jar-nonet
+spec:
+  deployTemplates:
+    - name: jar
+      replicas: 1
+      spec:
+        containers:
+          - command:
+              - sh
+              - -c
+              - exec java -jar ${APP_JAR:-/app/app.jar}
+            name: jar
+            # NO_NETWORK 隔离变体：scope=Cluster → Domain，Kuscia 不分配集群外端点。
+            # 容器端口仍暴露给探针（端口级 TCP 探测）。
+            workingDir: /app
+            ports:
+              - name: app
+                port: 8080
+                protocol: HTTP
+                scope: Domain
+            readinessProbe:
+              tcpSocket:
+                port: app
+            livenessProbe:
+              tcpSocket:
+                port: app
+            startupProbe:
+              failureThreshold: 60
+              tcpSocket:
+                port: app
+              periodSeconds: 10
+              successThreshold: 1
+              timeoutSeconds: 1
+  image:
+    id: "{{.IMAGE_NAME}}:{{.IMAGE_TAG}}"
+    name: {{.IMAGE_NAME}}
+    sign: ""
+    tag: {{.IMAGE_TAG}}

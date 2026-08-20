@@ -1,5 +1,7 @@
 HELP.md
 target/
+# root 属主残留构建产物（容器构建产生），移出 target 目录暂存，无法由普通用户删除
+*.rootcleanup.*/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/

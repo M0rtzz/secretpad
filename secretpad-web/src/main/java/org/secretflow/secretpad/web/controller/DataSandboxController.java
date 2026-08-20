@@ -12,6 +12,7 @@ package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalGate;
 
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -38,9 +39,11 @@ import java.util.Map;
 public class DataSandboxController {
 
     private final DataSandboxMvpService service;
+    private final SandboxApprovalGate gate;
 
-    public DataSandboxController(DataSandboxMvpService service) {
+    public DataSandboxController(DataSandboxMvpService service, SandboxApprovalGate gate) {
         this.service = service;
+        this.gate = gate;
     }
 
     @Operation(summary = "查询沙箱")
@@ -55,13 +58,26 @@ public class DataSandboxController {
     @Operation(summary = "创建沙箱")
     @PostMapping("/sandboxes/create")
     public SecretPadResponse<Map<String, Object>> createSandbox(@RequestBody Map<String, Object> request) {
+        // Z-03 门禁：approval.required 开启且非 admin/运营方时，直接创建被拒，需提交申请单
+        gate.assertDirectCreateAllowed();
         return SecretPadResponse.success(service.createSandbox(request));
     }
 
     @Operation(summary = "沙箱启停、销毁、续期或快照")
     @PostMapping("/sandboxes/action")
     public SecretPadResponse<Map<String, Object>> sandboxAction(@RequestBody Map<String, Object> request) {
+        // Z-03 门禁：RENEW/DESTROY 在 approval.required 开启且非 admin/运营方时需走申请单；START/STOP/SNAPSHOT 不设门禁
+        String action = String.valueOf(request.get("action"));
+        if ("RENEW".equals(action) || "DESTROY".equals(action)) {
+            gate.assertDirectActionAllowed(action);
+        }
         return SecretPadResponse.success(service.sandboxAction(request));
+    }
+
+    @Operation(summary = "签发开发环境访问 token（一次性，30 分钟有效）")
+    @PostMapping("/sandboxes/dev-token")
+    public SecretPadResponse<Map<String, Object>> devToken(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.generateDevToken(String.valueOf(request.get("id"))));
     }
 
     @GetMapping("/snapshots")
@@ -98,6 +114,26 @@ public class DataSandboxController {
     @PostMapping("/resources/alerts/resolve")
     public SecretPadResponse<Void> resolveAlert(@RequestBody Map<String, Object> request) {
         service.resolveAlert(String.valueOf(request.get("id")));
+        return SecretPadResponse.success();
+    }
+
+    @Operation(summary = "网络白名单列表（ALLOW_LIST 策略放行登记）")
+    @GetMapping("/resources/network/allowlist")
+    public SecretPadResponse<List<Map<String, Object>>> networkAllowlist(
+            @RequestParam(defaultValue = "") String sandboxId) {
+        return SecretPadResponse.success(service.listNetworkAllowlist(sandboxId));
+    }
+
+    @Operation(summary = "新增网络白名单条目")
+    @PostMapping("/resources/network/allowlist")
+    public SecretPadResponse<Map<String, Object>> addNetworkAllowlist(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.addNetworkAllowlist(request));
+    }
+
+    @Operation(summary = "删除网络白名单条目")
+    @PostMapping("/resources/network/allowlist/delete")
+    public SecretPadResponse<Void> deleteNetworkAllowlist(@RequestBody Map<String, Object> request) {
+        service.deleteNetworkAllowlist(String.valueOf(request.get("id")));
         return SecretPadResponse.success();
     }
 
@@ -225,6 +261,12 @@ public class DataSandboxController {
     @PostMapping("/operations/diagnostics")
     public SecretPadResponse<Map<String, Object>> diagnostics() {
         return SecretPadResponse.success(service.diagnostics());
+    }
+
+    @Operation(summary = "沙箱资源限制生效校验（期望值 + 运维核对指引）")
+    @PostMapping("/operations/limit-verify")
+    public SecretPadResponse<Map<String, Object>> limitVerify(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.limitVerify(String.valueOf(request.get("sandboxId"))));
     }
 
     @GetMapping("/operations/help")

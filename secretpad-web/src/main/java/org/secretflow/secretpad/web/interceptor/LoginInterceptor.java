@@ -34,6 +34,7 @@ import org.secretflow.secretpad.web.util.AuthUtils;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import jakarta.annotation.Resource;
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
@@ -64,6 +65,8 @@ import java.util.stream.Collectors;
 @Slf4j
 public class LoginInterceptor implements HandlerInterceptor {
 
+    private static final String DEV_ENDPOINT_COOKIE = "Data-Sandbox-Token";
+
     /**
      * Expiration time
      * one hour
@@ -91,6 +94,9 @@ public class LoginInterceptor implements HandlerInterceptor {
 
     @Resource
     private DataSandboxMvpService dataSandboxMvpService;
+
+    @Resource
+    private org.secretflow.secretpad.web.service.model.ModelApiService modelApiService;
 
     @Autowired
     public LoginInterceptor(UserTokensRepository userTokensRepository, EnvService envService,
@@ -136,6 +142,18 @@ public class LoginInterceptor implements HandlerInterceptor {
      */
     @Override
     public boolean preHandle(@NotNull HttpServletRequest request, @NotNull HttpServletResponse response, @NotNull Object handler) {
+        // 开发端点跳板：安全关键路径，独立于 auth.enabled 强制校验一次性 token
+        if (request.getRequestURI().startsWith("/api/v1alpha1/data-sandbox/proxy/")) {
+            processByDevEndpointToken(request, response);
+            return true;
+        }
+        // 受控模型 API 调用：X-APP-ID/X-APP-SECRET 凭证独立于 auth.enabled 强制校验（与 dev-proxy 同款范式）。
+        // 仅精确匹配 invoke 全路径；create/list/update 等 admin 端点仍走 User-Token 流程。
+        if (request.getRequestURI().equals("/api/v1alpha1/model-api/invoke")
+                && (StringUtils.isNotBlank(request.getHeader("X-APP-ID")) || StringUtils.isNotBlank(request.getHeader("X-APP-SECRET")))) {
+            modelApiService.authenticateInvoke(request, request.getHeader("X-APP-ID"), request.getHeader("X-APP-SECRET"));
+            return true;
+        }
         if (!enable) {
             UserContextDTO admin = createTmpUserForPlatformType(envService.getPlatformType());
             UserContext.setBaseUser(admin);
@@ -155,6 +173,39 @@ public class LoginInterceptor implements HandlerInterceptor {
         return true;
     }
 
+
+    /**
+     * 开发端点跳板鉴权：/proxy/{sandboxId}?token=... 使用一次性 token（DB sha256 比对、
+     * 未过期、沙箱 RUNNING），通过后构造虚拟用户供审计使用。失败抛 AUTH_FAILED，
+     * 由全局异常处理器返回明确业务错误。
+     */
+    private void processByDevEndpointToken(HttpServletRequest request, HttpServletResponse response) {
+        String[] segments = request.getRequestURI().split("/");
+        String sandboxId = segments.length >= 6 ? segments[5] : "";
+        String token = request.getParameter("token");
+        if (StringUtils.isBlank(token) && request.getCookies() != null) {
+            for (Cookie cookie : request.getCookies()) {
+                if (DEV_ENDPOINT_COOKIE.equals(cookie.getName())) {
+                    token = cookie.getValue();
+                    break;
+                }
+            }
+        }
+        dataSandboxMvpService.validateDevToken(sandboxId, token);
+        if (StringUtils.isNotBlank(request.getParameter("token"))) {
+            String path = "/api/v1alpha1/data-sandbox/proxy/" + sandboxId;
+            response.addHeader("Set-Cookie", DEV_ENDPOINT_COOKIE + "=" + token
+                    + "; Path=" + path + "; Max-Age=1800; HttpOnly; SameSite=Lax");
+        }
+        UserContextDTO devUser = new UserContextDTO();
+        devUser.setName("dev-proxy:" + sandboxId);
+        devUser.setOwnerId(sandboxId);
+        devUser.setOwnerType(UserOwnerTypeEnum.CENTER);
+        devUser.setPlatformType(PlatformTypeEnum.CENTER);
+        devUser.setPlatformNodeId(envService.getPlatformNodeId());
+        devUser.setDeployMode(deployMode);
+        UserContext.setBaseUser(devUser);
+    }
 
     private void processByNodeRpcRequest(HttpServletRequest request) {
         String sourceNodeId = request.getHeader("kuscia-origin-source");
