@@ -95,6 +95,9 @@ public class LoginInterceptor implements HandlerInterceptor {
     @Resource
     private DataSandboxMvpService dataSandboxMvpService;
 
+    @Resource
+    private org.secretflow.secretpad.web.service.model.ModelApiService modelApiService;
+
     @Autowired
     public LoginInterceptor(UserTokensRepository userTokensRepository, EnvService envService,
                             SysResourcesBizService sysResourcesBizService, ProjectNodeRepository projectNodeRepository) {
@@ -142,6 +145,13 @@ public class LoginInterceptor implements HandlerInterceptor {
         // 开发端点跳板：安全关键路径，独立于 auth.enabled 强制校验一次性 token
         if (request.getRequestURI().startsWith("/api/v1alpha1/data-sandbox/proxy/")) {
             processByDevEndpointToken(request, response);
+            return true;
+        }
+        // 受控模型 API 调用：X-APP-ID/X-APP-SECRET 凭证独立于 auth.enabled 强制校验（与 dev-proxy 同款范式）。
+        // 仅精确匹配 invoke 全路径；create/list/update 等 admin 端点仍走 User-Token 流程。
+        if (request.getRequestURI().equals("/api/v1alpha1/model-api/invoke")
+                && (StringUtils.isNotBlank(request.getHeader("X-APP-ID")) || StringUtils.isNotBlank(request.getHeader("X-APP-SECRET")))) {
+            modelApiService.authenticateInvoke(request, request.getHeader("X-APP-ID"), request.getHeader("X-APP-SECRET"));
             return true;
         }
         if (!enable) {
