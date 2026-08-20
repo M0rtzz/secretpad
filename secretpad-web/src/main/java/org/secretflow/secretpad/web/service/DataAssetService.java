@@ -17,6 +17,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -224,7 +227,7 @@ public class DataAssetService {
                     .providerNodeId(owner())
                     .assetJson(json(snapshot))
                     .attachedBy(actor())
-                    .attachedAt(now())
+                    .attachedAt(beijingNow())
                     .expiresAt(String.valueOf(asset.getOrDefault("valid_until", "")))
                     .build());
         }
@@ -337,6 +340,7 @@ public class DataAssetService {
     private boolean matchesOwner(String candidate){return Objects.equals(owner(),candidate)||Objects.equals(legacyOwner(),candidate);}
     private String actor(){UserContextDTO u=UserContext.getUserOrNotExist();return u==null||u.getName()==null?"system":u.getName();}
     private String now(){return LocalDateTime.now().toString();}
+    private String beijingNow(){return OffsetDateTime.now(ZoneId.of("Asia/Shanghai")).truncatedTo(ChronoUnit.SECONDS).toString();}
     private String json(Object o){try{return mapper.writeValueAsString(o);}catch(Exception e){throw new IllegalArgumentException(e);}}
     @SuppressWarnings("unchecked")
     private Map<String,Object> parseMap(Object value){try{if(value==null||String.valueOf(value).isBlank()||"{}".equals(String.valueOf(value)))return new LinkedHashMap<>();return new LinkedHashMap<>(mapper.readValue(String.valueOf(value),Map.class));}catch(Exception e){return new LinkedHashMap<>();}}
