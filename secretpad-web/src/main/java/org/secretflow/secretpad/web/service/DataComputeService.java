@@ -86,6 +86,21 @@ public class DataComputeService {
         return result;
     }
 
+    /** Returns the two data sets visible inside a sandbox workspace. */
+    public Map<String, Object> workspaceData(String sandboxId) {
+        Map<String, Object> context = context(sandboxId);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("mounts", context.get("mounts"));
+        result.put("results", jdbc.queryForList(
+                "select t.id task_id,t.name task_name,t.exec_type,t.result_rows,t.finished_at,"
+                        + "t.result_asset_id,a.name asset_name,a.modality,a.data_stage,a.datatable_id,"
+                        + "a.storage_uri,a.metadata_json,a.provider_node_id "
+                        + "from ds_dev_task t left join ds_data_asset a on a.id=t.result_asset_id and a.deleted=0 "
+                        + "where t.sandbox_id=? and t.status='SUCCEEDED' and t.deleted=0 "
+                        + "order by t.finished_at desc", sandboxId));
+        return result;
+    }
+
     public Map<String, Object> requestMount(Map<String, Object> request) {
         String sandboxId = required(request, "sandboxId");
         Map<String, Object> sandbox = requireSandbox(sandboxId);

@@ -14,6 +14,7 @@ public class DataComputeController {
     public DataComputeController(DataComputeService service){this.service=service;}
     @GetMapping("/overview") public SecretPadResponse<List<Map<String,Object>>> overview(){return SecretPadResponse.success(service.overview());}
     @GetMapping("/context") public SecretPadResponse<Map<String,Object>> context(@RequestParam String sandboxId){return SecretPadResponse.success(service.context(sandboxId));}
+    @GetMapping("/workspace/data") public SecretPadResponse<Map<String,Object>> workspaceData(@RequestParam String sandboxId){return SecretPadResponse.success(service.workspaceData(sandboxId));}
     @PostMapping("/mount-requests") public SecretPadResponse<Map<String,Object>> requestMount(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.requestMount(request));}
     @GetMapping("/mount-requests") public SecretPadResponse<List<Map<String,Object>>> mountRequests(@RequestParam(defaultValue="") String status){return SecretPadResponse.success(service.mountRequests(status));}
     @GetMapping("/components") public SecretPadResponse<List<Map<String,Object>>> components(@RequestParam String sandboxId){return SecretPadResponse.success(service.components(sandboxId));}
