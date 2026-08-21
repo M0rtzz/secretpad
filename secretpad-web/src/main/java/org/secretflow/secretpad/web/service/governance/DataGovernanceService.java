@@ -137,12 +137,12 @@ public class DataGovernanceService {
         if (nodeId.equals(currentNodeId)
                 || nodeId.equals(user.getOwnerId())
                 || (node != null && user.getOwnerId().equals(node.getInstId()))) {
-            Long processed = count("select count(1) from ds_data_asset where provider_node_id=? and datatable_id=? and data_stage<>'RAW' and deleted=0",
-                    nodeId, datatableId);
-            if (processed > 0) {
-                throw new IllegalArgumentException(GOV_NO_PERMISSION + ": 只能处理本节点源数据");
+            Long raw = count("select count(1) from ds_data_asset where provider_node_id=? and data_stage='RAW' and deleted=0 and (datatable_id=? or (coalesce(datatable_id,'')='' and id=?))",
+                    nodeId, datatableId, datatableId);
+            if (raw > 0) {
+                return;
             }
-            return;
+            throw new IllegalArgumentException(GOV_NO_PERMISSION + ": 只能处理本节点源数据");
         }
         throw noPermission();
     }
@@ -612,8 +612,7 @@ public class DataGovernanceService {
             result.put("message", "该结果未经脱敏（纯抽样或自定义代码输出），含真实数据，不予展示");
             return result;
         }
-        // 脱敏结果可展示：权限校验 + 读取结果 CSV（仅前 100 行）
-        checkSourcePermission(user, string(task.get("result_node_id")), string(task.get("result_datatable_id")));
+        // 任务创建人可查看已脱敏结果；源数据 RAW 权限校验不适用于治理结果表。
         DatatableDTO dst = resolveSource(string(task.get("result_node_id")), string(task.get("result_datatable_id")));
         List<List<String>> parsed = readCsv(dst.getNodeId(), dst.getRelativeUri());
         List<String> header = parsed.isEmpty() ? new ArrayList<>() : new ArrayList<>(parsed.get(0));

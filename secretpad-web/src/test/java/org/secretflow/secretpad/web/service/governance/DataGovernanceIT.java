@@ -585,6 +585,17 @@ public class DataGovernanceIT {
         List<List<String>> rows = resultRows(findResultUri(task));
         assertTrue(String.valueOf(rows.get(0).get(2)).contains("***"));
 
+        // A processed result must not make the original local RAW asset unusable for a new policy.
+        Map<String, Object> secondPolicy = governance.createPolicy(Map.of(
+                "name", "手机号掩码策略-再次配置",
+                "policyType", "MASKING",
+                "sourceAssetId", "asset-gov-source",
+                "sourceNodeId", "alice",
+                "sourceDatatableId", SOURCE_DT,
+                "samplingParams", "{}",
+                "maskingColumns", "[]"));
+        assertEquals("MASKING", String.valueOf(secondPolicy.get("policy_type")));
+
         // 更新 + 软删
         governance.updatePolicy(Map.of(
                 "id", policyId,
