@@ -32,6 +32,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -470,6 +471,7 @@ public class DataGovernanceService {
 
     /** 结果数据集挂载项目（source=IMPORTED），复用 project_datatable 授权表。
      *  source 须为 IMPORTED，否则项目数据集树（仅按 IMPORTED 查询）不展示挂载结果。 */
+    @Transactional
     public Map<String, Object> mountResult(Map<String, Object> request) {
         String taskId = required(request, "taskId");
         String projectId = required(request, "projectId");
@@ -479,14 +481,23 @@ public class DataGovernanceService {
         }
         String nodeId = string(task.get("result_node_id"));
         String datatableId = string(task.get("result_datatable_id"));
+        Map<String, Object> resultAsset = dataAssetService.registerGovernedResult(taskId, nodeId, datatableId);
+        String assetId = string(resultAsset.get("id"));
+        try {
+            dataAssetService.attachGovernedResult(projectId, assetId);
+        } catch (IllegalStateException e) {
+            if ("结果已挂载到该项目".equals(e.getMessage())) {
+                throw new IllegalStateException(GOV_STATE_CONFLICT + ": " + e.getMessage(), e);
+            }
+            throw e;
+        }
         Long dup = count("select count(1) from project_datatable where project_id=? and node_id=? and datatable_id=? and is_deleted=0",
                 projectId, nodeId, datatableId);
-        if (dup > 0) {
-            throw new IllegalStateException(GOV_STATE_CONFLICT + ": 结果已挂载到该项目");
+        if (dup == 0) {
+            String tableConfigs = buildTableConfigs(nodeId, datatableId);
+            jdbc.update("insert into project_datatable(project_id,node_id,datatable_id,table_configs,source,is_deleted) values(?,?,?,?,?,0)",
+                    projectId, nodeId, datatableId, tableConfigs, "IMPORTED");
         }
-        String tableConfigs = buildTableConfigs(nodeId, datatableId);
-        jdbc.update("insert into project_datatable(project_id,node_id,datatable_id,table_configs,source,is_deleted) values(?,?,?,?,?,0)",
-                projectId, nodeId, datatableId, tableConfigs, "IMPORTED");
         audit("GOVERNANCE_RESULT_MOUNT", "GOVERNANCE_TASK", taskId, "project=" + projectId + " result=" + datatableId, true);
         dispatch("governance.result.mounted", Map.of("taskId", taskId, "projectId", projectId, "datatableId", datatableId));
         return taskDetail(taskId);

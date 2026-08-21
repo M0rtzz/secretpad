@@ -235,6 +235,31 @@ public class DataAssetService {
         return projectAssets(projectId);
     }
 
+    /** Attach a governed result to the unified project catalog. */
+    @Transactional
+    public void attachGovernedResult(String projectId, String assetId) {
+        requireProjectParticipant(projectId);
+        Map<String, Object> asset = require(assetId);
+        requireProvider(asset);
+        if (!"PROCESSED".equals(String.valueOf(asset.get("data_stage")))) {
+            throw new IllegalArgumentException("仅治理结果可以通过该接口挂载");
+        }
+        ProjectAssetDO.UPK upk = new ProjectAssetDO.UPK(projectId, assetId);
+        if (projectAssetRepository.existsById(upk)) {
+            throw new IllegalStateException("结果已挂载到该项目");
+        }
+        Map<String, Object> snapshot = new LinkedHashMap<>(asset);
+        snapshot.put("schema_columns", schemaColumns(asset));
+        projectAssetRepository.saveAndFlush(ProjectAssetDO.builder()
+                .upk(upk)
+                .providerNodeId(String.valueOf(asset.get("provider_node_id")))
+                .assetJson(json(snapshot))
+                .attachedBy(actor())
+                .attachedAt(beijingNow())
+                .expiresAt(String.valueOf(asset.getOrDefault("valid_until", "")))
+                .build());
+    }
+
     public Map<String, Object> preview(String id, int requestedLimit) {
         Map<String, Object> asset = requireVisible(id);
         int limit = Math.max(1, Math.min(requestedLimit, 100));

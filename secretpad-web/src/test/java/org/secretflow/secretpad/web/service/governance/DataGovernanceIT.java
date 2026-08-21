@@ -22,6 +22,7 @@ import org.secretflow.secretpad.kuscia.v1alpha1.mock.service.HealthService;
 import org.secretflow.secretpad.kuscia.v1alpha1.mock.service.JobService;
 import org.secretflow.secretpad.kuscia.v1alpha1.model.KusciaGrpcConfig;
 import org.secretflow.secretpad.web.SecretPadApplication;
+import org.secretflow.secretpad.web.service.DataAssetService;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 
 import io.grpc.stub.StreamObserver;
@@ -98,6 +99,9 @@ public class DataGovernanceIT {
     private DataGovernanceService governance;
 
     @Resource
+    private DataAssetService dataAssetService;
+
+    @Resource
     private DataSandboxMvpService mvp;
 
     @Resource
@@ -158,6 +162,7 @@ public class DataGovernanceIT {
         jdbc.update("delete from ds_governance_task");
         jdbc.update("delete from ds_governance_policy");
         jdbc.update("delete from project_datatable where project_id in ('p1','p2')");
+        jdbc.update("delete from ds_project_asset where project_id in ('p1','p2')");
         jdbc.update("delete from node where node_id in ('alice','carol','p2p-node')");
         jdbc.update("delete from ds_alert_event where source='GOVERNANCE'");
         jdbc.update("delete from ds_unified_log where resource_type='GOVERNANCE_POLICY' or resource_type='GOVERNANCE_TASK' or action like 'GOVERNANCE%'");
@@ -589,7 +594,13 @@ public class DataGovernanceIT {
         governance.mountResult(Map.of("taskId", taskId, "projectId", "p1"));
         assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? and source='IMPORTED' and is_deleted=0",
                 String.valueOf(task.get("result_datatable_id"))));
+        assertEquals(1L, count("select count(1) from ds_project_asset where project_id='p1' and asset_id=? and deleted=0",
+                String.valueOf(task.get("result_datatable_id"))));
+        assertTrue(dataAssetService.projectAssets("p1").stream().anyMatch(asset ->
+                String.valueOf(task.get("result_datatable_id")).equals(String.valueOf(asset.get("id")))));
         // 重复挂载冲突
         assertThrows(IllegalStateException.class, () -> governance.mountResult(Map.of("taskId", taskId, "projectId", "p1")));
+        assertEquals(1L, count("select count(1) from ds_project_asset where project_id='p1' and asset_id=? and deleted=0",
+                String.valueOf(task.get("result_datatable_id"))));
     }
 }
