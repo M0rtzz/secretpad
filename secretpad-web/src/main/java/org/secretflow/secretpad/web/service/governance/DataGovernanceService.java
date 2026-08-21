@@ -58,8 +58,8 @@ import java.util.UUID;
  * 内置执行全部在进程内完成（读 CSV → 抽样 → 脱敏 → 写结果 → 注册 Kuscia DomainData），
  * 输出只含策略允许的列；自定义代码执行（CUSTOM）由 {@link #submitCustomTask} 委托执行组件。</p>
  *
- * <p>权限前置校验 {@link #checkSourcePermission}：发起人可处理已授权到其项目的 {@code project_datatable}，
- * 或 {@code nodeId == user.ownerId} 的平台自有数据（经 node 表校验平台节点）。</p>
+ * <p>权限前置校验 {@link #checkSourcePermission}：抽样、脱敏和源数据预览仅允许处理当前节点
+ * 自己的源数据；项目共享的其他节点数据不能作为治理输入。</p>
  */
 @Slf4j
 @Service
@@ -127,39 +127,36 @@ public class DataGovernanceService {
 
     /* ============================== 权限 ============================== */
 
-    /**
-     * 源数据权限前置校验。已授权到用户任一项目，或 nodeId == ownerId 的平台自有数据（平台节点存在）。
-     */
+    /** 源数据权限前置校验：抽样与脱敏只能处理当前节点自己的源数据。 */
     public void checkSourcePermission(UserContextDTO user, String nodeId, String datatableId) {
-        if (user == null || !notBlank(user.getOwnerId())) {
+        if (user == null || !notBlank(nodeId) || !notBlank(datatableId)) {
             throw noPermission();
         }
-        if (dataAssetService.processingTable(nodeId, datatableId).isPresent()) {
-            return;
-        }
-        // 平台自有数据：nodeId 即用户平台节点（EDGE 模式 nodeId == ownerId，
-        // P2P 模式 nodeId == user.ownerId 即用户所属 kuscia 域，无 node 行也放行）；
-        // 或节点属于用户所在机构（P2P 模式 node.instId == user.ownerId，如 dev-zgz/ctqkgaov）
+        String currentNodeId = notBlank(user.getPlatformNodeId()) ? user.getPlatformNodeId() : user.getOwnerId();
         NodeDO node = nodeRepository.findByNodeId(nodeId);
-        if (nodeId.equals(user.getOwnerId()) || (node != null && user.getOwnerId().equals(node.getInstId()))) {
-            return;
-        }
-        Set<String> projectIds = user.getProjectIds();
-        if (projectIds != null && !projectIds.isEmpty()) {
-            for (String projectId : projectIds) {
-                Long count = jdbc.queryForObject(
-                        "select count(1) from project_datatable where project_id=? and node_id=? and datatable_id=? and is_deleted=0",
-                        Long.class, projectId, nodeId, datatableId);
-                if (count != null && count > 0) {
-                    return;
-                }
+        if (nodeId.equals(currentNodeId)
+                || nodeId.equals(user.getOwnerId())
+                || (node != null && user.getOwnerId().equals(node.getInstId()))) {
+            Long processed = count("select count(1) from ds_data_asset where provider_node_id=? and datatable_id=? and data_stage<>'RAW' and deleted=0",
+                    nodeId, datatableId);
+            if (processed > 0) {
+                throw new IllegalArgumentException(GOV_NO_PERMISSION + ": 只能处理本节点源数据");
             }
+            return;
         }
         throw noPermission();
     }
 
     private IllegalArgumentException noPermission() {
         return new IllegalArgumentException(GOV_NO_PERMISSION + ": 无权访问该数据表");
+    }
+
+    private void requireRawSourceAsset(String assetId, String nodeId, String datatableId) {
+        Long matches = count("select count(1) from ds_data_asset where id=? and provider_node_id=? and data_stage='RAW' and deleted=0 and (datatable_id=? or (coalesce(datatable_id,'')='' and id=?))",
+                assetId, nodeId, datatableId, datatableId);
+        if (matches == 0) {
+            throw new IllegalArgumentException(GOV_NO_PERMISSION + ": 只能选择本节点源数据作为策略参考");
+        }
     }
 
     /* ============================== 策略 ============================== */
@@ -176,6 +173,11 @@ public class DataGovernanceService {
         }
         String samplingParams = jsonOr(request.get("samplingParams"), "{}");
         String maskingColumns = jsonOr(request.get("maskingColumns"), "[]");
+        String sourceAssetId = required(request, "sourceAssetId");
+        String sourceNodeId = required(request, "sourceNodeId");
+        String sourceDatatableId = required(request, "sourceDatatableId");
+        checkSourcePermission(currentUser(), sourceNodeId, sourceDatatableId);
+        requireRawSourceAsset(sourceAssetId, sourceNodeId, sourceDatatableId);
         Long dup = count("select count(1) from ds_governance_policy where name=? and deleted=0", name);
         if (dup > 0) {
             throw new IllegalArgumentException(GOV_STATE_CONFLICT + ": 策略名称已存在: " + name);
@@ -183,10 +185,11 @@ public class DataGovernanceService {
         String id = "gp-" + shortId();
         String createdBy = actor();
         String now = now();
-        jdbc.update("insert into ds_governance_policy(id,name,description,policy_type,sampling_method,sampling_params,masking_columns,created_by,created_at,updated_at,deleted)"
-                        + " values(?,?,?,?,?,?,?,?,?,?,0)",
+        jdbc.update("insert into ds_governance_policy(id,name,description,policy_type,sampling_method,sampling_params,masking_columns,source_asset_id,source_node_id,source_datatable_id,created_by,created_at,updated_at,deleted)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 id, name, string(request.get("description")), policyType, samplingMethod,
-                samplingParams, maskingColumns, createdBy, now, now);
+                samplingParams, maskingColumns, sourceAssetId, sourceNodeId, sourceDatatableId,
+                createdBy, now, now);
         audit("GOVERNANCE_POLICY_CREATE", "GOVERNANCE_POLICY", id, "type=" + policyType, true);
         dispatch("governance.policy.created", Map.of("id", id, "name", name));
         return policyDetail(id);
@@ -196,15 +199,24 @@ public class DataGovernanceService {
         String id = required(request, "id");
         Map<String, Object> policy = requirePolicy(id);
         requireCreator(policy, "策略");
+        String policyType = value(request, "policyType", string(policy.get("policy_type"))).trim().toUpperCase(Locale.ROOT);
+        if (!POLICY_TYPES.contains(policyType)) {
+            throw new IllegalArgumentException(GOV_PARAM_INVALID + ": policyType 必须是 SAMPLING/MASKING/SAMPLING_MASKING");
+        }
         String samplingMethod = value(request, "samplingMethod", string(policy.get("sampling_method")));
         if (notBlank(samplingMethod)) {
             GovernanceSamplingMethod.from(samplingMethod);
         }
         String samplingParams = jsonOr(request.get("samplingParams"), string(policy.get("sampling_params")));
         String maskingColumns = jsonOr(request.get("maskingColumns"), string(policy.get("masking_columns")));
-        jdbc.update("update ds_governance_policy set description=?,sampling_method=?,sampling_params=?,masking_columns=?,updated_at=? where id=? and deleted=0",
-                value(request, "description", string(policy.get("description"))), samplingMethod, samplingParams,
-                maskingColumns, now(), id);
+        String sourceAssetId = required(request, "sourceAssetId");
+        String sourceNodeId = required(request, "sourceNodeId");
+        String sourceDatatableId = required(request, "sourceDatatableId");
+        checkSourcePermission(currentUser(), sourceNodeId, sourceDatatableId);
+        requireRawSourceAsset(sourceAssetId, sourceNodeId, sourceDatatableId);
+        jdbc.update("update ds_governance_policy set description=?,policy_type=?,sampling_method=?,sampling_params=?,masking_columns=?,source_asset_id=?,source_node_id=?,source_datatable_id=?,updated_at=? where id=? and deleted=0",
+                value(request, "description", string(policy.get("description"))), policyType, samplingMethod, samplingParams,
+                maskingColumns, sourceAssetId, sourceNodeId, sourceDatatableId, now(), id);
         audit("GOVERNANCE_POLICY_UPDATE", "GOVERNANCE_POLICY", id, "", true);
         dispatch("governance.policy.updated", Map.of("id", id));
         return policyDetail(id);
@@ -267,8 +279,10 @@ public class DataGovernanceService {
     public Map<String, Object> submitCustomTask(Map<String, Object> request) {
         String nodeId = required(request, "nodeId");
         String datatableId = required(request, "datatableId");
+        String sourceAssetId = string(request.get("sourceAssetId"));
         String script = required(request, "script");
         checkSourcePermission(currentUser(), nodeId, datatableId);
+        if (notBlank(sourceAssetId)) requireRawSourceAsset(sourceAssetId, nodeId, datatableId);
 
         DatatableDTO source = resolveSource(nodeId, datatableId);
         String relativeUri = source.getRelativeUri();
@@ -321,7 +335,9 @@ public class DataGovernanceService {
     public Map<String, Object> submitBuiltinTask(Map<String, Object> request) {
         String nodeId = required(request, "nodeId");
         String datatableId = required(request, "datatableId");
+        String sourceAssetId = string(request.get("sourceAssetId"));
         checkSourcePermission(currentUser(), nodeId, datatableId);
+        if (notBlank(sourceAssetId)) requireRawSourceAsset(sourceAssetId, nodeId, datatableId);
 
         DatatableDTO source = resolveSource(nodeId, datatableId);
         String relativeUri = source.getRelativeUri();

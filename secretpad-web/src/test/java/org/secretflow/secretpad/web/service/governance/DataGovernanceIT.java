@@ -161,6 +161,7 @@ public class DataGovernanceIT {
         jdbc.update("delete from ds_governance_lineage");
         jdbc.update("delete from ds_governance_task");
         jdbc.update("delete from ds_governance_policy");
+        jdbc.update("delete from ds_data_asset where id='asset-gov-source'");
         jdbc.update("delete from project_datatable where project_id in ('p1','p2')");
         jdbc.update("delete from ds_project_asset where project_id in ('p1','p2')");
         jdbc.update("delete from node where node_id in ('alice','carol','p2p-node')");
@@ -178,6 +179,7 @@ public class DataGovernanceIT {
         jdbc.update("insert into node(node_id,name,control_node_id,type,mode) values('alice','alice-node','master','normal',0)");
         jdbc.update("insert into node(node_id,name,control_node_id,type,mode) values('carol','carol-node','master','normal',0)");
         jdbc.update("insert into project_datatable(project_id,node_id,datatable_id,table_configs,source,is_deleted) values('p1','alice','" + SOURCE_DT + "','[]','IMPORTED',0)");
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,ingestion_type,modality,data_stage,datatable_id,created_by,created_at,updated_at,status,deleted) values('asset-gov-source','sample','alice','UPLOAD','TABULAR','RAW',?,'alice','2026-01-01','2026-01-01','ACTIVE',0)", SOURCE_DT);
         UserContext.setBaseUser(alice());
     }
 
@@ -565,6 +567,9 @@ public class DataGovernanceIT {
         Map<String, Object> policy = governance.createPolicy(Map.of(
                 "name", "手机号掩码策略",
                 "policyType", "MASKING",
+                "sourceAssetId", "asset-gov-source",
+                "sourceNodeId", "alice",
+                "sourceDatatableId", SOURCE_DT,
                 "samplingParams", "{}",
                 "maskingColumns", "[{\"column\":\"phone\",\"method\":\"MASK\",\"params\":{\"keepLeft\":\"3\",\"keepRight\":\"4\"}}]"));
         String policyId = String.valueOf(policy.get("id"));
@@ -581,7 +586,12 @@ public class DataGovernanceIT {
         assertTrue(String.valueOf(rows.get(0).get(2)).contains("***"));
 
         // 更新 + 软删
-        governance.updatePolicy(Map.of("id", policyId, "description", "updated"));
+        governance.updatePolicy(Map.of(
+                "id", policyId,
+                "description", "updated",
+                "sourceAssetId", "asset-gov-source",
+                "sourceNodeId", "alice",
+                "sourceDatatableId", SOURCE_DT));
         governance.deletePolicy(policyId);
         assertThrows(IllegalArgumentException.class, () -> governance.policyDetail(policyId));
     }
