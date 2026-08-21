@@ -33,6 +33,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -501,6 +502,10 @@ public class SandboxApprovalService {
             if (!delError.isEmpty()) {
                 throw new IllegalStateException("删除旧任务失败: " + delError);
             }
+            String waitError = service.waitForKusciaJobDeletion(oldJob, Duration.ofSeconds(5));
+            if (!waitError.isEmpty()) {
+                throw new IllegalStateException("旧任务删除未完成: " + waitError);
+            }
         }
         // 2) 落新规格 + 清空 job/endpoint/状态（job id 已清 → startKuscia 走 createJob 新规格）
         jdbc.update("update ds_sandbox set cpu_cores=?,memory_gb=?,gpu_count=?,storage_gb=?,kuscia_job_id='',endpoint='',kuscia_job_state='',status='STARTING',intent='START',last_error='',updated_at=? where id=?",
@@ -600,10 +605,13 @@ public class SandboxApprovalService {
         String sandboxId = string(sandbox.get("id"));
         if (!notBlank(sandboxId) || "DESTROYED".equals(string(sandbox.get("status")))) throw new IllegalStateException("沙箱不可变更");
         if (notBlank(string(sandbox.get("kuscia_job_id")))) {
+            String oldJob = string(sandbox.get("kuscia_job_id"));
             String stopError = service.stopKuscia(sandbox, reason);
             if (!stopError.isEmpty()) throw new IllegalStateException("停止旧任务失败: " + stopError);
             String deleteError = service.deleteKuscia(sandbox);
             if (!deleteError.isEmpty()) throw new IllegalStateException("删除旧任务失败: " + deleteError);
+            String waitError = service.waitForKusciaJobDeletion(oldJob, Duration.ofSeconds(5));
+            if (!waitError.isEmpty()) throw new IllegalStateException("旧任务删除未完成: " + waitError);
         }
         mutation.run();
         jdbc.update("update ds_sandbox set kuscia_job_id='',endpoint='',kuscia_job_state='',status='STARTING',intent='START',last_error='',updated_at=? where id=?", now(), sandboxId);

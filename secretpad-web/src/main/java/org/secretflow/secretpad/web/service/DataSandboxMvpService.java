@@ -190,7 +190,10 @@ public class DataSandboxMvpService {
                 if ("EXPIRED".equals(status) || "DESTROYED".equals(status)) {
                     throw new IllegalStateException("已过期或销毁的沙箱不能启动");
                 }
-                if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.START)) {
+                // STARTING 可能是上次启动请求在状态同步前留下的中间态；启动操作本身幂等，
+                // 允许再次触发已有 Kuscia Job 的 restart，或补建缺失的 Job。
+                if (!"STARTING".equals(status)
+                        && !SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.START)) {
                     throw new IllegalStateException("当前状态不允许启动: " + status);
                 }
                 // 先落库启动意图（STARTING + intent=START）再请求 Kuscia 创建真实 Job；
@@ -1322,6 +1325,34 @@ public class DataSandboxMvpService {
         } catch (Exception e) {
             return truncate(e.getMessage(), 900);
         }
+    }
+
+    /**
+     * Wait until Kuscia has finished deleting a job.
+     *
+     * <p>DeleteJob returning success only means that the API request was accepted. The
+     * KusciaJob and its task resources are removed asynchronously. Creating another job with
+     * the same deterministic ID before that cleanup finishes can resurrect stale task status
+     * and leave the new task pending without a pod. Call this before recreating a job.</p>
+     */
+    public String waitForKusciaJobDeletion(String jobId, Duration timeout) {
+        if (!kusciaEnabled || !notBlank(jobId)) return "";
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            try {
+                var response = kuscia.queryJob(Job.QueryJobRequest.newBuilder().setJobId(jobId).build());
+                if (response.getStatus().getCode() != 0) return "";
+            } catch (Exception e) {
+                return truncate(e.getMessage(), 900);
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "等待 Kuscia Job 删除被中断: " + jobId;
+            }
+        }
+        return "等待 Kuscia Job 删除超时: " + jobId;
     }
 
     private void createSnapshot(Map<String, Object> sandbox) {

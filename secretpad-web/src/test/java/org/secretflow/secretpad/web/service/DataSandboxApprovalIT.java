@@ -436,7 +436,11 @@ public class DataSandboxApprovalIT {
         String id = String.valueOf(approvalService.submit(payload).get("id"));
         approveStage1(id);
         approveStage2(id);
+        // DeleteJob is asynchronous in Kuscia; the mock reports the old job as gone so the
+        // executor must wait for deletion before creating the replacement job.
+        JobService.State.jobQueryCode = FAIL_CODE;
         approvalService.executeApprovals();
+        JobService.State.jobQueryCode = KusciaAPIConstants.OK;
 
         assertEquals("COMPLETED", approvalStatus(id));
         Map<String, Object> sbx = jdbc.queryForMap("select cpu_cores,memory_gb,gpu_count,storage_gb,kuscia_job_id,alloc_state from ds_sandbox where id=?", sandboxId);
