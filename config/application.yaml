@@ -97,6 +97,7 @@ flyway:
     locations:
       - filesystem:./config/schema/center
     baseline-on-migrate: true
+    out-of-order: true
     encoding: UTF-8
   quartz:
     baseline-on-migrate: true

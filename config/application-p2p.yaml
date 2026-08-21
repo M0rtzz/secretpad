@@ -2,6 +2,7 @@ flyway:
   default:
     locations:
       - filesystem:./config/schema/p2p
+    out-of-order: true
 
 secretpad:
   deploy-mode: ${DEPLOY_MODE:MPC} # MPC TEE ALL-IN-ONE

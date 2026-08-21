@@ -46,6 +46,7 @@ public class FlywayConfig {
                 .dataSource(dataSource)
                 .locations(flywayProperties.getLocations().toArray(new String[0]))
                 .baselineOnMigrate(true)
+                .outOfOrder(flywayProperties.isOutOfOrder())
                 .load();
         flyway.migrate();
         return flyway;
@@ -64,6 +65,7 @@ public class FlywayConfig {
                 .dataSource(dataSource)
                 .locations(flywayProperties.getLocations().toArray(new String[0]))
                 .baselineOnMigrate(true)
+                .outOfOrder(flywayProperties.isOutOfOrder())
                 .load();
         flyway.migrate();
         return flyway;
