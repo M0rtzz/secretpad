@@ -46,7 +46,6 @@ public class SandboxApprovalSyncDO extends BaseAggregationRoot<SandboxApprovalSy
     private String snapshotJson;
 
     @Override
-    @JsonIgnore
     public String getProjectId() {
         return projectId;
     }
