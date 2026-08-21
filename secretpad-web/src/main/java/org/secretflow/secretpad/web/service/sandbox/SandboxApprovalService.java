@@ -134,7 +134,57 @@ public class SandboxApprovalService {
         assertApprovalVisible(data);
         data.put("history", approvalHistory(id));
         data.put("votes", jdbc.queryForList("select * from ds_sandbox_approval_vote where approval_id=? order by voter_node_id", id));
+        if ("ASSET_DELETE".equals(String.valueOf(data.get("approval_type")))) {
+            data.put("asset_detail", assetDeletionDetail(data));
+        }
         return data;
+    }
+
+    /** Enrich data deletion approvals with the catalog metadata users need to review. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> assetDeletionDetail(Map<String, Object> approval) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        try {
+            Object raw = approval.get("payload_json");
+            if (raw != null && !String.valueOf(raw).isBlank()) {
+                payload.putAll(objectMapper.readValue(String.valueOf(raw), Map.class));
+            }
+        } catch (Exception ignored) {
+            // Keep the approval visible even when a legacy payload is malformed.
+        }
+        String assetId = string(payload.get("assetId"));
+        detail.put("asset_id", assetId);
+        detail.put("name", string(payload.get("assetName")));
+        detail.put("provider_node_id", "");
+        detail.put("provider_node_name", "");
+        detail.put("uploaded_at", "");
+        detail.put("data_stage", "");
+        detail.put("project_shared", false);
+        detail.put("projects", List.of());
+        if (assetId.isBlank()) return detail;
+
+        List<Map<String, Object>> assets = jdbc.queryForList(
+                "select a.name,a.provider_node_id,a.created_at,a.data_stage,n.name provider_node_name "
+                        + "from ds_data_asset a left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) "
+                        + "and n.is_deleted=0 where a.id=? and a.deleted=0", assetId);
+        if (!assets.isEmpty()) {
+            Map<String, Object> asset = assets.get(0);
+            detail.put("name", string(asset.get("name")));
+            detail.put("provider_node_id", string(asset.get("provider_node_id")));
+            detail.put("provider_node_name", string(asset.get("provider_node_name")));
+            detail.put("uploaded_at", string(asset.get("created_at")));
+            detail.put("data_stage", string(asset.get("data_stage")));
+        }
+        List<Map<String, Object>> projects = jdbc.queryForList(
+                "select distinct p.project_id,p.name from project p join ("
+                        + "select project_id from ds_project_asset where asset_id=? and deleted=0 "
+                        + "union select project_id from project_datatable where datatable_id=(select datatable_id from ds_data_asset where id=?) and is_deleted=0"
+                        + ") mounted on mounted.project_id=p.project_id where p.is_deleted=0 order by p.name,p.project_id",
+                assetId, assetId);
+        detail.put("projects", projects);
+        detail.put("project_shared", !projects.isEmpty());
+        return detail;
     }
 
     public List<Map<String, Object>> approvalHistory(String id) {
