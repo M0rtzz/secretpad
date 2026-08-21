@@ -98,9 +98,15 @@ flyway:
       - filesystem:./config/schema/center
     baseline-on-migrate: true
     out-of-order: true
+    validate-on-migrate: false
+    ignore-migration-patterns:
+      - '*:missing'
     encoding: UTF-8
   quartz:
     baseline-on-migrate: true
+    validate-on-migrate: false
+    ignore-migration-patterns:
+      - '*:missing'
     encoding: UTF-8
     locations:
       - filesystem:./config/schema/quartz
