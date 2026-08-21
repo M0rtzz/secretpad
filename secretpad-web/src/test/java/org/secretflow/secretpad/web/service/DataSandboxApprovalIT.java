@@ -543,4 +543,29 @@ public class DataSandboxApprovalIT {
         assertEquals(1L, count("select is_deleted from ds_project_asset where project_id='p1' and asset_id=?", assetId));
         assertEquals(1L, count("select is_deleted from project_datatable where project_id='p1' and datatable_id=?", assetId));
     }
+
+    /** 数据目录应展示挂载项目；其他项目节点查看时应标记为项目共享数据。 */
+    @Test
+    public void catalogShowsMountedProjectsAndSharedStatus() {
+        String assetId = "asset-delete-it-catalog";
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','RAW','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                assetId, "共享目录数据", "alice", "alice", "FILE", assetId, "alice",
+                LocalDateTime.now().toString(), LocalDateTime.now().toString());
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p1',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                assetId, "alice");
+
+        Map<String, Object> owned = dataAssetService.catalog("").stream()
+                .filter(asset -> assetId.equals(asset.get("id"))).findFirst().orElseThrow();
+        assertEquals(false, owned.get("project_shared"));
+        assertEquals(1, owned.get("mounted_project_count"));
+        assertEquals("Approval IT", ((List<?>) owned.get("mounted_projects")).stream()
+                .map(project -> ((Map<?, ?>) project).get("name")).findFirst().orElseThrow());
+
+        UserContext.setBaseUser(carol());
+        List<Map<String, Object>> sharedRows = dataAssetService.catalog("").stream()
+                .filter(asset -> assetId.equals(asset.get("id"))).toList();
+        assertEquals(1, sharedRows.size(), "同一共享数据在目录中只能出现一次");
+        assertEquals(true, sharedRows.get(0).get("project_shared"));
+        assertEquals(1, sharedRows.get(0).get("mounted_project_count"));
+    }
 }

@@ -133,14 +133,18 @@ public class DataAssetService {
         String legacyOwner = legacyOwner();
         String q = keyword == null ? "" : keyword.trim().toLowerCase(Locale.ROOT);
         List<Object> args = new ArrayList<>(List.of(owner, legacyOwner, owner, owner));
-        StringBuilder sql = new StringBuilder("select distinct a.*,n.name provider_node_name,c.valid_from control_valid_from,c.valid_until control_valid_until,c.allow_export,c.access_start,c.access_end from ds_data_asset a left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 left join ds_asset_usage_control c on c.asset_id=a.id where a.deleted=0 and (a.provider_node_id in (?,?) or exists (select 1 from project_datatable pd join project_node pn on pn.project_id=pd.project_id and pn.node_id=? and pn.is_deleted=0 where pd.datatable_id=a.datatable_id and pd.is_deleted=0) or exists (select 1 from ds_project_asset pa join project_node pn2 on pn2.project_id=pa.project_id and pn2.node_id=? and pn2.is_deleted=0 where pa.asset_id=a.id and pa.deleted=0))");
+        StringBuilder sql = new StringBuilder("select distinct a.*,n.name provider_node_name,c.valid_from control_valid_from,c.valid_until control_valid_until,c.allow_export,c.access_start,c.access_end from ds_data_asset a left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 left join ds_asset_usage_control c on c.asset_id=a.id where a.deleted=0 and (a.provider_node_id in (?,?) or exists (select 1 from project_datatable pd join project_node pn on pn.project_id=pd.project_id and pn.node_id=? and pn.is_deleted=0 where pd.datatable_id=a.datatable_id and pd.is_deleted=0) or exists (select 1 from ds_project_asset pa join project_node pn2 on pn2.project_id=pa.project_id and pn2.node_id=? and pn2.is_deleted=0 where pa.asset_id=a.id and pa.deleted=0 and coalesce(pa.is_deleted,0)=0))");
         if (!q.isEmpty()) {
             sql.append(" and (lower(a.name) like ? or lower(a.id) like ?)");
             args.add("%" + q + "%"); args.add("%" + q + "%");
         }
         sql.append(" order by a.created_at desc");
         List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
-        rows.forEach(asset -> asset.put("owned", matchesOwner(String.valueOf(asset.get("provider_node_id")))));
+        Set<String> catalogAssetIds = new HashSet<>();
+        rows.forEach(asset -> {
+            asset.put("owned", matchesOwner(String.valueOf(asset.get("provider_node_id"))));
+            catalogAssetIds.add(String.valueOf(asset.get("id")));
+        });
         List<Map<String, Object>> shared = jdbc.queryForList(
                 "select pa.*,n.name provider_node_name from ds_project_asset pa "
                         + "join project_node pn on pn.project_id=pa.project_id and pn.node_id=? and pn.is_deleted=0 "
@@ -153,13 +157,35 @@ public class DataAssetService {
             if (asset.isEmpty()) continue;
             if (!q.isEmpty() && !String.valueOf(asset.getOrDefault("name", "")).toLowerCase(Locale.ROOT).contains(q)
                     && !String.valueOf(asset.getOrDefault("id", "")).toLowerCase(Locale.ROOT).contains(q)) continue;
+            if (!catalogAssetIds.add(String.valueOf(asset.get("id")))) continue;
             asset.put("provider_node_id", attachment.get("provider_node_id"));
             asset.put("provider_node_name", attachment.get("provider_node_name"));
-            asset.put("attached_project_id", attachment.get("project_id"));
             asset.put("owned", false);
             rows.add(asset);
         }
+        rows.forEach(this::decorateCatalogAsset);
         return rows;
+    }
+
+    /** Add project mount details without exposing unrelated projects for shared assets. */
+    private void decorateCatalogAsset(Map<String, Object> asset) {
+        boolean owned = Boolean.TRUE.equals(asset.get("owned"));
+        StringBuilder sql = new StringBuilder(
+                "select distinct p.project_id,p.name from project p join ("
+                        + "select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 "
+                        + "union select project_id from project_datatable where datatable_id=? and is_deleted=0"
+                        + ") mounted on mounted.project_id=p.project_id where p.is_deleted=0");
+        List<Object> args = new ArrayList<>(List.of(asset.get("id"), asset.getOrDefault("datatable_id", "")));
+        if (!owned) {
+            sql.append(" and exists (select 1 from project_node pn where pn.project_id=p.project_id and pn.node_id in (?,?) and pn.is_deleted=0)");
+            args.add(owner());
+            args.add(legacyOwner());
+        }
+        sql.append(" order by p.name,p.project_id");
+        List<Map<String, Object>> projects = jdbc.queryForList(sql.toString(), args.toArray());
+        asset.put("mounted_projects", projects);
+        asset.put("mounted_project_count", projects.size());
+        asset.put("project_shared", !owned && !projects.isEmpty());
     }
 
     public Map<String, Object> detail(String id) {
