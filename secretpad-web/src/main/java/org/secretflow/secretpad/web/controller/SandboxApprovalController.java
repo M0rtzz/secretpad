@@ -57,7 +57,7 @@ public class SandboxApprovalController {
         return SecretPadResponse.success(service.approval(id));
     }
 
-    @Operation(summary = "提交申请单（CREATE/RENEW/SPEC_CHANGE/RECYCLE）")
+    @Operation(summary = "提交沙箱申请单（数据删除申请须从数据目录发起）")
     @PostMapping("/submit")
     public SecretPadResponse<Map<String, Object>> submit(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.submit(request));

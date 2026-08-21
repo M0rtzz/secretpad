@@ -66,7 +66,7 @@ public class DataAssetController {
     @PostMapping("/projects/attach") public SecretPadResponse<List<Map<String,Object>>> attachProjectAssets(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.attachProjectAssets(r));}
     @GetMapping("/sandboxes/mounts") public SecretPadResponse<List<Map<String,Object>>> sandboxMounts(@RequestParam String sandboxId){return SecretPadResponse.success(service.sandboxMounts(sandboxId));}
     @GetMapping("/preview") public SecretPadResponse<Map<String,Object>> preview(@RequestParam String id,@RequestParam(defaultValue="5") int limit){return SecretPadResponse.success(service.preview(id,limit));}
-    @PostMapping("/delete") public SecretPadResponse<Void> delete(@RequestBody Map<String,Object> r){service.delete(String.valueOf(r.get("id")));return SecretPadResponse.success();}
+    @PostMapping("/delete") public SecretPadResponse<Map<String,Object>> delete(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.delete(String.valueOf(r.get("id"))));}
     @GetMapping("/usage-controls/requests") public SecretPadResponse<List<Map<String,Object>>> requests(){return SecretPadResponse.success(service.usageRequests());}
     @PostMapping("/usage-controls/save") public SecretPadResponse<Map<String,Object>> save(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.saveUsage(r));}
     @PostMapping("/usage-controls/review") public SecretPadResponse<Map<String,Object>> review(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.reviewUsage(r));}

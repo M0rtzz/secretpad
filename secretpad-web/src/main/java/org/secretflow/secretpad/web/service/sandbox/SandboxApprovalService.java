@@ -15,6 +15,10 @@ import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.persistence.entity.SandboxApprovalSyncDO;
+import org.secretflow.secretpad.persistence.entity.ProjectAssetDO;
+import org.secretflow.secretpad.persistence.entity.ProjectDatatableDO;
+import org.secretflow.secretpad.persistence.repository.ProjectAssetRepository;
+import org.secretflow.secretpad.persistence.repository.ProjectDatatableRepository;
 import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
@@ -55,7 +59,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class SandboxApprovalService {
 
-    private static final Set<String> APPROVAL_TYPES = Set.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE");
+    private static final Set<String> APPROVAL_TYPES = Set.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE", "ASSET_DELETE");
     private static final Set<String> APPROVAL_ACTIONS = Set.of("APPROVE", "REJECT", "RESUBMIT", "RETRY", "CANCEL");
     private static final Set<String> NETWORK_POLICIES = Set.of("INTERNAL_ONLY", "ALLOW_LIST", "NO_NETWORK");
     private static final Set<String> OPEN_STATUSES = Set.of("DATA_PROVIDER_REVIEW", "OPERATOR_REVIEW", "APPROVED", "EXECUTING");
@@ -66,6 +70,8 @@ public class SandboxApprovalService {
     private final SandboxApprovalGate gate;
     private final MinioAssetStorage assetStorage;
     private final SandboxApprovalSyncRepository approvalSyncRepository;
+    private final ProjectAssetRepository projectAssetRepository;
+    private final ProjectDatatableRepository projectDatatableRepository;
     private final Map<String, Integer> appliedSnapshotHashes = new ConcurrentHashMap<>();
 
     @Value("${secretpad.node-id:kuscia-system}")
@@ -80,13 +86,17 @@ public class SandboxApprovalService {
             DataSandboxMvpService service,
             SandboxApprovalGate gate,
             MinioAssetStorage assetStorage,
-            SandboxApprovalSyncRepository approvalSyncRepository) {
+            SandboxApprovalSyncRepository approvalSyncRepository,
+            ProjectAssetRepository projectAssetRepository,
+            ProjectDatatableRepository projectDatatableRepository) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.service = service;
         this.gate = gate;
         this.assetStorage = assetStorage;
         this.approvalSyncRepository = approvalSyncRepository;
+        this.projectAssetRepository = projectAssetRepository;
+        this.projectDatatableRepository = projectDatatableRepository;
     }
 
     /* ------------------------------- 申请单查询 ------------------------------- */
@@ -135,7 +145,7 @@ public class SandboxApprovalService {
     /** 门禁与重试配置，供前端感知 required 状态。 */
     public Map<String, Object> approvalConfig() {
         return Map.of("required", gate.isApprovalRequired(),
-                "types", List.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE"),
+                "types", List.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE", "ASSET_DELETE"),
                 "maxRetries", maxRetries);
     }
 
@@ -150,6 +160,9 @@ public class SandboxApprovalService {
         String type = required(request, "approvalType").toUpperCase(Locale.ROOT);
         if (!APPROVAL_TYPES.contains(type)) {
             throw new IllegalArgumentException("不支持的申请类型: " + type);
+        }
+        if ("ASSET_DELETE".equals(type)) {
+            throw new IllegalArgumentException("数据删除申请必须从数据目录发起");
         }
         String sandboxId = "CREATE".equals(type) ? "" : required(request, "sandboxId");
         String applicantNodeId = gate.effectiveOwner();
@@ -195,6 +208,41 @@ public class SandboxApprovalService {
                 Map.of("approvalId", id, "approvalType", type, "ownerId", ownerId, "sandboxId", sandboxId));
         publishSnapshot(id);
         return approval(id);
+    }
+
+    /** Create one synchronized unanimous-consent request for every project using an asset. */
+    @Transactional
+    public List<String> submitAssetDeletion(String assetId, String assetName, List<String> projectIds) {
+        String applicantNodeId = gate.effectiveOwner();
+        if (count("select count(1) from ds_sandbox_approval where approval_type='ASSET_DELETE' and sandbox_id=? and status in ('DATA_PROVIDER_REVIEW','APPROVED','EXECUTING') and deleted=0", assetId) > 0) {
+            throw new IllegalStateException("该数据已有删除申请正在审批中");
+        }
+        List<String> approvals = new ArrayList<>();
+        String submittedAt = now();
+        for (String projectId : projectIds.stream().distinct().sorted().toList()) {
+            requireProjectMembership(projectId, applicantNodeId);
+            String id = "apr-" + shortId();
+            List<String> voters = projectVoters(projectId, applicantNodeId);
+            String initialStatus = voters.isEmpty() ? "APPROVED" : "DATA_PROVIDER_REVIEW";
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("approvalType", "ASSET_DELETE");
+            payload.put("assetId", assetId);
+            payload.put("assetName", assetName);
+            payload.put("projectId", projectId);
+            payload.put("reason", "删除已挂载到项目的数据");
+            jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,approved_at,created_at,updated_at,deleted,project_id,applicant_node_id,project_snapshot_at) "
+                            + "values(?,'ASSET_DELETE',?,?,?,?,?,?,1,'','','','',0,?,?,?,?,0,?,?,?)",
+                    id, assetId, applicantNodeId, operator(), json(payload), initialStatus, initialStatus,
+                    submittedAt, voters.isEmpty() ? submittedAt : "", submittedAt, submittedAt, projectId,
+                    applicantNodeId, projectSnapshot(projectId));
+            voters.forEach(voter -> jdbc.update("insert into ds_sandbox_approval_vote(approval_id,voter_node_id,status,voter,comment,voted_at) values(?,?,'PENDING','','','')", id, voter));
+            history(id, "SUBMIT", "", initialStatus, "删除数据 " + assetName);
+            service.audit("AUDIT", "ASSET_DELETE_SUBMIT", "DATA_ASSET", assetId,
+                    "project=" + projectId + " approval=" + id, true);
+            publishSnapshot(id);
+            approvals.add(id);
+        }
+        return approvals;
     }
 
     /* ------------------------------- 审批动作 ------------------------------- */
@@ -299,6 +347,7 @@ public class SandboxApprovalService {
                 case "DATA_CHANGE" -> execDataChange(approval);
                 case "CONFIG_CHANGE" -> execConfigChange(approval);
                 case "RECYCLE" -> execRecycle(approval);
+                case "ASSET_DELETE" -> execAssetDelete(approval);
                 default -> throw new IllegalStateException("未知申请类型: " + type);
             }
             complete(id);
@@ -509,6 +558,43 @@ public class SandboxApprovalService {
         }
         if (!NETWORK_POLICIES.contains(networkPolicy)) throw new IllegalArgumentException("不支持的网络策略: " + networkPolicy);
         recreateSandboxJob(sbx, () -> jdbc.update("update ds_sandbox set image_id=?,network_policy=?,updated_at=? where id=?", imageId, networkPolicy, now(), sandboxId), "CONFIG_CHANGE");
+    }
+
+    /** Delete only after every referenced project's request has reached unanimous approval. */
+    private void execAssetDelete(Map<String, Object> approval) {
+        String assetId = string(approval.get("sandbox_id"));
+        long blockers = count("select count(1) from ds_sandbox_approval where approval_type='ASSET_DELETE' and sandbox_id=? and submitted_at=? and deleted=0 and status not in ('APPROVED','EXECUTING','COMPLETED')",
+                assetId, approval.get("submitted_at"));
+        if (blockers > 0) return;
+        List<Map<String, Object>> assets = jdbc.queryForList("select * from ds_data_asset where id=? and deleted=0", assetId);
+        if (assets.isEmpty()) return;
+        Map<String, Object> asset = assets.get(0);
+        String datatableId = string(asset.get("datatable_id"));
+        Long children = jdbc.queryForObject("select count(1) from ds_data_asset where source_asset_id=? and deleted=0", Long.class, assetId);
+        Long mounts = jdbc.queryForObject("select count(1) from ds_sandbox_dataset_mount where asset_id=? and deleted=0", Long.class, assetId);
+        if (children != null && children > 0) throw new IllegalStateException("数据仍被衍生资产引用，不能删除");
+        if (mounts != null && mounts > 0) throw new IllegalStateException("数据仍被运行中的沙箱挂载，不能删除");
+
+        List<String> projects = jdbc.queryForList(
+                "select distinct project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0)",
+                String.class, assetId, datatableId);
+        for (String projectId : projects) {
+            projectAssetRepository.findById(new ProjectAssetDO.UPK(projectId, assetId)).ifPresent(projectAsset -> {
+                projectAsset.setIsDeleted(true);
+                projectAsset.setGmtModified(LocalDateTime.now(java.time.ZoneOffset.UTC));
+                projectAssetRepository.save(projectAsset);
+            });
+            for (ProjectDatatableDO datatable : projectDatatableRepository.findByDatableId(projectId, datatableId)) {
+                datatable.setIsDeleted(true);
+                datatable.setGmtModified(LocalDateTime.now(java.time.ZoneOffset.UTC));
+                projectDatatableRepository.save(datatable);
+            }
+        }
+        projectAssetRepository.flush();
+        projectDatatableRepository.flush();
+        assetStorage.delete(string(asset.get("storage_uri")));
+        int changed = jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=? and deleted=0", now(), assetId);
+        if (changed != 1) throw new IllegalStateException("数据删除发生并发冲突");
     }
 
     private void recreateSandboxJob(Map<String, Object> sandbox, Runnable mutation, String reason) {

@@ -11,6 +11,7 @@ import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.ProjectAssetDO;
 import org.secretflow.secretpad.persistence.repository.ProjectAssetRepository;
+import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -34,13 +35,16 @@ public class DataAssetService {
     private final ObjectMapper mapper;
     private final MinioAssetStorage storage;
     private final ProjectAssetRepository projectAssetRepository;
+    private final SandboxApprovalService approvalService;
 
     public DataAssetService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc, ObjectMapper mapper,
-            MinioAssetStorage storage, ProjectAssetRepository projectAssetRepository) {
+            MinioAssetStorage storage, ProjectAssetRepository projectAssetRepository,
+            SandboxApprovalService approvalService) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.storage = storage;
         this.projectAssetRepository = projectAssetRepository;
+        this.approvalService = approvalService;
     }
 
     @Transactional
@@ -296,15 +300,26 @@ public class DataAssetService {
     }
 
     @Transactional
-    public void delete(String id) {
+    public Map<String, Object> delete(String id) {
         Map<String, Object> asset = require(id);
         requireProvider(asset);
-        Long refs = jdbc.queryForObject("select count(1) from project_datatable where datatable_id=? and is_deleted=0", Long.class, asset.get("datatable_id"));
-        Long projectAssetRefs = jdbc.queryForObject("select count(1) from ds_project_asset where asset_id=? and deleted=0", Long.class, id);
         Long children = jdbc.queryForObject("select count(1) from ds_data_asset where source_asset_id=? and deleted=0", Long.class, id);
-        if ((refs != null && refs > 0) || (projectAssetRefs != null && projectAssetRefs > 0) || (children != null && children > 0)) throw new IllegalStateException("数据仍被项目或衍生资产引用");
-        jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=?", now(), id);
+        Long mounts = jdbc.queryForObject("select count(1) from ds_sandbox_dataset_mount where asset_id=? and deleted=0", Long.class, id);
+        if (children != null && children > 0) throw new IllegalStateException("数据仍被衍生资产引用，不能删除");
+        if (mounts != null && mounts > 0) throw new IllegalStateException("数据仍被运行中的沙箱挂载，不能删除");
+        List<String> projects = jdbc.queryForList(
+                "select distinct project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0) order by project_id",
+                String.class, id, asset.get("datatable_id"));
+        if (!projects.isEmpty()) {
+            List<String> approvalIds = approvalService.submitAssetDeletion(id,
+                    String.valueOf(asset.get("name")), projects);
+            return Map.of("status", "PENDING_APPROVAL", "approvalIds", approvalIds,
+                    "projectCount", projects.size());
+        }
         storage.delete(String.valueOf(asset.get("storage_uri")));
+        int changed = jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=? and deleted=0", now(), id);
+        if (changed != 1) throw new IllegalStateException("数据已被删除或状态已变化");
+        return Map.of("status", "DELETED", "id", id);
     }
 
     public List<Map<String, Object>> usageRequests() {

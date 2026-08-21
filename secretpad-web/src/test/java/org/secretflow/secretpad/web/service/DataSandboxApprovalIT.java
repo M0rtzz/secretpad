@@ -21,6 +21,7 @@ import org.secretflow.secretpad.kuscia.v1alpha1.mock.MockKusciaGrpcServer;
 import org.secretflow.secretpad.kuscia.v1alpha1.mock.service.JobService;
 import org.secretflow.secretpad.kuscia.v1alpha1.model.KusciaGrpcConfig;
 import org.secretflow.secretpad.web.SecretPadApplication;
+import org.secretflow.secretpad.web.service.DataAssetService;
 import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
 
 import jakarta.annotation.Resource;
@@ -39,6 +40,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -89,6 +91,9 @@ public class DataSandboxApprovalIT {
     private SandboxApprovalService approvalService;
 
     @Resource
+    private DataAssetService dataAssetService;
+
+    @Resource
     private DynamicKusciaChannelProvider channelProvider;
 
     private MockKusciaGrpcServer mockServer;
@@ -136,8 +141,12 @@ public class DataSandboxApprovalIT {
 
     @BeforeEach
     public void reset() {
+        jdbc.update("delete from ds_sandbox_approval_vote");
         jdbc.update("delete from ds_sandbox_approval_history");
         jdbc.update("delete from ds_sandbox_approval");
+        jdbc.update("delete from ds_project_asset");
+        jdbc.update("delete from ds_data_asset where id like 'asset-delete-it-%'");
+        jdbc.update("delete from project_datatable where project_id='p1'");
         jdbc.update("delete from ds_sandbox");
         jdbc.update("delete from ds_sandbox_snapshot");
         jdbc.update("delete from ds_resource_allocation");
@@ -504,5 +513,34 @@ public class DataSandboxApprovalIT {
                 LocalDateTime.now().minusMinutes(11).toString(), id);
         approvalService.reclaimStuckExecuting();
         assertEquals("FAILED", approvalStatus(id), "已达上限的卡死单应置 FAILED");
+    }
+
+    /** 已挂载数据须经项目其余节点一致同意，审批执行后同时移除目录、项目引用和物理对象。 */
+    @Test
+    public void mountedAssetDeletionRequiresUnanimousProjectApproval() {
+        String assetId = "asset-delete-it-mounted";
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','RAW','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                assetId, "待删除数据", "alice", "alice", "FILE", assetId, "alice", LocalDateTime.now().toString(), LocalDateTime.now().toString());
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p1',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                assetId, "alice");
+        jdbc.update("insert into project_datatable(project_id,node_id,datatable_id,table_configs,source,is_deleted) values('p1','alice',?,'[]','IMPORTED',0)", assetId);
+
+        Map<String, Object> result = dataAssetService.delete(assetId);
+        assertEquals("PENDING_APPROVAL", result.get("status"));
+        assertEquals(0L, count("select deleted from ds_data_asset where id=?", assetId));
+        String approvalId = String.valueOf(((List<?>) result.get("approvalIds")).get(0));
+        assertEquals("DATA_PROVIDER_REVIEW", approvalStatus(approvalId));
+
+        UserContext.setBaseUser(carol());
+        approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意删除"));
+        assertEquals("APPROVED", approvalStatus(approvalId));
+        jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING' where id=?", approvalId);
+        UserContext.setBaseUser(alice());
+        approvalService.executeOne(approvalId);
+
+        assertEquals("COMPLETED", approvalStatus(approvalId));
+        assertEquals(1L, count("select deleted from ds_data_asset where id=?", assetId));
+        assertEquals(1L, count("select is_deleted from ds_project_asset where project_id='p1' and asset_id=?", assetId));
+        assertEquals(1L, count("select is_deleted from project_datatable where project_id='p1' and datatable_id=?", assetId));
     }
 }
