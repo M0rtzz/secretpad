@@ -291,7 +291,7 @@ public class DataAssetService {
     }
 
     public Map<String, Object> preview(String id, int requestedLimit) {
-        Map<String, Object> asset = requireVisible(id);
+        Map<String, Object> asset = catalogAsset(id);
         int limit = Math.max(1, Math.min(requestedLimit, 100));
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("asset", asset);
@@ -323,6 +323,31 @@ public class DataAssetService {
             throw new IllegalStateException("读取数据预览失败", e);
         }
         return result;
+    }
+
+    /** Resolve both local catalog assets and metadata snapshots for project-shared assets. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> catalogAsset(String id) {
+        List<Map<String, Object>> local = jdbc.queryForList(
+                "select * from ds_data_asset where id=? and deleted=0", id);
+        if (!local.isEmpty()) return requireVisible(id);
+        List<Map<String, Object>> shared = jdbc.queryForList(
+                "select pa.asset_json,pa.provider_node_id from ds_project_asset pa "
+                        + "join project_node pn on pn.project_id=pa.project_id and pn.node_id in (?,?) and pn.is_deleted=0 "
+                        + "where pa.asset_id=? and pa.deleted=0 and coalesce(pa.is_deleted,0)=0",
+                owner(), legacyOwner(), id);
+        for (Map<String, Object> row : shared) {
+            try {
+                Map<String, Object> asset = new LinkedHashMap<>(mapper.readValue(String.valueOf(row.get("asset_json")), Map.class));
+                asset.put("id", id);
+                asset.put("provider_node_id", row.get("provider_node_id"));
+                asset.put("owned", false);
+                return asset;
+            } catch (Exception ignored) {
+                // Try another project snapshot if a legacy attachment is malformed.
+            }
+        }
+        throw new NoSuchElementException("数据不存在");
     }
 
     @Transactional

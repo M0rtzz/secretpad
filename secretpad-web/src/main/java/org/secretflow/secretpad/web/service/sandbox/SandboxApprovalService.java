@@ -681,9 +681,12 @@ public class SandboxApprovalService {
             String provider = string(asset.get("provider_node_id"));
             String checksum = metadataChecksum(asset.get("metadata_json"));
             String stagingUri = string(asset.get("storage_uri"));
-            if (!Objects.equals(provider, sandboxNode)) {
+            boolean processedExternal = !Objects.equals(provider, sandboxNode)
+                    && "PROCESSED".equalsIgnoreCase(string(asset.get("data_stage")));
+            if (processedExternal) {
                 stagingUri = assetStorage.encryptedSnapshot(stagingUri, "sandbox-staging/" + sandboxNode + "/" + sandboxId + "/" + assetId + "-v" + intValue(asset.get("version"), 1), checksum);
             }
+            // External RAW data remains at its provider URI; only processed samples are copied locally.
             jdbc.update("insert into ds_sandbox_dataset_mount(id,sandbox_id,asset_id,asset_version,provider_node_id,staging_uri,mount_path,checksum,status,expires_at,created_at,updated_at,deleted) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
                     mountId, sandboxId, assetId, intValue(asset.get("version"), 1), provider,
                     stagingUri, "/data/assets/" + assetId, checksum,
