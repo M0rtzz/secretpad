@@ -184,11 +184,20 @@ public class NodeServiceImpl implements NodeService {
     @Transactional(rollbackFor = Exception.class)
     public String createP2pNode(P2pCreateNodeRequest request) {
         LOGGER.info("request = {}", JsonUtils.toJSONString(request));
+        String srcNodeId = envService.getPlatformNodeId();
+        NodeDO localNode = nodeRepository.findByNodeId(srcNodeId);
+        if (localNode == null) {
+            throw SecretpadException.of(NodeErrorCode.NODE_NOT_EXIST_ERROR, srcNodeId);
+        }
+        String srcNetAddress = withProtocol(localNode.getNetAddress(), localNode.getProtocol());
+        if (StringUtils.isBlank(srcNetAddress)) {
+            throw SecretpadException.of(NodeRouteErrorCode.NODE_ROUTE_CONFIG_ERROR, "本方节点通讯地址未配置");
+        }
         // check address equals
-        nodeManager.checkSrcAddressAndDstAddressEquals(request.getSrcNetAddress(), request.getDstNetAddress());
+        nodeManager.checkSrcAddressAndDstAddressEquals(srcNetAddress, request.getDstNetAddress());
         CreateNodeParam param = CreateNodeParam.builder()
                 .dstNodeId(request.getDstNodeId())
-                .srcNodeId(request.getSrcNodeId())
+                .srcNodeId(srcNodeId)
                 .name(request.getName())
                 .mode(request.getMode())
                 .netAddress(request.getDstNetAddress())
@@ -198,18 +207,26 @@ public class NodeServiceImpl implements NodeService {
                 .instName(request.getDstInstName())
                 .build();
         // check node cert
-        nodeManager.checkNodeCert(UserContext.getUser().getPlatformNodeId(), param);
+        nodeManager.checkNodeCert(srcNodeId, param);
         // create node
         String nodeId = nodeManager.createP2pNode(param);
         // create node route
         nodeRouterService.createNodeRouter(CreateNodeRouterRequest.builder()
-                .srcNodeId(request.getSrcNodeId())
+                .srcNodeId(srcNodeId)
                 .dstNodeId(request.getDstNodeId())
-                .srcNetAddress(request.getSrcNetAddress())
+                .srcNetAddress(srcNetAddress)
                 .dstNetAddress(request.getDstNetAddress())
                 .build());
         LOGGER.debug("createP2pNode return {}", nodeId);
         return nodeId;
+    }
+
+    private String withProtocol(String address, String protocol) {
+        if (StringUtils.isBlank(address)) return address;
+        if (address.startsWith("http://") || address.startsWith("https://")) return address;
+        String scheme = "tls".equalsIgnoreCase(protocol) || "mtls".equalsIgnoreCase(protocol)
+                || "https".equalsIgnoreCase(protocol) ? "https" : "http";
+        return scheme + "://" + address;
     }
 
 
@@ -601,5 +618,3 @@ public class NodeServiceImpl implements NodeService {
         return nodeRepository.findInstIdsByNodeIds(nodeIds);
     }
 }
-
-

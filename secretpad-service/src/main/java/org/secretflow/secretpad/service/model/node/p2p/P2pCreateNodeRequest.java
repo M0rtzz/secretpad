@@ -80,7 +80,6 @@ public class P2pCreateNodeRequest {
      * the nodeId of initiator
      */
     @Schema(description = "srcNodeId")
-    @NotBlank(message = "srcNodeId cannot be empty")
     private String srcNodeId;
 
     /**
