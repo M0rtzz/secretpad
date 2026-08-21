@@ -120,7 +120,12 @@ public class DataSandboxMvpService {
         StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref,n.name owner_node_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id left join node n on (n.node_id=s.owner_id or n.inst_id=s.owner_id) and n.is_deleted=0 where s.deleted=0");
         List<Object> args = new ArrayList<>();
         if (notBlank(ownerId)) {
-            sql.append(" and (s.owner_id=? or exists (select 1 from project_node pn where pn.project_id=s.project_id and pn.node_id=? and pn.is_deleted=0))");
+            // 页面路由历史上使用机构实例 ID（node.inst_id），而审批创建的沙箱使用节点 ID。
+            // 同时匹配两种身份，避免审批成功后因 ownerId 形态不同而在资源列表中消失。
+            sql.append(" and (s.owner_id=? or s.owner_id in (select node_id from node where (node_id=? or inst_id=?) and is_deleted=0) or exists (select 1 from project_node pn where pn.project_id=s.project_id and (pn.node_id=? or pn.node_id in (select node_id from node where inst_id=? and is_deleted=0)) and pn.is_deleted=0))");
+            args.add(ownerId);
+            args.add(ownerId);
+            args.add(ownerId);
             args.add(ownerId);
             args.add(ownerId);
         }
