@@ -11,6 +11,7 @@
 package org.secretflow.secretpad.web.service;
 
 import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.enums.PlatformTypeEnum;
 import org.secretflow.secretpad.common.enums.UserOwnerTypeEnum;
 import org.secretflow.secretpad.common.util.UserContext;
@@ -190,6 +191,7 @@ public class DataSandboxApprovalIT {
     private String submitCreate() {
         Map<String, Object> payload = createPayload("CREATE", null);
         payload.put("ownerId", "alice");
+        payload.put("projectId", "p1");
         payload.put("name", "apr-sandbox");
         payload.put("imageId", IMAGE_ID);
         payload.put("networkPolicy", "INTERNAL_ONLY");
@@ -542,6 +544,24 @@ public class DataSandboxApprovalIT {
         assertEquals(1L, count("select deleted from ds_data_asset where id=?", assetId));
         assertEquals(1L, count("select is_deleted from ds_project_asset where project_id='p1' and asset_id=?", assetId));
         assertEquals(1L, count("select is_deleted from project_datatable where project_id='p1' and datatable_id=?", assetId));
+    }
+
+    /** 两个节点使用同名管理员时，合作方仍须看到审批动作，且不能冒充申请人撤回。 */
+    @Test
+    public void sameUsernameOnDifferentNodesRemainsIncomingReviewer() {
+        UserContext.setBaseUser(user("devadmin", "alice"));
+        String approvalId = submitCreate();
+
+        UserContext.setBaseUser(user("devadmin", "carol"));
+        Map<String, Object> incoming = approvalService.listApprovals("", "", "").stream()
+                .filter(row -> approvalId.equals(row.get("id")))
+                .findFirst().orElseThrow();
+        assertEquals("INCOMING", incoming.get("direction"));
+        assertThrows(SecretpadException.class,
+                () -> approvalService.approvalAction(Map.of("id", approvalId, "action", "CANCEL")));
+
+        approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意"));
+        assertEquals("APPROVED", approvalStatus(approvalId));
     }
 
     /** 数据目录应展示挂载项目；其他项目节点查看时应标记为项目共享数据。 */

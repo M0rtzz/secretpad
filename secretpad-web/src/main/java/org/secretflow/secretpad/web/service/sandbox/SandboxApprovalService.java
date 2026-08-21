@@ -123,7 +123,7 @@ public class SandboxApprovalService {
         }
         sql.append(" order by a.created_at desc");
         List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
-        rows.forEach(row -> row.put("direction", current.equals(String.valueOf(row.get("submitter"))) || currentNode.equals(String.valueOf(row.get("applicant_node_id"))) ? "OUTGOING" : "INCOMING"));
+        rows.forEach(row -> row.put("direction", isApplicant(row) ? "OUTGOING" : "INCOMING"));
         return rows;
     }
 
@@ -262,7 +262,6 @@ public class SandboxApprovalService {
         String comment = value(request, "comment", "");
         Map<String, Object> approval = requireApproval(id);
         String from = string(approval.get("status"));
-        String submitter = string(approval.get("submitter"));
         assertApprovalVisible(approval);
         switch (action) {
             case "APPROVE", "REJECT" -> {
@@ -270,7 +269,7 @@ public class SandboxApprovalService {
                 vote(id, action, comment);
             }
             case "RESUBMIT" -> {
-                if (!Objects.equals(operator(), submitter)) {
+                if (!isApplicant(approval)) {
                     throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可提交复审");
                 }
                 if (!"REJECTED".equals(from)) throw new IllegalStateException("只有已驳回申请可复审");
@@ -280,14 +279,14 @@ public class SandboxApprovalService {
                 jdbc.update("update ds_sandbox_approval set status=?,current_stage=?,version=version+1,reviewer='',review_comment='',approved_at=?,updated_at=? where id=? and status='REJECTED'", target, target, voters == 0 ? now() : "", now(), id);
             }
             case "CANCEL" -> {
-                if (!Objects.equals(operator(), submitter)) {
+                if (!isApplicant(approval)) {
                     throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可撤回申请");
                 }
                 if (!Set.of("DATA_PROVIDER_REVIEW", "APPROVED").contains(from)) throw new IllegalStateException("当前状态不可撤回");
                 jdbc.update("update ds_sandbox_approval set status='CANCELLED',current_stage='CANCELLED',updated_at=? where id=? and status=?", now(), id, from);
             }
             case "RETRY" -> {
-                if (!Objects.equals(operator(), submitter)) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可重试");
+                if (!isApplicant(approval)) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可重试");
                 if (!"FAILED".equals(from)) throw new IllegalStateException("只有执行失败申请可重试");
                 jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,retry_count=0,last_error='',updated_at=? where id=? and status='FAILED'", operator(), now(), id);
             }
@@ -864,9 +863,16 @@ public class SandboxApprovalService {
 
     private void assertApprovalVisible(Map<String, Object> approval) {
         String currentNode = gate.effectiveOwner();
-        boolean applicant = Objects.equals(operator(), string(approval.get("submitter"))) || Objects.equals(currentNode, string(approval.get("applicant_node_id")));
         boolean voter = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and voter_node_id=?", approval.get("id"), currentNode) > 0;
-        if (!applicant && !voter) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+        if (!isApplicant(approval) && !voter) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+    }
+
+    private boolean isApplicant(Map<String, Object> approval) {
+        String applicantNodeId = string(approval.get("applicant_node_id"));
+        boolean sameUser = Objects.equals(operator(), string(approval.get("submitter")));
+        // Legacy non-project approvals did not persist an applicant node, so retain their
+        // username-based behavior. Project approvals must also match the originating node.
+        return sameUser && (!notBlank(applicantNodeId) || gate.matchesCurrentNode(applicantNodeId));
     }
 
     private void vote(String approvalId, String action, String comment) {
