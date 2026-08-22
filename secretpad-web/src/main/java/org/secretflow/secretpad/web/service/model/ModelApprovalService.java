@@ -135,6 +135,59 @@ public class ModelApprovalService {
         return modelDetail(id);
     }
 
+    /**
+     * 画布训练 / 制品一键发布用：自动注册模型且直接 APPROVED（绕过两段审批；评估由画布内
+     * ml.binary_classification / ml.regression_evaluation 等节点承担）。
+     *
+     * <p>幂等：同项目同制品同版本已存在 APPROVED/PUBLISHED 模型时直接复用——画布重复训练/重复发布
+     * 不重复建模型，仅返回既有模型（调用方需注意此时不轮换 API 凭证）。</p>
+     */
+    @Transactional
+    public Map<String, Object> registerModelAutoApproved(String name, String projectId, String artifactId,
+            String artifactVersionId, String sandboxId, String description) {
+        Map<String, Object> artifact = requireArtifact(artifactId);
+        String artifactType = string(artifact.get("type"));
+        if (!MODEL_TYPES.contains(artifactType)) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID
+                    + ": 仅 JAR/PYTHON 制品可作为模型（当前 " + artifactType + "）");
+        }
+        requireVersion(artifactId, artifactVersionId);
+        requireProject(projectId);
+        if (notBlank(sandboxId)) {
+            Map<String, Object> sandbox = requireRow("select * from ds_sandbox where id=? and project_id=? and deleted=0", sandboxId, projectId);
+            if (!Objects.equals(actor(), string(sandbox.get("created_by")))) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_NO_PERMISSION + ": 沙箱仅创建人可注册算法");
+            }
+            if (!sandboxId.equals(string(artifact.get("sandbox_id")))) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID + ": 制品不属于当前沙箱");
+            }
+        }
+        List<Map<String, Object>> existing = jdbc.queryForList(
+                "select * from ds_model where project_id=? and artifact_id=? and artifact_version_id=? and deleted=0 and status in ('APPROVED','PUBLISHED') order by version desc limit 1",
+                projectId, artifactId, artifactVersionId);
+        if (!existing.isEmpty()) {
+            return enrichModel(new LinkedHashMap<>(existing.get(0)));
+        }
+        Integer maxVersion = jdbc.queryForObject(
+                "select max(version) from ds_model where project_id=? and artifact_id=? and deleted=0",
+                Integer.class, projectId, artifactId);
+        int modelVersion = (maxVersion == null ? 0 : maxVersion) + 1;
+        String id = "dm-" + shortId();
+        String createdBy = actor();
+        String createdByOwner = currentOwner();
+        String now = now();
+        jdbc.update("insert into ds_model(id,name,description,project_id,artifact_id,artifact_version_id,node_id,version,status,"
+                        + "created_by,created_by_owner,created_at,updated_at,approved_at,published_at,deleted,sandbox_id,input_schema,output_schema)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
+                id, name, description, projectId, artifactId, artifactVersionId, nodeIdOf(projectId, createdByOwner),
+                modelVersion, "APPROVED", createdBy, createdByOwner, now, now, now, "", sandboxId, "[]", "[]");
+        audit("MODEL_AUTO_APPROVED", "MODEL", id,
+                "artifact=" + artifactId + " v" + artifactVersionId + " project=" + projectId, true);
+        dispatch("model.registered", Map.of("id", id, "name", name, "artifactId", artifactId,
+                "version", modelVersion, "autoApproved", true));
+        return modelDetail(id);
+    }
+
     @Transactional
     public Map<String, Object> updateModel(String id, String name, String description) {
         Map<String, Object> model = requireModel(id);

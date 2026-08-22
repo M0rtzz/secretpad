@@ -162,14 +162,15 @@ public class SandboxDbService {
                 manifestRowSum(manifest), System.currentTimeMillis() - start);
     }
 
-    /** 从既有库读取 kind=RESULT 的清单行（结果表数据保留在库中，只回写其清单）。 */
+    /** 从既有库读取 kind=RESULT/OPERATOR 的清单行（结果表/画布节点输出保留在库中，只回写其清单）。 */
     private List<Map<String, Object>> preservedResultEntries(Path db) {
         List<Map<String, Object>> preserved = new ArrayList<>();
         if (!Files.exists(db)) {
             return preserved;
         }
         for (Map<String, Object> e : readManifest(db)) {
-            if ("RESULT".equals(string(e.get("kind")))) {
+            String kind = string(e.get("kind"));
+            if ("RESULT".equals(kind) || "OPERATOR".equals(kind)) {
                 preserved.add(e);
             }
         }
@@ -272,6 +273,16 @@ public class SandboxDbService {
         return result;
     }
 
+    /** 沙箱单表 CSV 导出（header + 全量行 → UTF-8 CSV 字节）；仅允许清单内已知表。 */
+    public byte[] readTableCsv(String sandboxId, String tableName) {
+        Map<String, Object> table = readTable(sandboxId, tableName);
+        @SuppressWarnings("unchecked")
+        List<String> header = (List<String>) table.get("header");
+        @SuppressWarnings("unchecked")
+        List<List<String>> rows = (List<List<String>>) table.get("rows");
+        return CsvUtil.toCsv(header, rows).getBytes(StandardCharsets.UTF_8);
+    }
+
     /** 下载沙箱权威库文件（仅沙箱创建人，由控制器校验）。 */
     public byte[] downloadBytes(String sandboxId) {
         Path db = sandboxDbPath(sandboxId);
@@ -288,23 +299,47 @@ public class SandboxDbService {
     /* ------------------------------ 结果回填（Stage 4 供 DataDevService 调） ------------------------------ */
 
     /**
-     * 任务 SUCCEEDED 后把产出表写入沙箱库（{@code result_{taskId}}）并登记 RESULT 清单与数据目录。
+     * 任务 SUCCEEDED 后把产出表写入沙箱库（{@code result_{taskId}}，kind=RESULT）并登记清单与数据目录。
      */
     @Transactional
     public Map<String, Object> backfillResultTable(String sandboxId, String taskId, String name,
             List<String> header, List<List<String>> data) {
+        return backfillTable(sandboxId, "result_" + SqliteTableLoader.sanitizeTableName(taskId),
+                "RESULT", name, header, data);
+    }
+
+    /**
+     * 画布节点输出回填：写入沙箱库 {@code op_{canvasId}_{nodeId}}（kind=OPERATOR）。
+     *
+     * <p>op_* 表仅画布内部消费（下游节点输入 + 节点输出查看/导出），遵循「结果不能被沙箱消费」边界：
+     * 不允许作为 data-dev 任务源表（{@link #isOperatorTable}），不允许挂载项目。重建/挂载变更时保留。</p>
+     */
+    @Transactional
+    public Map<String, Object> backfillOperatorTable(String sandboxId, String canvasId, String nodeId,
+            String name, List<String> header, List<List<String>> data) {
+        String table = "op_" + SqliteTableLoader.sanitizeTableName(canvasId)
+                + "_" + SqliteTableLoader.sanitizeTableName(nodeId);
+        return backfillTable(sandboxId, table, "OPERATOR", name, header, data);
+    }
+
+    /**
+     * 通用产出表回填：写入沙箱库指定表名并登记清单（kind 由调用方指定 RESULT/OPERATOR）。
+     */
+    @Transactional
+    public Map<String, Object> backfillTable(String sandboxId, String table, String kind, String name,
+            List<String> header, List<List<String>> data) {
         String safeId = sanitizeSandboxId(sandboxId);
         Path db = sandboxDbPath(safeId);
-        String table = "result_" + SqliteTableLoader.sanitizeTableName(taskId);
-        SqliteTableLoader.dropTableIfExists(db, table);
-        SqliteTableLoader.Materialized m = SqliteTableLoader.materializeToFile(db, table, header, data, false);
+        String safeTable = SqliteTableLoader.sanitizeTableName(table);
+        SqliteTableLoader.dropTableIfExists(db, safeTable);
+        SqliteTableLoader.Materialized m = SqliteTableLoader.materializeToFile(db, safeTable, header, data, false);
         List<Map<String, Object>> manifest = readManifest(db);
-        manifest.removeIf(e -> table.equals(string(e.get("table_name"))));
+        manifest.removeIf(e -> safeTable.equals(string(e.get("table_name"))));
         Map<String, Object> entry = new LinkedHashMap<>();
-        entry.put("table_name", table);
+        entry.put("table_name", safeTable);
         entry.put("asset_id", "");
-        entry.put("name", name == null || name.isBlank() ? table : name);
-        entry.put("kind", "RESULT");
+        entry.put("name", name == null || name.isBlank() ? safeTable : name);
+        entry.put("kind", kind);
         entry.put("source", "LOCAL");
         entry.put("row_count", m.rowCount());
         manifest.add(entry);
@@ -312,7 +347,7 @@ public class SandboxDbService {
         refreshDataDir(safeId, manifest);
         refreshDbRecord(safeId, db, manifest.size(), manifestRowSum(manifest));
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("tableName", table);
+        result.put("tableName", safeTable);
         result.put("rowCount", m.rowCount());
         result.put("columns", m.columns());
         return result;
@@ -323,6 +358,32 @@ public class SandboxDbService {
         String safeTable = SqliteTableLoader.sanitizeTableName(tableName);
         return readManifest(sandboxDbPath(sanitizeSandboxId(sandboxId))).stream()
                 .anyMatch(e -> safeTable.equals(string(e.get("table_name"))));
+    }
+
+    /**
+     * 是否为沙箱计算结果表（RESULT）。结果表只能预览/导出，不能作为沙箱计算源、不能挂载到项目。
+     * 判定依据：清单 kind=RESULT，或以 {@code result_} 为前缀（结果表命名约定）。
+     */
+    public boolean isResultTable(String sandboxId, String tableName) {
+        String safeTable = SqliteTableLoader.sanitizeTableName(tableName);
+        if (safeTable.startsWith("result_")) {
+            return true;
+        }
+        return readManifest(sandboxDbPath(sanitizeSandboxId(sandboxId))).stream()
+                .anyMatch(e -> safeTable.equals(string(e.get("table_name"))) && "RESULT".equals(string(e.get("kind"))));
+    }
+
+    /**
+     * 是否为画布节点输出表（OPERATOR）。op_* 表仅画布内部消费（下游节点 + 预览/导出），
+     * 不允许作为 data-dev 任务源表、不允许挂载项目。
+     */
+    public boolean isOperatorTable(String sandboxId, String tableName) {
+        String safeTable = SqliteTableLoader.sanitizeTableName(tableName);
+        if (safeTable.startsWith("op_")) {
+            return true;
+        }
+        return readManifest(sandboxDbPath(sanitizeSandboxId(sandboxId))).stream()
+                .anyMatch(e -> safeTable.equals(string(e.get("table_name"))) && "OPERATOR".equals(string(e.get("kind"))));
     }
 
     /* ------------------------------ 清单/系统表 ------------------------------ */

@@ -49,6 +49,12 @@ public class ModelApiController {
         return SecretPadResponse.success(service.create(request));
     }
 
+    @Operation(summary = "制品→API 一键发布（自动注册 APPROVED 模型 + 创建 API；一次性 app_id+secret 明文仅本次返回）")
+    @PostMapping("/create-from-artifact")
+    public SecretPadResponse<Map<String, Object>> createFromArtifact(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.createFromArtifact(request));
+    }
+
     @Operation(summary = "API 列表（keyword 过滤，不回显 secret）")
     @GetMapping("/list")
     public SecretPadResponse<List<Map<String, Object>>> list(@RequestParam(defaultValue = "") String keyword) {

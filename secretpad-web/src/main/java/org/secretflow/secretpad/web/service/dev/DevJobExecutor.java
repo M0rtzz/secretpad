@@ -161,6 +161,18 @@ public class DevJobExecutor {
     public void submitSandbox(String taskId, String nodeId, String inputB64, String execType,
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
             String sandboxId, String inputTable, String outputTable) {
+        submitSandboxChannel(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports,
+                sandboxId, inputTable, outputTable, "dev");
+    }
+
+    /**
+     * 沙箱表源任务（画布节点通道）：与 {@link #submitSandbox} 相同，额外指定 channel（'canvas'）。
+     * channel 由 SandboxCanvasService 使用，result CSV 照常落盘（persistResult 含 canvas），
+     * 供画布层回填 op_* 输出表与自动注册模型；不注册 DomainData、不产生血缘。
+     */
+    public void submitSandboxChannel(String taskId, String nodeId, String inputB64, String execType,
+            String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
+            String sandboxId, String inputTable, String outputTable, String channel) {
         Map<String, Object> extra = new LinkedHashMap<>();
         extra.put("jdbc_url", "jdbc:sqlite:/workspace/sandbox_data.db");
         extra.put("input_table", inputTable);
@@ -176,7 +188,7 @@ public class DevJobExecutor {
             }
             extra.put("sandbox_db_b64", Base64.getEncoder().encodeToString(db));
         }
-        doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, "dev", extra);
+        doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, channel, extra);
     }
 
     private void doSubmit(String taskId, String nodeId, String inputB64, String execType,
@@ -394,9 +406,10 @@ public class DevJobExecutor {
         if (!kusciaEnabled) {
             return;
         }
-        // Z-06：channel='api' 的 invoke 任务由 runAndAwait 同步收官，调度器绝不轮询（避免双收官）
+        // Z-06：channel='api' 的 invoke 任务由 runAndAwait 同步收官，调度器绝不轮询（避免双收官）。
+        // canvas 节点任务由 SandboxCanvasService runAndAwait 收官，调度器兜底轮询（后台线程异常退出时防止悬挂）。
         List<Map<String, Object>> tasks = jdbc.queryForList(
-                "select * from ds_dev_task where deleted=0 and status=? and kuscia_job_id<>'' and channel in ('dev','model')",
+                "select * from ds_dev_task where deleted=0 and status=? and kuscia_job_id<>'' and channel in ('dev','model','canvas')",
                 STATUS_RUNNING);
         for (Map<String, Object> task : tasks) {
             try {
@@ -533,8 +546,9 @@ public class DevJobExecutor {
         String nodeId = string(task.get("source_node_id"));
         String runMode = string(task.get("run_mode"));
         String channel = string(task.get("channel"));
-        // Z-06：model/api 通道需要结果 CSV 供指标计算/调用取数——即使 runMode=DEV 也落盘
-        boolean persistResult = "PROD".equals(runMode) || "model".equals(channel) || "api".equals(channel);
+        // Z-06/Z-07：model/api/canvas 通道需要结果 CSV 供指标计算/调用取数/画布回填——即使 runMode=DEV 也落盘
+        boolean persistResult = "PROD".equals(runMode) || "model".equals(channel)
+                || "api".equals(channel) || "canvas".equals(channel);
         String csv = new String(body, StandardCharsets.UTF_8);
         List<List<String>> parsed = CsvUtil.parse(csv);
         if (parsed.isEmpty()) {

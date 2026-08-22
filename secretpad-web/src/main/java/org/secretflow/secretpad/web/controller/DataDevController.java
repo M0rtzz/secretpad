@@ -91,16 +91,17 @@ public class DataDevController {
         return SecretPadResponse.success(service.createVersion(request));
     }
 
-    @Operation(summary = "JAR 多部分上传新版本（DevJarValidator 校验 + sha256 + 落盘）")
+    @Operation(summary = "JAR 多部分上传新版本（DevJarValidator 校验 + sha256 + 落盘；version 可选，手填需查重）")
     @PostMapping(value = "/artifacts/versions/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public SecretPadResponse<Map<String, Object>> uploadJarVersion(
             @RequestParam("artifactId") String artifactId,
             @RequestParam("file") MultipartFile file,
             @RequestParam(defaultValue = "[]") String paramsSchema,
             @RequestParam(defaultValue = "{}") String defaultParams,
-            @RequestParam(defaultValue = "") String description) throws java.io.IOException {
+            @RequestParam(defaultValue = "") String description,
+            @RequestParam(required = false) Integer version) throws java.io.IOException {
         return SecretPadResponse.success(service.uploadJarVersion(artifactId, file.getBytes(),
-                paramsSchema, defaultParams, description));
+                paramsSchema, defaultParams, description, version));
     }
 
     @Operation(summary = "软删版本（latest_version 回退）")

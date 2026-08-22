@@ -23,6 +23,7 @@ import org.secretflow.secretpad.kuscia.v1alpha1.mock.service.JobService;
 import org.secretflow.secretpad.kuscia.v1alpha1.model.KusciaGrpcConfig;
 import org.secretflow.secretpad.web.SecretPadApplication;
 import org.secretflow.secretpad.web.service.dev.DataDevService;
+import org.secretflow.secretpad.web.service.dev.DevErrors;
 import org.secretflow.secretpad.web.service.dev.DevSqlEngine;
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
 import org.secretflow.secretpad.web.service.util.TestSchemaMigrator;
@@ -370,9 +371,9 @@ public class SandboxStorageIT {
         assertEquals(0L, count("select count(1) from ds_sandbox_data_dir where sandbox_id=? and kind='RESULT'", SBX));
     }
 
-    /** 5. 沙箱 SQL PROD：结果表回填沙箱库 + 结果数据集注册 + 目录 RESULT 行 + 一键挂载。 */
+    /** 5. 沙箱 SQL PROD：结果表回填沙箱库 + 结果数据集注册 + 目录 RESULT 行；结果不可挂载、不可作计算源，仅预览/导出。 */
     @Test
-    public void sandboxSqlProdBackfillsResultRegistersDomainAndMounts() {
+    public void sandboxSqlProdBackfillsResultAndBlocksMount() {
         sandboxDb.rebuild(SBX);
         Map<String, Object> task = submitSql("PROD", "SELECT name, score FROM " + procTable() + " WHERE score >= 60");
         String taskId = String.valueOf(task.get("id"));
@@ -384,15 +385,53 @@ public class SandboxStorageIT {
         assertEquals(1, DevDomainDataService.created.size(), "PROD 应注册结果数据集");
         assertEquals(1L, count("select count(1) from ds_sandbox_data_dir where sandbox_id=? and kind='RESULT'", SBX));
 
-        // 一键挂载（复用 mountResult）
+        // 沙箱结果不可挂载到项目
         String resultDt = String.valueOf(task.get("result_datatable_id"));
         assertTrue(!resultDt.isEmpty());
-        dataDev.mountResult(Map.of("taskId", taskId, "projectId", "p1"));
-        assertEquals(1L, count("select count(1) from project_datatable where project_id='p1' and datatable_id=? "
-                + "and source='IMPORTED' and is_deleted=0", resultDt));
-        // 重复挂载冲突
-        assertThrows(IllegalStateException.class,
+        IllegalStateException mountErr = assertThrows(IllegalStateException.class,
                 () -> dataDev.mountResult(Map.of("taskId", taskId, "projectId", "p1")));
+        assertTrue(String.valueOf(mountErr.getMessage()).contains(DevErrors.DEV_RESULT_NOT_MOUNTABLE),
+                mountErr.getMessage());
+
+        // 结果表不可作为沙箱计算源
+        assertTrue(sandboxDb.isResultTable(SBX, resultTable), "result_ 表应判定为结果表");
+        assertFalse(sandboxDb.isResultTable(SBX, procTable()), "挂载表不应判定为结果表");
+        Map<String, Object> consume = new LinkedHashMap<>();
+        consume.put("sandboxId", SBX);
+        consume.put("name", "consume-result");
+        consume.put("runMode", "DEV");
+        consume.put("execType", "SQL");
+        consume.put("sql", "SELECT * FROM " + resultTable);
+        consume.put("sourceTable", resultTable);
+        IllegalArgumentException consumeErr = assertThrows(IllegalArgumentException.class,
+                () -> dataDev.submitSandboxTask(consume));
+        assertTrue(String.valueOf(consumeErr.getMessage()).contains(DevErrors.DEV_RESULT_NOT_CONSUMABLE),
+                consumeErr.getMessage());
+
+        // SQL 内深引用 result_ 表也拒绝
+        IllegalArgumentException sqlDeepErr = assertThrows(IllegalArgumentException.class,
+                () -> DevSqlEngine.executeOnDb(sandboxDb.sandboxDbPath(SBX),
+                        "SELECT * FROM src WHERE x IN (SELECT y FROM " + resultTable + ")", Map.of(), 50, 30));
+        assertTrue(String.valueOf(sqlDeepErr.getMessage()).contains(DevErrors.DEV_RESULT_NOT_CONSUMABLE),
+                sqlDeepErr.getMessage());
+
+        // 结果表仍可预览 + 单表 CSV 导出
+        assertTrue(((List<?>) sandboxDb.previewTable(SBX, resultTable, 20).get("rows")).size() > 0, "结果表可预览");
+        String csv = new String(sandboxDb.readTableCsv(SBX, resultTable), StandardCharsets.UTF_8);
+        assertTrue(csv.startsWith("name,score"), "导出 CSV 应以表头开头，实际: " + csv);
+    }
+
+    /** 5b. 单表 CSV 导出：挂载表 readTableCsv 往返与挂载表/结果表均可导出。 */
+    @Test
+    public void tableExportRoundTrips() {
+        sandboxDb.rebuild(SBX);
+        String csv = new String(sandboxDb.readTableCsv(SBX, procTable()), StandardCharsets.UTF_8);
+        List<List<String>> parsed = CsvUtil.parse(csv);
+        assertEquals(4, parsed.size(), "表头 + 3 行");
+        assertEquals(HEADER, parsed.get(0));
+        assertEquals(ROWS, parsed.subList(1, parsed.size()));
+        // 未知表拒绝
+        assertThrows(IllegalArgumentException.class, () -> sandboxDb.readTableCsv(SBX, "nope_table"));
     }
 
     private Map<String, Object> submitSql(String runMode, String sql) {
@@ -412,7 +451,7 @@ public class SandboxStorageIT {
         sandboxDb.rebuild(SBX);
         Map<String, Object> art = dataDev.createArtifact(Map.of("name", "it-jar-sbx", "type", "JAR"));
         String artId = String.valueOf(art.get("id"));
-        Map<String, Object> v = dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "");
+        Map<String, Object> v = dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "", null);
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("sandboxId", SBX);
         request.put("name", "it-jar-sbx-run");

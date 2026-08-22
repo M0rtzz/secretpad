@@ -348,30 +348,56 @@ public class DataDevIT {
         Map<String, Object> art = createArtifact("it-jar", "JAR");
         String artId = String.valueOf(art.get("id"));
         byte[] jar = validJar();
-        Map<String, Object> v = dataDev.uploadJarVersion(artId, jar, "[]", "{}", "demo");
+        Map<String, Object> v = dataDev.uploadJarVersion(artId, jar, "[]", "{}", "demo", null);
         assertEquals(1, ((Number) v.get("version")).intValue());
         assertEquals(64, String.valueOf(v.get("sha256")).length());
         assertEquals(jar.length, ((Number) v.get("size")).longValue());
         // 下载回读一致
         assertArrayEquals(jar, dataDev.downloadJar(String.valueOf(v.get("id"))));
         // 非 ZIP 拒绝
-        assertThrows(IllegalArgumentException.class, () -> dataDev.uploadJarVersion(artId, "not a jar".getBytes(), "[]", "{}", ""));
+        assertThrows(IllegalArgumentException.class, () -> dataDev.uploadJarVersion(artId, "not a jar".getBytes(), "[]", "{}", "", null));
         // JAR 上传到 SQL 制品拒绝
         Map<String, Object> sqlArt = createArtifact("it-sql2", "SQL");
         assertThrows(IllegalArgumentException.class,
-                () -> dataDev.uploadJarVersion(String.valueOf(sqlArt.get("id")), jar, "[]", "{}", ""));
+                () -> dataDev.uploadJarVersion(String.valueOf(sqlArt.get("id")), jar, "[]", "{}", "", null));
     }
 
-    /** 5. PYTHON 依赖白名单：import requests 拒绝；import numpy 放行（V12 预置白名单）。 */
+    /** 5. PYTHON 依赖记录：createVersion 不再做白名单拦截（缺失依赖由 runner 运行时 pip 安装），dependency_names=实际 import。 */
     @Test
-    public void pythonDependencyRejected() {
+    public void pythonDependencyRecordedNotRejected() {
         Map<String, Object> art = createArtifact("it-py", "PYTHON");
         String artId = String.valueOf(art.get("id"));
-        assertThrows(IllegalArgumentException.class,
-                () -> dataDev.createVersion(Map.of("artifactId", artId, "contentText", "import requests\nprint(1)", "dependencyNames", List.of())));
-        Map<String, Object> v = dataDev.createVersion(Map.of("artifactId", artId,
-                "contentText", "import numpy as np\nimport pandas as pd\nprint(np.array([1]))", "dependencyNames", List.of("numpy", "pandas")));
-        assertEquals(1, ((Number) v.get("version")).intValue());
+        // 白名单外依赖不再被 createVersion 拒绝
+        Map<String, Object> v1 = dataDev.createVersion(Map.of("artifactId", artId,
+                "contentText", "import requests\nprint(1)"));
+        assertEquals(1, ((Number) v1.get("version")).intValue());
+        // dependency_names 记录实际 import 的顶层模块
+        assertEquals("[\"requests\"]", String.valueOf(v1.get("dependency_names")));
+        Map<String, Object> v2 = dataDev.createVersion(Map.of("artifactId", artId,
+                "contentText", "import numpy as np\nimport pandas as pd\nprint(np.array([1]))"));
+        assertEquals(2, ((Number) v2.get("version")).intValue());
+        assertEquals("[\"numpy\",\"pandas\"]", String.valueOf(v2.get("dependency_names")));
+    }
+
+    /** 5b. 版本号手填：createVersion/uploadJarVersion 支持用户指定版本号 + 查重。 */
+    @Test
+    public void versionHandFillAndDedup() throws IOException {
+        Map<String, Object> sqlArt = createArtifact("it-ver-sql", "SQL");
+        Map<String, Object> v3 = dataDev.createVersion(Map.of("artifactId", sqlArt.get("id"),
+                "contentText", "SELECT 3", "version", 3));
+        assertEquals(3, ((Number) v3.get("version")).intValue());
+        IllegalArgumentException dup = assertThrows(IllegalArgumentException.class,
+                () -> dataDev.createVersion(Map.of("artifactId", sqlArt.get("id"), "contentText", "SELECT 3b", "version", 3)));
+        assertTrue(String.valueOf(dup.getMessage()).contains(DevErrors.DEV_VERSION_EXISTS), dup.getMessage());
+        Map<String, Object> auto = dataDev.createVersion(Map.of("artifactId", sqlArt.get("id"), "contentText", "SELECT 4"));
+        assertEquals(4, ((Number) auto.get("version")).intValue());
+
+        Map<String, Object> jarArt = createArtifact("it-ver-jar", "JAR");
+        Map<String, Object> j1 = dataDev.uploadJarVersion(String.valueOf(jarArt.get("id")), validJar(), "[]", "{}", "", 2);
+        assertEquals(2, ((Number) j1.get("version")).intValue());
+        IllegalArgumentException dupJar = assertThrows(IllegalArgumentException.class,
+                () -> dataDev.uploadJarVersion(String.valueOf(jarArt.get("id")), validJar(), "[]", "{}", "", 2));
+        assertTrue(String.valueOf(dupJar.getMessage()).contains(DevErrors.DEV_VERSION_EXISTS), dupJar.getMessage());
     }
 
     /** 6. 权限拒绝：carol 访问 alice/dt-sample → DEV_NO_PERMISSION。 */
@@ -412,7 +438,7 @@ public class DataDevIT {
     public void jarAndPythonSubmitWriteRunningTask() throws IOException {
         Map<String, Object> art = createArtifact("it-jar2", "JAR");
         String artId = String.valueOf(art.get("id"));
-        Map<String, Object> v = dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "");
+        Map<String, Object> v = dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "", null);
         Map<String, Object> jarReq = new LinkedHashMap<>();
         jarReq.put("name", "it-jar-run");
         jarReq.put("runMode", "PROD");

@@ -263,17 +263,10 @@ public class DataDevService {
         String defaultParams = jsonOr(request.get("defaultParams"), "{}");
         validateJsonArray(paramsSchema, "paramsSchema");
         validateJsonObject(defaultParams, "defaultParams");
-        List<String> dependencyNames = stringList(request.get("dependencyNames"));
-        if ("PYTHON".equals(type) || "FUNCTION".equals(type)) {
-            Set<String> whitelist = enabledWhitelist();
-            for (String dep : dependencyNames) {
-                if (!whitelist.contains(dep.toLowerCase(Locale.ROOT))) {
-                    throw new IllegalArgumentException(DevErrors.DEV_DEPENDENCY_REJECTED
-                            + ": 依赖不在白名单: " + dep + "（白名单: " + whitelist + "）");
-                }
-            }
-            DevDependencyChecker.validate(contentText, whitelist);
-        }
+        // 记录实际 import 的依赖（白名单校验已废弃：缺失依赖由 runner 运行时 pip 自动安装）
+        List<String> dependencyNames = ("PYTHON".equals(type) || "FUNCTION".equals(type))
+                ? DevDependencyChecker.extractImports(contentText)
+                : stringList(request.get("dependencyNames"));
         String functionName = "";
         int functionNargs = 0;
         String sqlTemplate = "";
@@ -286,7 +279,7 @@ public class DataDevService {
                         + ": FUNCTION 版本需提供 functionName/functionNargs/sqlTemplate");
             }
         }
-        int version = nextVersion(artifactId);
+        int version = resolveVersion(artifactId, request.get("version"));
         String versionId = "dav-" + shortId();
         String now = now();
         jdbc.update("insert into ds_dev_artifact_version(id,artifact_id,version,content_text,file_path,sha256,size,params_schema,default_params,dependency_names,description,created_by,created_at,deleted,function_name,function_nargs,sql_template)"
@@ -302,7 +295,7 @@ public class DataDevService {
 
     /** JAR 版本上传：ZIP 魔数 + MANIFEST 校验 + sha256 + 落盘（{storeDir}/dev-artifacts/{versionId}.jar）。 */
     public Map<String, Object> uploadJarVersion(String artifactId, byte[] bytes, String paramsSchema,
-            String defaultParams, String description) {
+            String defaultParams, String description, Integer requestedVersion) {
         Map<String, Object> artifact = requireArtifact(artifactId);
         requireCreator(artifact, "制品");
         if (!"JAR".equals(string(artifact.get("type")))) {
@@ -313,7 +306,7 @@ public class DataDevService {
         String defaultParamsVal = jsonOr(defaultParams, "{}");
         validateJsonArray(paramsSchemaVal, "paramsSchema");
         validateJsonObject(defaultParamsVal, "defaultParams");
-        int version = nextVersion(artifactId);
+        int version = resolveVersion(artifactId, requestedVersion);
         String versionId = "dav-" + shortId();
         String filePath = "dev-artifacts/" + versionId + ".jar";
         String now = now();
@@ -536,6 +529,14 @@ public class DataDevService {
         if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
             throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 沙箱内无此表: " + sourceTable);
         }
+        if (sandboxDb.isResultTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
+                    + ": 计算结果表不能作为沙箱计算源（仅支持预览与导出）: " + sourceTable);
+        }
+        if (sandboxDb.isOperatorTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
+                    + ": 画布节点输出表（op_*）仅画布内部消费，不能作为数据开发任务源: " + sourceTable);
+        }
         Map<String, Object> src = sandboxDb.readTable(sandboxId, sourceTable);
         List<String> header = stringList(src.get("header"));
         List<List<String>> data = rowList(src.get("rows"));
@@ -592,39 +593,53 @@ public class DataDevService {
     private Map<String, Object> submitSandboxJarTask(Map<String, Object> request, String runMode, String sandboxId,
             String nodeId, String sourceTable, List<String> header, List<List<String>> data,
             Map<String, Object> params) {
-        String artifactId = required(request, "artifactId");
-        int version = intValue(request.get("version"), 0);
-        if (version <= 0) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 JAR 版本号 version");
+        String jarB64;
+        String artifactLabel;
+        if (notBlank(string(request.get("jar")))) {
+            // 内联 JAR 上传：直接解码使用（不依赖制品版本文件）
+            byte[] inlineJar = Base64.getDecoder().decode(string(request.get("jar")));
+            if (inlineJar.length > maxJarBytes) {
+                throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                        + ": JAR " + inlineJar.length + " 字节超过上限 " + maxJarBytes);
+            }
+            jarB64 = string(request.get("jar"));
+            artifactLabel = "jar (内联上传)";
+        } else {
+            String artifactId = required(request, "artifactId");
+            int version = intValue(request.get("version"), 0);
+            if (version <= 0) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 JAR 版本号 version");
+            }
+            Map<String, Object> artifact = requireArtifact(artifactId);
+            requireCreator(artifact, "制品");
+            if (!"JAR".equals(string(artifact.get("type")))) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 JAR 类型");
+            }
+            Map<String, Object> versionRow = requireVersion(artifactId, version);
+            String filePath = string(versionRow.get("file_path"));
+            if (!notBlank(filePath)) {
+                throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 该版本无 JAR 文件");
+            }
+            byte[] jarBytes;
+            try {
+                jarBytes = Files.readAllBytes(resolveStorePath(filePath));
+            } catch (IOException e) {
+                throw new IllegalStateException(DevErrors.DEV_NOT_FOUND + ": 读取 JAR 文件失败: " + e.getMessage(), e);
+            }
+            if (jarBytes.length > maxJarBytes) {
+                throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                        + ": JAR " + jarBytes.length + " 字节超过上限 " + maxJarBytes);
+            }
+            jarB64 = Base64.getEncoder().encodeToString(jarBytes);
+            artifactLabel = "jar " + artifactId + " v" + version;
         }
-        Map<String, Object> artifact = requireArtifact(artifactId);
-        requireCreator(artifact, "制品");
-        if (!"JAR".equals(string(artifact.get("type")))) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 JAR 类型");
-        }
-        Map<String, Object> versionRow = requireVersion(artifactId, version);
-        String filePath = string(versionRow.get("file_path"));
-        if (!notBlank(filePath)) {
-            throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 该版本无 JAR 文件");
-        }
-        byte[] jarBytes;
-        try {
-            jarBytes = Files.readAllBytes(resolveStorePath(filePath));
-        } catch (IOException e) {
-            throw new IllegalStateException(DevErrors.DEV_NOT_FOUND + ": 读取 JAR 文件失败: " + e.getMessage(), e);
-        }
-        if (jarBytes.length > maxJarBytes) {
-            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
-                    + ": JAR " + jarBytes.length + " 字节超过上限 " + maxJarBytes);
-        }
-        String jarB64 = Base64.getEncoder().encodeToString(jarBytes);
         String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
         if (inputB64.length() > maxInputBytes) {
             throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
                     + ": 输入数据超过 " + maxInputBytes + " 字节上限");
         }
         String taskId = createTask(request, runMode, "JAR", nodeId, sourceTable, "sandbox-db://" + sourceTable,
-                params, "jar " + artifactId + " v" + version, List.of());
+                params, artifactLabel, List.of());
         audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId,
                 "type=JAR mode=" + runMode + " sandbox=" + sandboxId + " table=" + sourceTable, true);
         dispatch("dev.task.submitted", Map.of("id", taskId, "type", "JAR", "mode", runMode));
@@ -644,9 +659,8 @@ public class DataDevService {
             String nodeId, String sourceTable, List<String> header, List<List<String>> data,
             Map<String, Object> params) {
         String script = resolveScript(request, "PYTHON");
-        Set<String> whitelist = enabledWhitelist();
-        DevDependencyChecker.validate(script, whitelist);
-        List<String> dependencyNames = new ArrayList<>(whitelist);
+        // 记录实际 import 的依赖（缺失依赖由 runner 运行时 pip 自动安装）
+        List<String> dependencyNames = DevDependencyChecker.extractImports(script);
         String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
         if (inputB64.length() > maxInputBytes) {
             throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
@@ -681,8 +695,6 @@ public class DataDevService {
             String nodeId, String sourceTable, List<String> header, List<List<String>> data,
             Map<String, Object> params) {
         FunctionSpec spec = resolveFunctionSpec(request);
-        Set<String> whitelist = enabledWhitelist();
-        DevDependencyChecker.validate(spec.source(), whitelist);
         // 服务端预渲染有界 SQL（参数插值 + 引号转义 + LIMIT 封顶），保证 pod 内执行与预览一致
         String renderedSql = DevSqlEngine.renderBounded(spec.sql(), params, sqlLimit);
         String wrapper = DevFunctionWrapper.generate(spec.name(), spec.nargs(), spec.source(), renderedSql);
@@ -814,37 +826,51 @@ public class DataDevService {
     private Map<String, Object> submitJarTask(Map<String, Object> request, String runMode, String nodeId,
             String datatableId, String relativeUri, List<String> header, List<List<String>> data,
             Map<String, Object> params) {
-        String artifactId = required(request, "artifactId");
-        int version = intValue(request.get("version"), 0);
-        if (version <= 0) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 JAR 版本号 version");
+        String jarB64;
+        String artifactLabel;
+        if (notBlank(string(request.get("jar")))) {
+            // 内联 JAR 上传：直接解码使用（不依赖制品版本文件）
+            byte[] inlineJar = Base64.getDecoder().decode(string(request.get("jar")));
+            if (inlineJar.length > maxJarBytes) {
+                throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                        + ": JAR " + inlineJar.length + " 字节超过上限 " + maxJarBytes);
+            }
+            jarB64 = string(request.get("jar"));
+            artifactLabel = "jar (内联上传)";
+        } else {
+            String artifactId = required(request, "artifactId");
+            int version = intValue(request.get("version"), 0);
+            if (version <= 0) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 JAR 版本号 version");
+            }
+            Map<String, Object> artifact = requireArtifact(artifactId);
+            requireCreator(artifact, "制品");
+            if (!"JAR".equals(string(artifact.get("type")))) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 JAR 类型");
+            }
+            Map<String, Object> versionRow = requireVersion(artifactId, version);
+            String filePath = string(versionRow.get("file_path"));
+            if (!notBlank(filePath)) {
+                throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 该版本无 JAR 文件");
+            }
+            byte[] jarBytes;
+            try {
+                jarBytes = Files.readAllBytes(resolveStorePath(filePath));
+            } catch (IOException e) {
+                throw new IllegalStateException(DevErrors.DEV_NOT_FOUND + ": 读取 JAR 文件失败: " + e.getMessage(), e);
+            }
+            if (jarBytes.length > maxJarBytes) {
+                throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE + ": JAR " + jarBytes.length + " 字节超过上限 " + maxJarBytes);
+            }
+            jarB64 = Base64.getEncoder().encodeToString(jarBytes);
+            artifactLabel = "jar " + artifactId + " v" + version;
         }
-        Map<String, Object> artifact = requireArtifact(artifactId);
-        requireCreator(artifact, "制品");
-        if (!"JAR".equals(string(artifact.get("type")))) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 JAR 类型");
-        }
-        Map<String, Object> versionRow = requireVersion(artifactId, version);
-        String filePath = string(versionRow.get("file_path"));
-        if (!notBlank(filePath)) {
-            throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 该版本无 JAR 文件");
-        }
-        byte[] jarBytes;
-        try {
-            jarBytes = Files.readAllBytes(resolveStorePath(filePath));
-        } catch (IOException e) {
-            throw new IllegalStateException(DevErrors.DEV_NOT_FOUND + ": 读取 JAR 文件失败: " + e.getMessage(), e);
-        }
-        if (jarBytes.length > maxJarBytes) {
-            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE + ": JAR " + jarBytes.length + " 字节超过上限 " + maxJarBytes);
-        }
-        String jarB64 = Base64.getEncoder().encodeToString(jarBytes);
         String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
         if (inputB64.length() > maxInputBytes) {
             throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE + ": 输入数据超过 " + maxInputBytes + " 字节上限");
         }
         String taskId = createTask(request, runMode, "JAR", nodeId, datatableId, relativeUri, params,
-                "jar " + artifactId + " v" + version, List.of());
+                artifactLabel, List.of());
         audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId, "type=JAR mode=" + runMode + " source=" + nodeId + "/" + datatableId, true);
         dispatch("dev.task.submitted", Map.of("id", taskId, "type", "JAR", "mode", runMode));
         try {
@@ -862,9 +888,8 @@ public class DataDevService {
             String datatableId, String relativeUri, List<String> header, List<List<String>> data,
             Map<String, Object> params) {
         String script = resolveScript(request, "PYTHON");
-        Set<String> whitelist = enabledWhitelist();
-        DevDependencyChecker.validate(script, whitelist);
-        List<String> dependencyNames = new ArrayList<>(whitelist);
+        // 记录实际 import 的依赖（缺失依赖由 runner 运行时 pip 自动安装）
+        List<String> dependencyNames = DevDependencyChecker.extractImports(script);
         String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
         if (inputB64.length() > maxInputBytes) {
             throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE + ": 输入数据超过 " + maxInputBytes + " 字节上限");
@@ -1011,7 +1036,6 @@ public class DataDevService {
                 case "PYTHON": {
                     String script = string(task.get("content_snapshot"));
                     List<String> dependencyNames = parseStringList(string(task.get("dependency_names")));
-                    DevDependencyChecker.validate(script, enabledWhitelist());
                     String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
                     devJobExecutor.submit(id, nodeId, inputB64, "PYTHON", script, params, dependencyNames);
                     break;
@@ -1038,6 +1062,14 @@ public class DataDevService {
         sourceTable = sourceTable.startsWith(prefix) ? sourceTable.substring(prefix.length()) : sourceTable;
         if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
             throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 沙箱内无此表: " + sourceTable);
+        }
+        if (sandboxDb.isResultTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
+                    + ": 计算结果表不能作为沙箱计算源（仅支持预览与导出）: " + sourceTable);
+        }
+        if (sandboxDb.isOperatorTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
+                    + ": 画布节点输出表（op_*）仅画布内部消费，不能作为数据开发任务源: " + sourceTable);
         }
         Map<String, Object> src = sandboxDb.readTable(sandboxId, sourceTable);
         List<String> header = stringList(src.get("header"));
@@ -1077,7 +1109,6 @@ public class DataDevService {
                 case "PYTHON": {
                     String script = string(task.get("content_snapshot"));
                     List<String> dependencyNames = parseStringList(string(task.get("dependency_names")));
-                    DevDependencyChecker.validate(script, enabledWhitelist());
                     String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
                     devJobExecutor.submitSandbox(id, nodeId, inputB64, "PYTHON", script, params, dependencyNames,
                             sandboxId, sourceTable, outputTable);
@@ -1092,8 +1123,6 @@ public class DataDevService {
                         throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID
                                 + ": 函数任务缺少函数定义，无法重试");
                     }
-                    Set<String> whitelist = enabledWhitelist();
-                    DevDependencyChecker.validate(functionSource, whitelist);
                     List<String> dependencyNames = DevDependencyChecker.extractImports(functionSource);
                     String renderedSql = DevSqlEngine.renderBounded(sql, params, sqlLimit);
                     String wrapper = DevFunctionWrapper.generate(functionName, functionNargs, functionSource, renderedSql);
@@ -1134,6 +1163,11 @@ public class DataDevService {
                 || !STATUS_SUCCEEDED.equals(string(task.get("status")))
                 || !notBlank(string(task.get("result_datatable_id")))) {
             throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT + ": 仅 PROD SUCCEEDED 且含结果数据集的任务可挂载");
+        }
+        // 沙箱计算结果（result_<taskId>）仅预览/导出，禁止挂载项目
+        if (notBlank(string(task.get("sandbox_id")))) {
+            throw new IllegalStateException(DevErrors.DEV_RESULT_NOT_MOUNTABLE
+                    + ": 沙箱计算结果仅支持预览与导出，不能挂载到项目: " + taskId);
         }
         String nodeId = string(task.get("result_node_id"));
         String datatableId = string(task.get("result_datatable_id"));
@@ -1299,6 +1333,30 @@ public class DataDevService {
         return taskId;
     }
 
+    /**
+     * 画布节点任务：在沙箱内创建 ds_dev_task（channel='canvas'，runMode=DEV，execType=PYTHON），
+     * 由画布引擎经 DevJobExecutor.submitSandboxChannel 派发到 v2-ml 镜像执行。
+     * 输入表在 submit 时显式指定（挂载表或上游 op_*）；output_table 预写 op_{canvasId}_{nodeId}。
+     */
+    public String createCanvasTask(String sandboxId, String canvasId, String nodeId, String componentCode,
+            String script, Map<String, Object> params, List<String> dependencyNames, String outputTable) {
+        Map<String, Object> sandbox = requireRow("select project_id,owner_id from ds_sandbox where id=? and deleted=0", sandboxId);
+        requireSandboxCreator(sandboxId, "");
+        String taskId = "dt-" + shortId();
+        String now = now();
+        jdbc.update("insert into ds_dev_task(id,name,description,artifact_id,version,run_mode,exec_type,source_node_id,"
+                        + "source_datatable_id,source_relative_uri,params,content_snapshot,dependency_names,status,result_node_id,"
+                        + "result_datatable_id,result_preview,source_rows,result_rows,error_message,kuscia_job_id,retry_count,"
+                        + "created_by,created_at,updated_at,started_at,finished_at,deleted,project_id,sandbox_id,source_asset_id,source_mount_id,result_asset_id,"
+                        + "source_table_name,output_table_name,function_name,function_nargs,function_source,sql_template,channel)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','','','',0,0,'','',0,?,?,?,?,'',0,?,?,?,?,'',?,?,?,?,?,?,'canvas')",
+                taskId, "画布节点-" + componentCode, "画布执行节点任务", "", 0, "DEV", "PYTHON",
+                string(sandbox.get("owner_id")), "", "", json(params), script, json(dependencyNames),
+                actor(), now, now, now, string(sandbox.get("project_id")), sandboxId,
+                "", "", "", outputTable, "", 0, "", "");
+        return taskId;
+    }
+
     private Map<String, Object> requireSandboxMount(String sandboxId, String mountId, String assetId) {
         requireSandboxCreator(sandboxId, "");
         StringBuilder sql = new StringBuilder("select m.*,a.datatable_id,a.processor_node_id,s.project_id from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id join ds_sandbox s on s.id=m.sandbox_id where m.sandbox_id=? and m.deleted=0 and m.status='READY' and a.deleted=0 and a.status='ACTIVE' and a.data_stage='PROCESSED'");
@@ -1323,6 +1381,14 @@ public class DataDevService {
     }
 
     /** 认领 PENDING 任务为 RUNNING（条件 UPDATE + affected==1 并发控制）。 */
+    public void claimCanvasTask(String taskId) {
+        int affected = jdbc.update("update ds_dev_task set status=?,started_at=?,updated_at=? where id=? and status=?",
+                STATUS_RUNNING, now(), now(), taskId, STATUS_PENDING);
+        if (affected != 1) {
+            throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT + ": 画布节点任务状态已变更，无法开始执行: " + taskId);
+        }
+    }
+
     private void claimTask(String taskId) {
         int affected = jdbc.update("update ds_dev_task set status=?,started_at=?,updated_at=? where id=? and status=?",
                 STATUS_RUNNING, now(), now(), taskId, STATUS_PENDING);
@@ -1378,14 +1444,18 @@ public class DataDevService {
         return (max == null ? 0 : max) + 1;
     }
 
-    private Set<String> enabledWhitelist() {
-        List<Map<String, Object>> rows = jdbc.queryForList(
-                "select name from ds_dev_dependency where deleted=0 and enabled=1");
-        Set<String> result = new java.util.HashSet<>();
-        for (Map<String, Object> row : rows) {
-            result.add(string(row.get("name")).toLowerCase(Locale.ROOT));
+    /** 版本号解析：用户手填（正整数 + 与已有版本查重）时用用户值，否则自动自增。 */
+    private int resolveVersion(String artifactId, Object requested) {
+        Integer userVersion = intValue(requested);
+        if (userVersion == null || userVersion <= 0) {
+            return nextVersion(artifactId);
         }
-        return result;
+        Long dup = count("select count(1) from ds_dev_artifact_version where artifact_id=? and version=? and deleted=0",
+                artifactId, userVersion);
+        if (dup > 0) {
+            throw new IllegalArgumentException(DevErrors.DEV_VERSION_EXISTS + ": 版本号已存在: v" + userVersion);
+        }
+        return userVersion;
     }
 
     /* ============================== 数据 / 注册 ============================== */

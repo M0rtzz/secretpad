@@ -7,6 +7,7 @@ package org.secretflow.secretpad.web.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.util.UserContext;
+import org.secretflow.secretpad.web.service.canvas.CanvasOperatorRegistry;
 import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -125,6 +126,12 @@ public class DataComputeService {
         return sandboxDb.downloadBytes(sandboxId);
     }
 
+    /** 沙箱单表 CSV 导出（MOUNT/RESULT 均可，仅创建人）。 */
+    public byte[] sandboxDbTableExport(String sandboxId, String tableName) {
+        requireUsableSandbox(sandboxId, true);
+        return sandboxDb.readTableCsv(sandboxId, tableName);
+    }
+
     public Map<String, Object> requestMount(Map<String, Object> request) {
         String sandboxId = required(request, "sandboxId");
         Map<String, Object> sandbox = requireSandbox(sandboxId);
@@ -155,38 +162,8 @@ public class DataComputeService {
     }
 
     private List<Map<String, Object>> builtInComponents() {
-        return List.of(
-                component("data.table", "数据资源", "数据输入", "读取当前沙箱已挂载的数据"),
-                component("preprocessing.psi", "数据对齐", "数据处理", "隐私集合求交与样本对齐"),
-                component("preprocessing.feature_align", "特征对齐", "数据处理", "参与方字段与特征语义对齐"),
-                component("preprocessing.outlier", "异常值处理", "数据处理", "检测并处理异常值"),
-                component("preprocessing.fillna", "缺失值处理", "数据处理", "缺失值填充或删除"),
-                component("preprocessing.unique", "唯一值筛选", "数据处理", "筛除常量和低信息量特征"),
-                component("preprocessing.binning", "特征分箱", "特征工程", "等频、等距及自定义分箱"),
-                component("preprocessing.woe", "WOE 转换", "特征工程", "分箱后的证据权重转换"),
-                component("preprocessing.standardize", "标准化", "特征工程", "数值特征归一化和标准化"),
-                component("stats.correlation", "相关系数", "统计分析", "计算特征相关性矩阵"),
-                component("ml.knn", "KNN", "机器学习", "K 近邻分类或回归"),
-                component("ml.kmeans", "KMeans", "机器学习", "无监督聚类"),
-                component("ml.dnn", "DNN", "深度学习", "深度神经网络训练与预测"),
-                component("ml.logistic_regression", "逻辑回归", "机器学习", "二分类逻辑回归"),
-                component("ml.linear_regression", "线性回归", "机器学习", "线性回归训练与预测"),
-                component("ml.binary_classification", "二分类评估", "模型评估", "准确率、精确率、召回率和 AUC 评估"));
-    }
-
-    private Map<String, Object> component(String code, String name, String category, String description) {
-        Map<String, Object> item = new LinkedHashMap<>();
-        item.put("code", code);
-        item.put("name", name);
-        item.put("category", category);
-        item.put("runtime_app", "SecretFlow");
-        item.put("runtime_code", code);
-        item.put("version", "1.0.0");
-        item.put("description", description);
-        item.put("parameter_schema_json", "[]");
-        item.put("default_params_json", "{}");
-        item.put("source", "BUILT_IN");
-        return item;
+        // 智能建模算子超市：元数据 + 参数 schema + 输入/输出 schema + 资源配额统一由 CanvasOperatorRegistry 维护
+        return new ArrayList<>(CanvasOperatorRegistry.builtInComponents());
     }
 
     @Transactional
@@ -226,15 +203,20 @@ public class DataComputeService {
         String graph = json(request.getOrDefault("graph", Map.of("nodes", List.of(), "edges", List.of())));
         String id = string(request.get("id"));
         String now = now();
+        // 画布拖拽/连线等自动保存时前端传 snapshot=false，避免版本快照爆炸；显式「保存」才生成版本记录
+        boolean snapshot = !"false".equals(String.valueOf(request.get("snapshot")));
         if (id.isBlank()) {
             id = "canvas-" + shortId();
             jdbc.update("insert into ds_compute_canvas(id,project_id,sandbox_id,name,description,graph_json,version,status,created_by,created_at,updated_at,deleted) values(?,?,?,?,?,?,1,'DRAFT',?,?,?,0)",
                     id, sandbox.get("project_id"), sandboxId, required(request, "name"), string(request.get("description")), graph, actor(), now, now);
+            if (snapshot) snapshotCanvasVersion(id, 1, string(request.get("name")), graph, actor(), now);
         } else {
             Map<String, Object> old = row("select * from ds_compute_canvas where id=? and deleted=0", id);
             if (!Objects.equals(actor(), string(old.get("created_by")))) throw new SecurityException("仅画布创建人可编辑");
-            jdbc.update("update ds_compute_canvas set name=?,description=?,graph_json=?,version=version+1,updated_at=? where id=? and deleted=0",
-                    required(request, "name"), string(request.get("description")), graph, now, id);
+            int newVersion = intValue(old.get("version"), 0) + 1;
+            jdbc.update("update ds_compute_canvas set name=?,description=?,graph_json=?,version=?,updated_at=? where id=? and deleted=0",
+                    required(request, "name"), string(request.get("description")), graph, newVersion, now, id);
+            if (snapshot) snapshotCanvasVersion(id, newVersion, string(request.get("name")), graph, actor(), now);
         }
         return row("select * from ds_compute_canvas where id=?", id);
     }
@@ -333,4 +315,11 @@ public class DataComputeService {
     private String shortId(){return UUID.randomUUID().toString().replace("-","").substring(0,12);}
     private String json(Object value){try{return mapper.writeValueAsString(value);}catch(Exception e){throw new IllegalArgumentException("JSON 格式错误",e);}}
     @SuppressWarnings("unchecked") private Object parse(String value){try{return mapper.readValue(value,Map.class);}catch(Exception e){return Map.of();}}
+    private static int intValue(Object v, int d){if(v instanceof Number n){return n.intValue();}if(v==null||String.valueOf(v).isBlank()){return d;}try{return Integer.parseInt(String.valueOf(v).trim());}catch(NumberFormatException e){return d;}}
+
+    /** 画布保存版本快照：ds_compute_canvas_version（供回滚/对比）。 */
+    private void snapshotCanvasVersion(String canvasId, int version, String name, String graph, String createdBy, String now) {
+        jdbc.update("insert into ds_compute_canvas_version(id,canvas_id,version,name,graph_json,created_by,created_at,deleted) values(?,?,?,?,?,?,?,0)",
+                "cv-" + shortId(), canvasId, version, name, graph, createdBy, now);
+    }
 }

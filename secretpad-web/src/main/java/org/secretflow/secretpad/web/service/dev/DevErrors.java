@@ -38,4 +38,13 @@ public final class DevErrors {
 
     /** Python 脚本引用了不在依赖白名单内的库。 */
     public static final String DEV_DEPENDENCY_REJECTED = "DEV_DEPENDENCY_REJECTED";
+
+    /** 计算结果表（result_*）不能作为沙箱计算源（仅预览/导出）。 */
+    public static final String DEV_RESULT_NOT_CONSUMABLE = "DEV_RESULT_NOT_CONSUMABLE";
+
+    /** 沙箱计算结果不能挂载到项目（仅预览/导出）。 */
+    public static final String DEV_RESULT_NOT_MOUNTABLE = "DEV_RESULT_NOT_MOUNTABLE";
+
+    /** 制品版本号与已有版本冲突。 */
+    public static final String DEV_VERSION_EXISTS = "DEV_VERSION_EXISTS";
 }

@@ -79,6 +79,9 @@ public class ModelApiService {
     private ModelTestService modelTestService;
 
     @Resource
+    private ModelApprovalService modelApprovalService;
+
+    @Resource
     private EnvService envService;
 
     @Value("${secretpad.deploy-mode:}")
@@ -126,6 +129,34 @@ public class ModelApiService {
         result.put("secret", secret);
         result.put("notice", "调用密钥只显示一次，请立即保存");
         return result;
+    }
+
+    /**
+     * 制品→API 一键发布（发布源双入口之「制品」侧）：选沙箱制品+版本，自动注册 APPROVED 模型
+     * （幂等，同制品同版本复用），再发布受控 API。返回与 {@link #create} 相同结构（含一次性 app_id+secret）。
+     */
+    public Map<String, Object> createFromArtifact(Map<String, Object> request) {
+        String artifactId = required(request, "artifactId");
+        String artifactVersionId = required(request, "artifactVersionId");
+        String sandboxId = string(request.get("sandboxId"));
+        // projectId 缺省时从制品反查（制品已归属项目，沙箱上下文下无需客户端显式传）
+        String projectId = string(request.get("projectId"));
+        if (!notBlank(projectId)) {
+            List<Map<String, Object>> artRows = jdbc.queryForList(
+                    "select project_id from ds_dev_artifact where id=? and deleted=0", artifactId);
+            if (!artRows.isEmpty()) {
+                projectId = string(artRows.get(0).get("project_id"));
+            }
+        }
+        if (!notBlank(projectId)) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID + ": 缺少 projectId");
+        }
+        String name = required(request, "name");
+        Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
+                name, projectId, artifactId, artifactVersionId, sandboxId, string(request.get("description")));
+        Map<String, Object> apiRequest = new LinkedHashMap<>(request);
+        apiRequest.put("modelId", string(model.get("id")));
+        return create(apiRequest);
     }
 
     public List<Map<String, Object>> list(String keyword) {

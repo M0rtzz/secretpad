@@ -100,6 +100,7 @@ public final class DevSqlEngine {
             }
             logs.add("query_only=ON");
             assertReadOnly(sql);
+            assertNoResultConsumption(sql);
             rendered = interpolate(sql, params);
             String bounded = ensureLimit(rendered, maxResultRows);
             logs.add("exec " + String.valueOf(timeoutSeconds) + "s timeout, limit=" + maxResultRows);
@@ -157,6 +158,7 @@ public final class DevSqlEngine {
             }
             logs.add("query_only=ON, db=" + dbFile.getFileName());
             assertReadOnly(sql);
+            assertNoResultConsumption(sql);
             rendered = interpolate(sql, params);
             String bounded = ensureLimit(rendered, maxResultRows);
             logs.add("exec " + timeoutSeconds + "s timeout, limit=" + maxResultRows);
@@ -287,6 +289,24 @@ public final class DevSqlEngine {
             end++;
         }
         return s.substring(0, end).toUpperCase(Locale.ROOT);
+    }
+
+    /** FROM/JOIN 引用的表名（去掉字符串字面量后扫描，规避列名/字符串里的误报）。 */
+    private static final Pattern TABLE_REF =
+            Pattern.compile("(?i)\\b(?:from|join)\\s+[`\"]?([a-zA-Z_][\\w\\-]*)[`\"]?");
+
+    /** 计算结果表（result_*）只能预览/导出，禁止在 SQL 的 FROM/JOIN 中引用消费。 */
+    private static void assertNoResultConsumption(String sql) {
+        String body = TRAILING_SEMIS.matcher(sql).replaceFirst("");
+        String withoutLiterals = body.replaceAll("'([^']|'')*'", "''");
+        Matcher m = TABLE_REF.matcher(withoutLiterals);
+        while (m.find()) {
+            String table = m.group(1);
+            if (table.toLowerCase(Locale.ROOT).startsWith("result_")) {
+                throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
+                        + ": 计算结果表不能作为沙箱计算源（仅支持预览与导出）: " + table);
+            }
+        }
     }
 
     private static boolean containsWord(String text, String word) {
