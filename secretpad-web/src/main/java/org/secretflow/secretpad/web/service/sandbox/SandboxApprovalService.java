@@ -46,10 +46,10 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Z-03 沙箱资源申请与审批：申请单 CRUD、两级审批动作、权限/并发/幂等控制、审批历史与执行引擎。
+ * Z-03 沙箱资源申请与审批：申请单 CRUD、项目节点审批、权限/并发/幂等控制、审批历史与执行引擎。
  *
- * <p>审批流程由 {@link SandboxApprovalStateMachine} 驱动：DATA_PROVIDER_REVIEW → OPERATOR_REVIEW →
- * APPROVED，任一级可 REJECTED（RESUBMIT 复审 version+1），APPROVED 由轮询器认领
+ * <p>审批流程由 {@link SandboxApprovalStateMachine} 驱动：DATA_PROVIDER_REVIEW → APPROVED，
+ * 任一级可 REJECTED（RESUBMIT 复审 version+1），APPROVED 由轮询器认领
  * （EXECUTING → COMPLETED），失败自动重试（回退 APPROVED，达上限置 FAILED 可人工 RETRY）。</p>
  *
  * <p>并发控制：所有动作走「条件 UPDATE + affected==1」判定，只有一个线程能赢。
@@ -820,9 +820,9 @@ public class SandboxApprovalService {
         return switch (action) {
             case "APPROVE" -> {
                 if ("DATA_PROVIDER_REVIEW".equals(from)) {
-                    yield jdbc.update("update ds_sandbox_approval set status='OPERATOR_REVIEW',current_stage='OPERATOR_REVIEW',reviewer=?,review_comment=?,updated_at=? "
+                    yield jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',reviewer=?,review_comment=?,approved_at=?,updated_at=? "
                                     + "where id=? and status='DATA_PROVIDER_REVIEW' and deleted=0",
-                            operator(), comment, now, id);
+                            operator(), comment, now, now, id);
                 }
                 yield jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',reviewer=?,review_comment=?,approved_at=?,updated_at=? "
                                 + "where id=? and status='OPERATOR_REVIEW' and deleted=0",
@@ -977,7 +977,7 @@ public class SandboxApprovalService {
         if ("REJECTED".equals(voteStatus)) {
             jdbc.update("update ds_sandbox_approval set status='REJECTED',current_stage='REJECTED',reviewer=?,review_comment=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), approvalId);
         } else if (count("select count(1) from ds_sandbox_approval_vote where approval_id=? and status='PENDING'", approvalId) == 0) {
-            jdbc.update("update ds_sandbox_approval set status='OPERATOR_REVIEW',current_stage='OPERATOR_REVIEW',reviewer=?,review_comment=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), approvalId);
+            jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',reviewer=?,review_comment=?,approved_at=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), now(), approvalId);
         }
     }
 
