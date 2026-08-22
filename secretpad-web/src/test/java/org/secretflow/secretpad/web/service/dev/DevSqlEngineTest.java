@@ -102,6 +102,44 @@ public class DevSqlEngineTest {
     }
 
     @Test
+    void renderBoundedInterpolatesAndAppendsLimit() {
+        String rendered = DevSqlEngine.renderBounded(
+                "SELECT * FROM src WHERE name={{name}}", Map.of("name", "bob"), 2);
+        assertTrue(rendered.contains("WHERE name='bob'"), rendered);
+        assertTrue(rendered.trim().endsWith("LIMIT 2;"), rendered);
+        // 渲染结果可直接执行
+        DevSqlEngine.SqlResult result = execute(rendered, 10);
+        assertEquals(1, result.rows().size());
+        assertEquals("bob", result.rows().get(0).get(1));
+    }
+
+    @Test
+    void renderBoundedKeepsExistingLimit() {
+        String rendered = DevSqlEngine.renderBounded(
+                "SELECT * FROM src LIMIT 1", Map.of(), 10);
+        assertTrue(rendered.trim().endsWith("LIMIT 1;"), rendered);
+    }
+
+    @Test
+    void renderBoundedRejectsMissingParam() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> DevSqlEngine.renderBounded("SELECT * FROM src WHERE name={{nope}}", Map.of(), 10));
+        assertTrue(e.getMessage().contains("DEV_PARAM_INVALID"));
+    }
+
+    @Test
+    void renderBoundedRejectsBlank() {
+        assertThrows(IllegalArgumentException.class,
+                () -> DevSqlEngine.renderBounded("  ", Map.of(), 10));
+        assertThrows(IllegalArgumentException.class,
+                () -> DevSqlEngine.renderBounded(null, Map.of(), 10));
+    }
+
+    private DevSqlEngine.SqlResult execute(String sql, int limit) {
+        return DevSqlEngine.execute(CSV, sql, Map.of(), limit, 5);
+    }
+
+    @Test
     void rejectsEmptyCsv() {
         assertThrows(IllegalArgumentException.class,
                 () -> DevSqlEngine.execute("", "SELECT 1", Map.of(), 10, 5));

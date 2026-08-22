@@ -39,6 +39,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
@@ -86,6 +87,9 @@ public class DevJobExecutor {
 
     @Value("${secretpad.data-sandbox.dev.input-bytes:262144}")
     private long maxInputBytes;
+
+    @Value("${secretpad.data-sandbox.dev.sandbox-db-bytes:20971520}")
+    private long maxSandboxDbBytes;
 
     @Value("${secretpad.data-sandbox.dev.timeout-seconds:300}")
     private long timeoutSeconds;
@@ -150,16 +154,27 @@ public class DevJobExecutor {
     /**
      * 沙箱表源任务（Stage 4）：与 {@link #submit} 相同的 CSV base64 回退通道，额外在
      * {@code task_input_config} 注入沙箱库 JDBC 契约（{@code jdbc_url}/{@code input_table}/
-     * {@code output_table}），供升级版 runner 直接连库计算（当前 runner 仍走 CSV 回退）。
+     * {@code output_table}）与整库快照 {@code sandbox_db_b64}，供升级版 runner 直连
+     * {@code /workspace/sandbox_data.db} 计算；DB 快照缺失（sandboxId 为空）时 runner
+     * 自动回退旧 CSV 模式。
      */
     public void submitSandbox(String taskId, String nodeId, String inputB64, String execType,
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
-            String inputTable, String outputTable) {
+            String sandboxId, String inputTable, String outputTable) {
         Map<String, Object> extra = new LinkedHashMap<>();
         extra.put("jdbc_url", "jdbc:sqlite:/workspace/sandbox_data.db");
         extra.put("input_table", inputTable);
         if (notBlank(outputTable)) {
             extra.put("output_table", outputTable);
+        }
+        if (notBlank(sandboxId)) {
+            byte[] db = sandboxDb.downloadBytes(sandboxId);
+            if (db.length > maxSandboxDbBytes) {
+                throw new IllegalStateException(DevErrors.DEV_INPUT_TOO_LARGE
+                        + ": 沙箱数据库超过 " + maxSandboxDbBytes + " 字节上限（当前 "
+                        + db.length + " 字节）");
+            }
+            extra.put("sandbox_db_b64", Base64.getEncoder().encodeToString(db));
         }
         doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, "dev", extra);
     }

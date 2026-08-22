@@ -39,7 +39,8 @@ public final class DevDependencyChecker {
             "http", "ssl", "binascii", "struct", "array", "bisect", "heapq", "operator",
             "platform", "shutil", "glob", "gzip", "zipfile", "tarfile", "xml", "html", "numbers",
             "sysconfig", "concurrent", "asyncio", "threading", "queue", "weakref", "inspect",
-            "importlib", "pkgutil", "codecs", "getpass", "secrets", "uuid", "zoneinfo", "contextvars");
+            "importlib", "pkgutil", "codecs", "getpass", "secrets", "uuid", "zoneinfo", "contextvars",
+            "sqlite3");
 
     private static final Pattern IMPORT_LINE = Pattern.compile("(?im)^\\s*import\\s+([a-zA-Z_][\\w.]*)");
     private static final Pattern FROM_LINE = Pattern.compile("(?im)^\\s*from\\s+([a-zA-Z_][\\w.]*)\\s+import");

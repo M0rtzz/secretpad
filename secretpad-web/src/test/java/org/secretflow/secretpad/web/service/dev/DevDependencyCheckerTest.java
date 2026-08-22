@@ -57,6 +57,13 @@ public class DevDependencyCheckerTest {
     }
 
     @Test
+    void allowsSqlite3Stdlib() {
+        // E2E 修复：sqlite3 为标准库，FUNCTION 包装器/PYTHON 脚本直连沙箱 DB 快照需放行
+        DevDependencyChecker.validate("import sqlite3", WHITELIST);
+        DevDependencyChecker.validate("import os, sqlite3\nfrom sqlite3 import connect", WHITELIST);
+    }
+
+    @Test
     void noImportOk() {
         DevDependencyChecker.validate("print('hello')", WHITELIST);
     }

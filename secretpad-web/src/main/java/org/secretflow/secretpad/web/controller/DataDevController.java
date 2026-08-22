@@ -29,14 +29,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Z-05 计算任务开发能力 API：制品（JAR/SQL/PYTHON）与版本、依赖白名单、任务提交/操作/调试日志。
+ * Z-05 计算任务开发能力 API：制品（JAR/SQL/PYTHON/FUNCTION）与版本、依赖白名单、任务提交/操作/调试日志。
  *
  * <p>权限：制品/任务/依赖按创建人隔离；submit/preview/mount 走
  * {@link DataDevService#checkSourcePermission}；viewResult/runLog/mount 限创建人。
  * 错误码沿用全局异常体系（DEV_NO_PERMISSION / DEV_INPUT_TOO_LARGE / DEV_NOT_FOUND /
  * DEV_STATE_CONFLICT / DEV_PARAM_INVALID / DEV_DEPENDENCY_REJECTED）。所有写操作在服务内审计 + webhook。</p>
  */
-@Tag(name = "Data Dev", description = "数据开发：制品与版本管理、JAR/SQL/Python 计算任务、依赖白名单、调试日志")
+@Tag(name = "Data Dev", description = "数据开发：制品与版本管理、JAR/SQL/Python/函数(UDF) 计算任务、依赖白名单、调试日志")
 @RestController
 @RequestMapping("/api/v1alpha1/data-dev")
 public class DataDevController {
@@ -49,7 +49,7 @@ public class DataDevController {
 
     /* ------------------------------- 制品 ------------------------------- */
 
-    @Operation(summary = "创建制品（type=JAR/SQL/PYTHON，同名幂等拒绝）")
+    @Operation(summary = "创建制品（type=JAR/SQL/PYTHON/FUNCTION，同名幂等拒绝）")
     @PostMapping("/artifacts")
     public SecretPadResponse<Map<String, Object>> createArtifact(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.createArtifact(request));
@@ -85,7 +85,7 @@ public class DataDevController {
 
     /* ------------------------------- 版本 ------------------------------- */
 
-    @Operation(summary = "新增 SQL/PYTHON 脚本版本（版本自增，不可变）")
+    @Operation(summary = "新增 SQL/PYTHON/函数 版本（版本自增，不可变）")
     @PostMapping("/artifacts/versions")
     public SecretPadResponse<Map<String, Object>> createVersion(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.createVersion(request));

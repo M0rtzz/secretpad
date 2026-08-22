@@ -72,8 +72,8 @@ public class DataDevService {
     private static final String STATUS_FAILED = "FAILED";
     private static final String STATUS_CANCELLED = "CANCELLED";
 
-    private static final Set<String> EXEC_TYPES = Set.of("JAR", "SQL", "PYTHON");
-    private static final Set<String> ARTIFACT_TYPES = Set.of("JAR", "SQL", "PYTHON");
+    private static final Set<String> EXEC_TYPES = Set.of("JAR", "SQL", "PYTHON", "FUNCTION");
+    private static final Set<String> ARTIFACT_TYPES = Set.of("JAR", "SQL", "PYTHON", "FUNCTION");
     private static final Set<String> RUN_MODES = Set.of("DEV", "PROD");
 
     private static final String ATTR_DATASOURCE_TYPE = "DatasourceType";
@@ -172,7 +172,7 @@ public class DataDevService {
         String name = required(request, "name");
         String type = required(request, "type").trim().toUpperCase(Locale.ROOT);
         if (!ARTIFACT_TYPES.contains(type)) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": type 必须是 JAR/SQL/PYTHON");
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": type 必须是 JAR/SQL/PYTHON/FUNCTION");
         }
         String projectId = string(request.get("projectId"));
         String sandboxId = string(request.get("sandboxId"));
@@ -264,7 +264,7 @@ public class DataDevService {
         validateJsonArray(paramsSchema, "paramsSchema");
         validateJsonObject(defaultParams, "defaultParams");
         List<String> dependencyNames = stringList(request.get("dependencyNames"));
-        if ("PYTHON".equals(type)) {
+        if ("PYTHON".equals(type) || "FUNCTION".equals(type)) {
             Set<String> whitelist = enabledWhitelist();
             for (String dep : dependencyNames) {
                 if (!whitelist.contains(dep.toLowerCase(Locale.ROOT))) {
@@ -274,13 +274,26 @@ public class DataDevService {
             }
             DevDependencyChecker.validate(contentText, whitelist);
         }
+        String functionName = "";
+        int functionNargs = 0;
+        String sqlTemplate = "";
+        if ("FUNCTION".equals(type)) {
+            functionName = string(request.get("functionName")).trim();
+            functionNargs = intValue(request.get("functionNargs"), -1);
+            sqlTemplate = string(request.get("sqlTemplate"));
+            if (!notBlank(functionName) || !notBlank(sqlTemplate) || functionNargs < 0) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID
+                        + ": FUNCTION 版本需提供 functionName/functionNargs/sqlTemplate");
+            }
+        }
         int version = nextVersion(artifactId);
         String versionId = "dav-" + shortId();
         String now = now();
-        jdbc.update("insert into ds_dev_artifact_version(id,artifact_id,version,content_text,file_path,sha256,size,params_schema,default_params,dependency_names,description,created_by,created_at,deleted)"
-                        + " values(?,?,?,?,'','',0,?,?,?,?,?,?,0)",
+        jdbc.update("insert into ds_dev_artifact_version(id,artifact_id,version,content_text,file_path,sha256,size,params_schema,default_params,dependency_names,description,created_by,created_at,deleted,function_name,function_nargs,sql_template)"
+                        + " values(?,?,?,?,'','',0,?,?,?,?,?,?,0,?,?,?)",
                 versionId, artifactId, version, contentText, paramsSchema, defaultParams,
-                json(dependencyNames), string(request.get("description")), actor(), now);
+                json(dependencyNames), string(request.get("description")), actor(), now,
+                functionName, functionNargs, sqlTemplate);
         jdbc.update("update ds_dev_artifact set latest_version=?,updated_at=? where id=?", version, now, artifactId);
         audit("DEV_ARTIFACT_VERSION_CREATE", "DEV_ARTIFACT_VERSION", versionId, "version=" + version, true);
         dispatch("dev.artifact.versionCreated", Map.of("id", versionId, "artifactId", artifactId, "version", version));
@@ -448,7 +461,7 @@ public class DataDevService {
         }
         String execType = required(request, "execType").trim().toUpperCase(Locale.ROOT);
         if (!EXEC_TYPES.contains(execType)) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON");
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON/FUNCTION");
         }
         String sandboxId = string(request.get("sandboxId"));
         String mountId = string(request.get("mountId"));
@@ -515,7 +528,7 @@ public class DataDevService {
         }
         String execType = required(request, "execType").trim().toUpperCase(Locale.ROOT);
         if (!EXEC_TYPES.contains(execType)) {
-            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON");
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON/FUNCTION");
         }
         requireSandboxCreator(sandboxId, "");
         Map<String, Object> sandbox = requireRow("select project_id,owner_id from ds_sandbox where id=?", sandboxId);
@@ -547,6 +560,9 @@ public class DataDevService {
             }
             case "PYTHON" -> {
                 return submitSandboxPythonTask(request, runMode, sandboxId, nodeId, sourceTable, header, data, params);
+            }
+            case "FUNCTION" -> {
+                return submitSandboxFunctionTask(request, runMode, sandboxId, nodeId, sourceTable, header, data, params);
             }
             default -> throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 未知 execType " + execType);
         }
@@ -615,7 +631,7 @@ public class DataDevService {
         try {
             claimTask(taskId);
             devJobExecutor.submitSandbox(taskId, nodeId, inputB64, "JAR", jarB64, params, List.of(),
-                    sourceTable, string(request.get("outputTable")));
+                    sandboxId, sourceTable, string(request.get("outputTable")));
         } catch (Exception e) {
             log.warn("Dev sandbox JAR task {} failed: {}", taskId, e.getMessage(), e);
             failTask(taskId, e);
@@ -644,12 +660,92 @@ public class DataDevService {
         try {
             claimTask(taskId);
             devJobExecutor.submitSandbox(taskId, nodeId, inputB64, "PYTHON", script, params, dependencyNames,
-                    sourceTable, string(request.get("outputTable")));
+                    sandboxId, sourceTable, string(request.get("outputTable")));
         } catch (Exception e) {
             log.warn("Dev sandbox PYTHON task {} failed: {}", taskId, e.getMessage(), e);
             failTask(taskId, e);
         }
         return taskDetail(taskId);
+    }
+
+    /** FUNCTION 函数定义解析结果（inline 或引用 FUNCTION 制品版本）。 */
+    private record FunctionSpec(String name, int nargs, String source, String sql) {
+    }
+
+    /**
+     * 沙箱 FUNCTION（UDF）任务：JVM 无法执行用户 Python 函数，后端生成 Python 包装器
+     * （内嵌服务端预渲染有界 SQL）复用 python-runner pod 执行；源表 CSV base64 作回退
+     * 输入 + 沙箱库 DB 快照送 pod。函数定义与 SQL 持久化到 ds_dev_task 备查/重试。
+     */
+    private Map<String, Object> submitSandboxFunctionTask(Map<String, Object> request, String runMode, String sandboxId,
+            String nodeId, String sourceTable, List<String> header, List<List<String>> data,
+            Map<String, Object> params) {
+        FunctionSpec spec = resolveFunctionSpec(request);
+        Set<String> whitelist = enabledWhitelist();
+        DevDependencyChecker.validate(spec.source(), whitelist);
+        // 服务端预渲染有界 SQL（参数插值 + 引号转义 + LIMIT 封顶），保证 pod 内执行与预览一致
+        String renderedSql = DevSqlEngine.renderBounded(spec.sql(), params, sqlLimit);
+        String wrapper = DevFunctionWrapper.generate(spec.name(), spec.nargs(), spec.source(), renderedSql);
+        String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+        if (inputB64.length() > maxInputBytes) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": 输入数据超过 " + maxInputBytes + " 字节上限");
+        }
+        // 函数列经 createTask 持久化：回写已解析规格，让 createTask 从 request 取值
+        request.put("functionName", spec.name());
+        request.put("functionNargs", spec.nargs());
+        request.put("functionSource", spec.source());
+        request.put("sql", spec.sql());
+        String taskId = createTask(request, runMode, "FUNCTION", nodeId, sourceTable, "sandbox-db://" + sourceTable,
+                params, wrapper, DevDependencyChecker.extractImports(spec.source()));
+        audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId,
+                "type=FUNCTION mode=" + runMode + " sandbox=" + sandboxId + " table=" + sourceTable
+                        + " fn=" + spec.name(), true);
+        dispatch("dev.task.submitted", Map.of("id", taskId, "type", "FUNCTION", "mode", runMode));
+        try {
+            claimTask(taskId);
+            devJobExecutor.submitSandbox(taskId, nodeId, inputB64, "FUNCTION", wrapper, params,
+                    DevDependencyChecker.extractImports(spec.source()),
+                    sandboxId, sourceTable, string(request.get("outputTable")));
+        } catch (Exception e) {
+            log.warn("Dev sandbox FUNCTION task {} failed: {}", taskId, e.getMessage(), e);
+            failTask(taskId, e);
+        }
+        return taskDetail(taskId);
+    }
+
+    /** FUNCTION 定义解析：优先 inline（functionName/functionNargs/functionSource/sql），否则引用 FUNCTION 制品版本。 */
+    private FunctionSpec resolveFunctionSpec(Map<String, Object> request) {
+        String inlineName = string(request.get("functionName"));
+        int inlineNargs = intValue(request.get("functionNargs"), -1);
+        String inlineSource = string(request.get("functionSource"));
+        String inlineSql = string(request.get("sql"));
+        if (notBlank(inlineName) || notBlank(inlineSource) || notBlank(inlineSql)) {
+            if (!notBlank(inlineName) || !notBlank(inlineSource) || !notBlank(inlineSql) || inlineNargs < 0) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID
+                        + ": FUNCTION inline 提交需同时提供 functionName/functionNargs/functionSource/sql");
+            }
+            return new FunctionSpec(inlineName.trim(), inlineNargs, inlineSource, inlineSql);
+        }
+        String artifactId = string(request.get("artifactId"));
+        if (notBlank(artifactId)) {
+            int version = intValue(request.get("version"), 0);
+            Map<String, Object> versionRow = requireVersion(artifactId, version);
+            Map<String, Object> artifact = requireArtifact(artifactId);
+            if (!"FUNCTION".equals(string(artifact.get("type")))) {
+                throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 FUNCTION 类型");
+            }
+            String name = string(versionRow.get("function_name"));
+            int nargs = intValue(versionRow.get("function_nargs"), -1);
+            String source = string(versionRow.get("content_text"));
+            String sql = string(versionRow.get("sql_template"));
+            if (!notBlank(name) || !notBlank(source) || !notBlank(sql) || nargs < 0) {
+                throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 函数版本缺少完整函数定义");
+            }
+            return new FunctionSpec(name, nargs, source, sql);
+        }
+        throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID
+                + ": 缺少函数定义（functionName/functionSource/sql 或 artifactId+version）");
     }
 
     /** 沙箱 SQL 执行流：文件库只读执行；DEV 仅预览+日志，PROD 结果回填沙箱库与数据目录。 */
@@ -872,6 +968,10 @@ public class DataDevService {
         if (retries >= maxRetries) {
             throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT + ": 重试次数已达上限 " + maxRetries);
         }
+        // 沙箱表源任务（sandbox-db://）走沙箱专用重试：源表重读沙箱库 + 按 exec_type 重派发
+        if (string(task.get("source_relative_uri")).startsWith("sandbox-db://")) {
+            return retrySandboxTask(id, task, retries);
+        }
         String execType = string(task.get("exec_type"));
         String runMode = string(task.get("run_mode"));
         String nodeId = string(task.get("source_node_id"));
@@ -921,6 +1021,92 @@ public class DataDevService {
             }
         } catch (Exception e) {
             log.warn("Dev retry {} failed: {}", id, e.getMessage(), e);
+            failTask(id, e);
+        }
+        return taskDetail(id);
+    }
+
+    /**
+     * 沙箱表源任务重试：源表重读沙箱库（无需平台数据表权限），按 exec_type 重派发。
+     * JAR 重读制品版本文件；FUNCTION 用新列重生成包装器；SQL 进程内重跑；均带 DB 快照。
+     */
+    private Map<String, Object> retrySandboxTask(String id, Map<String, Object> task, int retries) {
+        String sandboxId = string(task.get("sandbox_id"));
+        requireSandboxCreator(sandboxId, "");
+        String prefix = "sandbox-db://";
+        String sourceTable = string(task.get("source_relative_uri"));
+        sourceTable = sourceTable.startsWith(prefix) ? sourceTable.substring(prefix.length()) : sourceTable;
+        if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 沙箱内无此表: " + sourceTable);
+        }
+        Map<String, Object> src = sandboxDb.readTable(sandboxId, sourceTable);
+        List<String> header = stringList(src.get("header"));
+        List<List<String>> data = rowList(src.get("rows"));
+        if (data.size() > maxInputRows) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": 源表行数 " + data.size() + " 超过上限 " + maxInputRows);
+        }
+        Map<String, Object> params = parseJsonMap(string(task.get("params")));
+        String nodeId = string(task.get("source_node_id"));
+        String runMode = string(task.get("run_mode"));
+        String execType = string(task.get("exec_type"));
+        String outputTable = string(task.get("output_table_name"));
+
+        jdbc.update("update ds_dev_task set retry_count=retry_count+1,error_message='',kuscia_job_id='',started_at=?,status=?,updated_at=? where id=? and status=?",
+                now(), STATUS_RUNNING, now(), id, STATUS_FAILED);
+        audit("DEV_TASK_RETRY", "DEV_TASK", id, "retry=" + (retries + 1), true);
+        dispatch("dev.task.retried", Map.of("id", id, "retry", retries + 1));
+        try {
+            switch (execType) {
+                case "SQL":
+                    runSandboxSqlFlow(id, runMode, sandboxId, nodeId, header, data, params,
+                            string(task.get("content_snapshot")));
+                    break;
+                case "JAR": {
+                    Map<String, Object> versionRow = requireVersion(string(task.get("artifact_id")), intValue(task.get("version"), 0));
+                    byte[] jarBytes = Files.readAllBytes(resolveStorePath(string(versionRow.get("file_path"))));
+                    if (jarBytes.length > maxJarBytes) {
+                        throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE + ": JAR 超过上限 " + maxJarBytes);
+                    }
+                    String jarB64 = Base64.getEncoder().encodeToString(jarBytes);
+                    String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+                    devJobExecutor.submitSandbox(id, nodeId, inputB64, "JAR", jarB64, params, List.of(),
+                            sandboxId, sourceTable, outputTable);
+                    break;
+                }
+                case "PYTHON": {
+                    String script = string(task.get("content_snapshot"));
+                    List<String> dependencyNames = parseStringList(string(task.get("dependency_names")));
+                    DevDependencyChecker.validate(script, enabledWhitelist());
+                    String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+                    devJobExecutor.submitSandbox(id, nodeId, inputB64, "PYTHON", script, params, dependencyNames,
+                            sandboxId, sourceTable, outputTable);
+                    break;
+                }
+                case "FUNCTION": {
+                    String functionSource = string(task.get("function_source"));
+                    String functionName = string(task.get("function_name"));
+                    int functionNargs = intValue(task.get("function_nargs"), -1);
+                    String sql = string(task.get("sql_template"));
+                    if (!notBlank(functionSource) || !notBlank(functionName) || !notBlank(sql) || functionNargs < 0) {
+                        throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID
+                                + ": 函数任务缺少函数定义，无法重试");
+                    }
+                    Set<String> whitelist = enabledWhitelist();
+                    DevDependencyChecker.validate(functionSource, whitelist);
+                    List<String> dependencyNames = DevDependencyChecker.extractImports(functionSource);
+                    String renderedSql = DevSqlEngine.renderBounded(sql, params, sqlLimit);
+                    String wrapper = DevFunctionWrapper.generate(functionName, functionNargs, functionSource, renderedSql);
+                    String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+                    devJobExecutor.submitSandbox(id, nodeId, inputB64, "FUNCTION", wrapper, params, dependencyNames,
+                            sandboxId, sourceTable, outputTable);
+                    break;
+                }
+                default:
+                    throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 未知 execType " + execType);
+            }
+        } catch (Exception e) {
+            log.warn("Dev sandbox retry {} failed: {}", id, e.getMessage(), e);
             failTask(id, e);
         }
         return taskDetail(id);
@@ -1100,12 +1286,16 @@ public class DataDevService {
         jdbc.update("insert into ds_dev_task(id,name,description,artifact_id,version,run_mode,exec_type,source_node_id,"
                         + "source_datatable_id,source_relative_uri,params,content_snapshot,dependency_names,status,result_node_id,"
                         + "result_datatable_id,result_preview,source_rows,result_rows,error_message,kuscia_job_id,retry_count,"
-                        + "created_by,created_at,updated_at,started_at,finished_at,deleted,project_id,sandbox_id,source_asset_id,source_mount_id,result_asset_id)"
-                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','','','',0,0,'','',0,?,?,?,?,'',0,?,?,?,?,'')",
+                        + "created_by,created_at,updated_at,started_at,finished_at,deleted,project_id,sandbox_id,source_asset_id,source_mount_id,result_asset_id,"
+                        + "source_table_name,output_table_name,function_name,function_nargs,function_source,sql_template)"
+                        + " values(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING','','','',0,0,'','',0,?,?,?,?,'',0,?,?,?,?,'',?,?,?,?,?,?)",
                 taskId, name, string(request.get("description")), artifactId, version, runMode, execType,
                 nodeId, datatableId, relativeUri, json(params), contentSnapshot, json(dependencyNames),
                 actor(), now, now, now, string(request.get("projectId")), string(request.get("sandboxId")),
-                string(request.get("assetId")), string(request.get("mountId")));
+                string(request.get("assetId")), string(request.get("mountId")),
+                string(request.get("sourceTable")), string(request.get("outputTable")),
+                string(request.get("functionName")), intValue(request.get("functionNargs"), 0),
+                string(request.get("functionSource")), string(request.get("sql")));
         return taskId;
     }
 

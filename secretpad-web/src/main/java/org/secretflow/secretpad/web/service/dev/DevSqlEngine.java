@@ -189,6 +189,21 @@ public final class DevSqlEngine {
         }
     }
 
+    /**
+     * 服务端预渲染有界 SQL：先插值 {@code {{param}}}，再封顶输出（供 FUNCTION 任务包装器内嵌）。
+     *
+     * <p>FUNCTION（UDF）任务由后端生成 Python 包装脚本，脚本内嵌本方法渲染后的 SQL 原文；
+     * 服务端提前完成参数插值（引号加倍防注入）与 LIMIT 封顶，包装器内只执行不再处理占位符，
+     * 保证服务端与 pod 内执行的 SQL 完全一致。</p>
+     */
+    public static String renderBounded(String sql, Map<String, Object> params, int maxResultRows) {
+        if (sql == null || sql.isBlank()) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": SQL 为空");
+        }
+        String rendered = interpolate(sql, params);
+        return ensureLimit(rendered, maxResultRows);
+    }
+
     /* ------------------------------ 内部实现 ------------------------------ */
 
     private static void createSourceTable(Connection conn, List<String> safeCols,
