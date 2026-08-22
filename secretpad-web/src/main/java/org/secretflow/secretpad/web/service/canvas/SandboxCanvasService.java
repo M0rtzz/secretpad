@@ -336,6 +336,89 @@ public class SandboxCanvasService {
                 "select * from ds_compute_canvas_version where canvas_id=? and deleted=0 order by version desc", canvasId);
     }
 
+    /* ============================== 工作流模型 ============================== */
+
+    /** 查询画布显式保存的工作流模型，graph_json 为保存时的不可变拓扑快照。 */
+    public List<Map<String, Object>> models(String canvasId) {
+        Map<String, Object> canvas = requireCanvas(canvasId);
+        requireUsableSandbox(string(canvas.get("sandbox_id")), false);
+        return jdbc.queryForList(
+                "select cm.*,m.status model_status,m.version model_version,m.artifact_id,m.artifact_version_id "
+                        + "from ds_compute_canvas_model cm left join ds_model m on m.id=cm.model_id and m.deleted=0 "
+                        + "where cm.canvas_id=? and cm.deleted=0 order by cm.created_at desc",
+                canvasId);
+    }
+
+    /** 查询画布训练节点最近生成的可执行模型，供“保存为模型”时选择输出节点。 */
+    public List<Map<String, Object>> modelCandidates(String canvasId) {
+        Map<String, Object> canvas = requireCanvas(canvasId);
+        requireUsableSandbox(string(canvas.get("sandbox_id")), false);
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select nr.model_id,nr.node_id,nr.component_code,nr.finished_at,m.name,m.status,m.version "
+                        + "from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
+                        + "where nr.canvas_id=? and nr.deleted=0 and nr.status='SUCCEEDED' and nr.model_id<>'' "
+                        + "order by nr.finished_at desc",
+                canvasId);
+        List<Map<String, Object>> result = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (Map<String, Object> row : rows) {
+            if (seen.add(string(row.get("model_id")))) {
+                result.add(row);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 将当前画布保存为工作流模型。未选择训练输出时保存为 DRAFT 拓扑快照；选择成功训练产生的
+     * modelId 后保存为 READY，后续才允许在自定义算法中发布 API。
+     */
+    public Map<String, Object> saveModel(Map<String, Object> request) {
+        String canvasId = string(request.get("canvasId"));
+        if (!notBlank(canvasId)) {
+            throw new IllegalArgumentException("canvasId 不能为空");
+        }
+        Map<String, Object> canvas = requireCanvas(canvasId);
+        requireUsableSandbox(string(canvas.get("sandbox_id")), true);
+        String graphJson = string(canvas.get("graph_json"));
+        GraphModel graph = parseGraph(graphJson);
+        if (graph.nodes.isEmpty()) {
+            throw new IllegalArgumentException("空画布不能保存为模型，请先添加工作流组件");
+        }
+        topoSort(graph);
+
+        String modelId = string(request.get("modelId"));
+        String sourceNodeId = "";
+        String status = "DRAFT";
+        if (notBlank(modelId)) {
+            List<Map<String, Object>> candidates = jdbc.queryForList(
+                    "select nr.node_id from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
+                            + "where nr.canvas_id=? and nr.model_id=? and nr.status='SUCCEEDED' and nr.deleted=0 "
+                            + "order by nr.finished_at desc limit 1",
+                    canvasId, modelId);
+            if (candidates.isEmpty()) {
+                throw new IllegalArgumentException("所选模型不是该画布成功训练产生的模型");
+            }
+            sourceNodeId = string(candidates.get(0).get("node_id"));
+            status = "READY";
+        }
+
+        String name = string(request.get("name"));
+        if (!notBlank(name)) {
+            name = string(canvas.get("name")) + "-模型";
+        }
+        String id = "cm-" + shortId();
+        String now = now();
+        jdbc.update("insert into ds_compute_canvas_model(id,canvas_id,canvas_version,model_id,source_node_id,name,"
+                        + "description,graph_json,status,created_by,created_at,updated_at,deleted) "
+                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                id, canvasId, intValue(canvas.get("version"), 1), modelId, sourceNodeId, name,
+                string(request.get("description")), graphJson, status, actor(), now, now);
+        audit("CANVAS_MODEL_SAVED", "CANVAS_MODEL", id,
+                "canvas=" + canvasId + " version=" + canvas.get("version") + " model=" + modelId, true);
+        return requireCanvasModel(id);
+    }
+
     /** 回滚：将画布 graph_json 恢复为指定版本内容（并自增版本 + 快照）。 */
     public Map<String, Object> rollbackVersion(String versionId) {
         List<Map<String, Object>> rows = jdbc.queryForList(
@@ -585,9 +668,14 @@ public class SandboxCanvasService {
         vreq.put("contentText", script);
         vreq.put("description", "训练时间 " + now());
         String versionId = string(dataDevService.createVersion(vreq).get("id"));
-        modelApprovalService.registerModelAutoApproved(artifactName, projectId, artifactId, versionId, sandboxId,
+        Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
+                artifactName, projectId, artifactId, versionId, sandboxId,
                 "画布训练产物自动注册（" + kind + "）");
-        audit("CANVAS_MODEL_AUTO_REGISTERED", "MODEL", "", "canvas=" + string(canvas.get("id"))
+        String modelId = string(model.get("id"));
+        jdbc.update("update ds_compute_node_run set model_id=?,updated_at=? "
+                        + "where run_id=? and node_id=? and deleted=0",
+                modelId, now(), runId, node.id);
+        audit("CANVAS_MODEL_AUTO_REGISTERED", "MODEL", modelId, "canvas=" + string(canvas.get("id"))
                 + " artifact=" + artifactId + " v=" + versionId, true);
     }
 
@@ -1045,6 +1133,18 @@ public class SandboxCanvasService {
                 "select * from ds_compute_canvas_version where id=? and deleted=0", id);
         if (rows.isEmpty()) {
             throw new IllegalArgumentException("画布版本不存在: " + id);
+        }
+        return new LinkedHashMap<>(rows.get(0));
+    }
+
+    private Map<String, Object> requireCanvasModel(String id) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select cm.*,m.status model_status,m.version model_version,m.artifact_id,m.artifact_version_id "
+                        + "from ds_compute_canvas_model cm left join ds_model m on m.id=cm.model_id and m.deleted=0 "
+                        + "where cm.id=? and cm.deleted=0",
+                id);
+        if (rows.isEmpty()) {
+            throw new IllegalArgumentException("工作流模型不存在: " + id);
         }
         return new LinkedHashMap<>(rows.get(0));
     }

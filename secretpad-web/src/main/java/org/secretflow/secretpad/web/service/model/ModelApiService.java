@@ -79,9 +79,6 @@ public class ModelApiService {
     private ModelTestService modelTestService;
 
     @Resource
-    private ModelApprovalService modelApprovalService;
-
-    @Resource
     private EnvService envService;
 
     @Value("${secretpad.deploy-mode:}")
@@ -102,6 +99,7 @@ public class ModelApiService {
         String modelId = required(request, "modelId");
         String name = required(request, "name");
         Map<String, Object> model = requireModel(modelId);
+        requireSavedCanvasWorkflow(modelId);
         String modelStatus = string(model.get("status"));
         if (!Set.of("APPROVED", "PUBLISHED").contains(modelStatus)) {
             throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
@@ -136,27 +134,8 @@ public class ModelApiService {
      * （幂等，同制品同版本复用），再发布受控 API。返回与 {@link #create} 相同结构（含一次性 app_id+secret）。
      */
     public Map<String, Object> createFromArtifact(Map<String, Object> request) {
-        String artifactId = required(request, "artifactId");
-        String artifactVersionId = required(request, "artifactVersionId");
-        String sandboxId = string(request.get("sandboxId"));
-        // projectId 缺省时从制品反查（制品已归属项目，沙箱上下文下无需客户端显式传）
-        String projectId = string(request.get("projectId"));
-        if (!notBlank(projectId)) {
-            List<Map<String, Object>> artRows = jdbc.queryForList(
-                    "select project_id from ds_dev_artifact where id=? and deleted=0", artifactId);
-            if (!artRows.isEmpty()) {
-                projectId = string(artRows.get(0).get("project_id"));
-            }
-        }
-        if (!notBlank(projectId)) {
-            throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID + ": 缺少 projectId");
-        }
-        String name = required(request, "name");
-        Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
-                name, projectId, artifactId, artifactVersionId, sandboxId, string(request.get("description")));
-        Map<String, Object> apiRequest = new LinkedHashMap<>(request);
-        apiRequest.put("modelId", string(model.get("id")));
-        return create(apiRequest);
+        throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                + ": 请先在可视化建模画布中将工作流保存为模型，再发布 API");
     }
 
     public List<Map<String, Object>> list(String keyword) {
@@ -494,6 +473,16 @@ public class ModelApiService {
             throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 模型不存在: " + id);
         }
         return new LinkedHashMap<>(rows.get(0));
+    }
+
+    private void requireSavedCanvasWorkflow(String modelId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select id from ds_compute_canvas_model where model_id=? and status='READY' and deleted=0 limit 1",
+                modelId);
+        if (rows.isEmpty()) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                    + ": 仅可发布已在可视化建模画布中保存的工作流模型");
+        }
     }
 
     private Map<String, Object> requireArtifact(String id) {

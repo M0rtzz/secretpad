@@ -262,6 +262,10 @@ public class ModelApprovalService {
         result.put("currentApproval", approvals.isEmpty() ? null : approvals.get(0));
         result.put("testCount", count("select count(1) from ds_model_test where model_id=? and deleted=0", id));
         result.put("apiCount", count("select count(1) from ds_model_api where model_id=? and deleted=0", id));
+        long canvasModelCount = count(
+                "select count(1) from ds_compute_canvas_model where model_id=? and status='READY' and deleted=0", id);
+        result.put("canvasModelSaved", canvasModelCount > 0);
+        result.put("canvasModelCount", canvasModelCount);
         return result;
     }
 

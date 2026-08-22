@@ -89,6 +89,21 @@ public class SandboxCanvasController {
         return SecretPadResponse.success(service.versions(canvasId));
     }
 
+    @GetMapping("/models")
+    public SecretPadResponse<List<Map<String, Object>>> models(@RequestParam String canvasId) {
+        return SecretPadResponse.success(service.models(canvasId));
+    }
+
+    @GetMapping("/models/candidates")
+    public SecretPadResponse<List<Map<String, Object>>> modelCandidates(@RequestParam String canvasId) {
+        return SecretPadResponse.success(service.modelCandidates(canvasId));
+    }
+
+    @PostMapping("/models/save")
+    public SecretPadResponse<Map<String, Object>> saveModel(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.saveModel(request));
+    }
+
     @PostMapping("/versions/rollback")
     public SecretPadResponse<Map<String, Object>> rollbackVersion(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.rollbackVersion(String.valueOf(request.get("versionId"))));
