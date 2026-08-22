@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -30,15 +31,18 @@ public class DataComputeService {
     private final ObjectMapper mapper;
     private final SandboxApprovalService approvals;
     private final DataAssetService assets;
+    private final SandboxDbService sandboxDb;
 
     public DataComputeService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc,
                               ObjectMapper mapper,
                               SandboxApprovalService approvals,
-                              DataAssetService assets) {
+                              DataAssetService assets,
+                              SandboxDbService sandboxDb) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.approvals = approvals;
         this.assets = assets;
+        this.sandboxDb = sandboxDb;
     }
 
     public List<Map<String, Object>> overview() {
@@ -99,6 +103,26 @@ public class DataComputeService {
                         + "where t.sandbox_id=? and t.status='SUCCEEDED' and t.deleted=0 "
                         + "order by t.finished_at desc", sandboxId));
         return result;
+    }
+
+    /* ------------------------------ 沙箱权威库数据目录（Stage 3） ------------------------------ */
+
+    /** 沙箱数据目录（MOUNT + RESULT），仅创建人。 */
+    public Map<String, Object> sandboxDbDirectory(String sandboxId) {
+        requireUsableSandbox(sandboxId, true);
+        return sandboxDb.directory(sandboxId);
+    }
+
+    /** 沙箱表预览（schema + 前 limit 行），仅创建人。 */
+    public Map<String, Object> sandboxDbTablePreview(String sandboxId, String tableName, int limit) {
+        requireUsableSandbox(sandboxId, true);
+        return sandboxDb.previewTable(sandboxId, tableName, limit);
+    }
+
+    /** 沙箱权威库文件（Jupyter 会话按需拉取），仅创建人。 */
+    public byte[] sandboxDbDownload(String sandboxId) {
+        requireUsableSandbox(sandboxId, true);
+        return sandboxDb.downloadBytes(sandboxId);
     }
 
     public Map<String, Object> requestMount(Map<String, Object> request) {

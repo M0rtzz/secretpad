@@ -22,6 +22,8 @@ import org.secretflow.secretpad.persistence.repository.ProjectDatatableRepositor
 import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
+import org.secretflow.secretpad.web.service.sync.AssetSyncService;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -73,6 +75,8 @@ public class SandboxApprovalService {
     private final SandboxApprovalSyncRepository approvalSyncRepository;
     private final ProjectAssetRepository projectAssetRepository;
     private final ProjectDatatableRepository projectDatatableRepository;
+    private final AssetSyncService assetSyncService;
+    private final SandboxDbService sandboxDbService;
     private final Map<String, Integer> appliedSnapshotHashes = new ConcurrentHashMap<>();
 
     @Value("${secretpad.node-id:kuscia-system}")
@@ -89,7 +93,9 @@ public class SandboxApprovalService {
             MinioAssetStorage assetStorage,
             SandboxApprovalSyncRepository approvalSyncRepository,
             ProjectAssetRepository projectAssetRepository,
-            ProjectDatatableRepository projectDatatableRepository) {
+            ProjectDatatableRepository projectDatatableRepository,
+            AssetSyncService assetSyncService,
+            SandboxDbService sandboxDbService) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.service = service;
@@ -98,6 +104,8 @@ public class SandboxApprovalService {
         this.approvalSyncRepository = approvalSyncRepository;
         this.projectAssetRepository = projectAssetRepository;
         this.projectDatatableRepository = projectDatatableRepository;
+        this.assetSyncService = assetSyncService;
+        this.sandboxDbService = sandboxDbService;
     }
 
     /* ------------------------------- 申请单查询 ------------------------------- */
@@ -632,12 +640,25 @@ public class SandboxApprovalService {
             String checksum = metadataChecksum(asset.get("metadata_json"));
             String stagingUri = string(asset.get("storage_uri"));
             if (!Objects.equals(provider, sandboxNode)) {
-                stagingUri = assetStorage.encryptedSnapshot(stagingUri, "sandbox-staging/" + sandboxNode + "/" + sandboxId + "/" + assetId + "-v" + intValue(asset.get("version"), 1), checksum);
+                // 授权自动同步：跨节点 PROCESSED 先在本地物化；本地权威库表作为 staging 源，不再 MinIO 加密快照
+                assetSyncService.ensureSynced(projectId, assetId);
+                String localTable = assetSyncService.localPhysicalTable(projectId, assetId);
+                if (localTable != null) {
+                    stagingUri = "node-data://" + localTable;
+                } else {
+                    stagingUri = assetStorage.encryptedSnapshot(stagingUri, "sandbox-staging/" + sandboxNode + "/" + sandboxId + "/" + assetId + "-v" + intValue(asset.get("version"), 1), checksum);
+                }
             }
             jdbc.update("insert into ds_sandbox_dataset_mount(id,sandbox_id,asset_id,asset_version,provider_node_id,staging_uri,mount_path,checksum,status,expires_at,created_at,updated_at,deleted) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
                     mountId, sandboxId, assetId, intValue(asset.get("version"), 1), provider,
                     stagingUri, "/data/assets/" + assetId, checksum,
                     "READY", string(asset.get("valid_until")), now(), now());
+        }
+        // 挂载即重建沙箱权威库（仅 PROCESSED 注入、RAW 禁入）；START 时亦会重建兜底
+        try {
+            sandboxDbService.rebuild(sandboxId);
+        } catch (Exception e) {
+            log.warn("沙箱 {} 权威库重建失败（不阻断启动，START 时重试）: {}", sandboxId, e.getMessage());
         }
     }
 
@@ -841,6 +862,8 @@ public class SandboxApprovalService {
             }
             String validUntil = string(asset.get("valid_until"));
             if (notBlank(validUntil) && validUntil.compareTo(now()) < 0) throw new IllegalArgumentException("数据已过有效期: " + assetId);
+            // 授权自动同步：挂载前置校验即触发跨节点 PROCESSED 物理拉取（幂等；本节点资产为无操作）
+            assetSyncService.ensureSynced(projectId, assetId);
         }
     }
 

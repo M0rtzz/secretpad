@@ -18,6 +18,7 @@ import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -75,6 +76,7 @@ public class DevJobExecutor {
     private final ObjectMapper objectMapper;
     private final KusciaGrpcClientAdapter kuscia;
     private final DataSandboxMvpService mvp;
+    private final SandboxDbService sandboxDb;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -113,11 +115,13 @@ public class DevJobExecutor {
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             KusciaGrpcClientAdapter kuscia,
-            DataSandboxMvpService mvp) {
+            DataSandboxMvpService mvp,
+            SandboxDbService sandboxDb) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
         this.mvp = mvp;
+        this.sandboxDb = sandboxDb;
     }
 
     /* ------------------------------- 提交 ------------------------------- */
@@ -140,6 +144,29 @@ public class DevJobExecutor {
      */
     public void submit(String taskId, String nodeId, String inputB64, String execType,
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports, String channel) {
+        doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, channel, null);
+    }
+
+    /**
+     * 沙箱表源任务（Stage 4）：与 {@link #submit} 相同的 CSV base64 回退通道，额外在
+     * {@code task_input_config} 注入沙箱库 JDBC 契约（{@code jdbc_url}/{@code input_table}/
+     * {@code output_table}），供升级版 runner 直接连库计算（当前 runner 仍走 CSV 回退）。
+     */
+    public void submitSandbox(String taskId, String nodeId, String inputB64, String execType,
+            String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
+            String inputTable, String outputTable) {
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("jdbc_url", "jdbc:sqlite:/workspace/sandbox_data.db");
+        extra.put("input_table", inputTable);
+        if (notBlank(outputTable)) {
+            extra.put("output_table", outputTable);
+        }
+        doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, "dev", extra);
+    }
+
+    private void doSubmit(String taskId, String nodeId, String inputB64, String execType,
+            String jarB64OrScript, Map<String, Object> params, List<String> allowedImports, String channel,
+            Map<String, Object> extraConfig) {
         if (!kusciaEnabled) {
             throw new IllegalStateException(DevErrors.DEV_PARAM_INVALID + ": Kuscia 运行时未启用，无法执行 " + execType + " 任务");
         }
@@ -160,6 +187,9 @@ public class DevJobExecutor {
         }
         config.put("input_csv_b64", inputB64);
         config.put("params", params == null ? new LinkedHashMap<>() : params);
+        if (extraConfig != null) {
+            config.putAll(extraConfig);
+        }
         String taskInputConfig = json(config);
 
         String jobId = "dt-" + taskId;
@@ -535,8 +565,27 @@ public class DevJobExecutor {
             dispatch("dev.task.debugSucceeded", Map.of("id", taskId, "sourceRows", num(task.get("source_rows")),
                     "resultRows", rows.size()));
         }
+        // Stage 4：沙箱任务 PROD 成功 → 结果表回填沙箱权威库 + 数据目录
+        backfillSandboxResultIfNeeded(task, header, rows);
         // 查询/拉取完成后删除 Job（幂等）
         delete(jobId);
+    }
+
+    /** 沙箱表源任务 PROD 成功：结果表写入 sandbox_data.db 并登记 RESULT 清单/目录。 */
+    private void backfillSandboxResultIfNeeded(Map<String, Object> task, List<String> header, List<List<String>> rows) {
+        String sandboxId = string(task.get("sandbox_id"));
+        if (!notBlank(sandboxId) || !"PROD".equals(string(task.get("run_mode")))) {
+            return;
+        }
+        String taskId = string(task.get("id"));
+        try {
+            String resultTable = string(sandboxDb.backfillResultTable(sandboxId, taskId,
+                    string(task.get("name")), header, rows).get("tableName"));
+            jdbc.update("update ds_dev_task set result_table_name=? where id=?", resultTable, taskId);
+            log.info("沙箱任务 {} 结果已回填沙箱库: {}", taskId, resultTable);
+        } catch (Exception e) {
+            log.warn("沙箱任务 {} 结果回填失败（不影响任务 SUCCEEDED）: {}", taskId, e.getMessage());
+        }
     }
 
     private void fail(String taskId, String errorMessage, String dedupeKey) {

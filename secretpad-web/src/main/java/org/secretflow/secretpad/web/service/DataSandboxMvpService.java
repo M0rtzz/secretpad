@@ -16,6 +16,7 @@ import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
 import org.secretflow.secretpad.web.service.sandbox.SandboxStatusMachine;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.secretflow.secretpad.web.util.RequestUtils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -77,6 +78,7 @@ public class DataSandboxMvpService {
     private final JdbcTemplate jdbc;
     private final ObjectMapper objectMapper;
     private final KusciaGrpcClientAdapter kuscia;
+    private final SandboxDbService sandboxDbService;
     private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
     @Value("${secretpad.node-id:kuscia-system}")
@@ -103,10 +105,12 @@ public class DataSandboxMvpService {
     public DataSandboxMvpService(
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
-            KusciaGrpcClientAdapter kuscia) {
+            KusciaGrpcClientAdapter kuscia,
+            SandboxDbService sandboxDbService) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
+        this.sandboxDbService = sandboxDbService;
     }
 
     /** Kuscia 运行时是否启用（供 Z-03 审批执行引擎判断 CREATE/SPEC_CHANGE 可否拉起）。 */
@@ -1260,6 +1264,12 @@ public class DataSandboxMvpService {
 
     /** 启动 Kuscia Job（幂等：有 job 则 restart，否则 create）。供 Z-03 审批执行引擎复用。 */
     public String startKuscia(Map<String, Object> sandbox) {
+        // Stage 3：START 即重建沙箱权威库，保证 sandbox_data.db 最新（挂载变更亦触发；失败不阻断启动，下次重试）
+        try {
+            sandboxDbService.rebuild(string(sandbox.get("id")));
+        } catch (Exception e) {
+            log.warn("沙箱 {} 权威库 START 重建失败（启动继续，下次重建重试）: {}", sandbox.get("id"), e.getMessage());
+        }
         if (!kusciaEnabled) {
             // 运行时未启用时禁止“假 RUNNING”：返回明确错误，由调用方将状态置为 ERROR
             return "Kuscia 运行时未启用（secretpad.data-sandbox.kuscia.enabled=false），请启用后重试";

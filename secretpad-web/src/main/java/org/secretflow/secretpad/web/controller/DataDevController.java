@@ -168,6 +168,21 @@ public class DataDevController {
         return SecretPadResponse.success(service.submitTask(request));
     }
 
+    @Operation(summary = "沙箱表源任务提交（sandboxId+sourceTable；SQL 文件库只读 / JAR/PYTHON CSV+JDBC 契约）")
+    @PostMapping("/tasks/submit-sandbox")
+    public SecretPadResponse<Map<String, Object>> submitSandboxTask(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.submitSandboxTask(request));
+    }
+
+    @Operation(summary = "沙箱表预览（任务 Modal 即时预览，仅沙箱创建人）")
+    @GetMapping("/tasks/sandbox-preview")
+    public SecretPadResponse<Map<String, Object>> sandboxPreview(
+            @RequestParam String sandboxId,
+            @RequestParam String tableName,
+            @RequestParam(defaultValue = "20") int limit) {
+        return SecretPadResponse.success(service.previewSandboxTable(sandboxId, tableName, limit));
+    }
+
     @Operation(summary = "任务列表（status/runMode/execType/keyword 过滤）")
     @GetMapping("/tasks")
     public SecretPadResponse<List<Map<String, Object>>> listTasks(

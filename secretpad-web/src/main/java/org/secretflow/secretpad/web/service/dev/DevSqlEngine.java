@@ -11,7 +11,10 @@
 package org.secretflow.secretpad.web.service.dev;
 
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
+import org.secretflow.secretpad.web.service.storage.SqliteTableLoader;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -20,12 +23,9 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -93,8 +93,8 @@ public final class DevSqlEngine {
         String rendered = null;
         try (Connection conn = DriverManager.getConnection("jdbc:sqlite::memory:")) {
             conn.setAutoCommit(true);
-            List<String> safeCols = sanitizeColumns(header);
-            createSourceTable(conn, safeCols, header, data, logs);
+            List<String> safeCols = SqliteTableLoader.sanitizeColumns(header);
+            createSourceTable(conn, safeCols, data, logs);
             try (Statement pragma = conn.createStatement()) {
                 pragma.execute("PRAGMA query_only = ON");
             }
@@ -132,43 +132,69 @@ public final class DevSqlEngine {
         }
     }
 
-    /* ------------------------------ 内部实现 ------------------------------ */
-
-    private static List<String> sanitizeColumns(List<String> header) {
-        List<String> result = new ArrayList<>(header.size());
-        Set<String> used = new HashSet<>();
-        for (int i = 0; i < header.size(); i++) {
-            String raw = header.get(i) == null ? "" : header.get(i).trim();
-            String base = raw.replaceAll("[^a-zA-Z0-9_]", "_");
-            if (base.isEmpty()) {
-                base = "col" + i;
-            }
-            if (Character.isDigit(base.charAt(0))) {
-                base = "col_" + base;
-            }
-            String name = base;
-            int n = 2;
-            while (used.contains(name)) {
-                name = base + "_" + n;
-                n++;
-            }
-            used.add(name);
-            result.add(name);
+    /**
+     * 在沙箱文件库 {@code sandbox_data.db} 上执行只读 SQL（Stage 4 沙箱计算契约）。
+     *
+     * <p>与 {@link #execute} 不同：不再新建 src 表，直接对预置表执行；连接以只读打开并叠加
+     * {@code PRAGMA query_only=ON} 双重防护（文件存在才打开，杜绝误建文件）。语句门禁
+     * （SELECT/WITH、禁 PRAGMA/ATTACH/VACUUM/EXPLAIN）、{{@code param}} 插值与强制 LIMIT 与
+     * 内存版完全一致。</p>
+     */
+    public static SqlResult executeOnDb(Path dbFile, String sql,
+            Map<String, Object> params, int maxResultRows, int timeoutSeconds) {
+        if (dbFile == null || !Files.exists(dbFile)) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 沙箱数据库不存在");
         }
-        return result;
+        if (sql == null || sql.isBlank()) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": SQL 为空");
+        }
+        long start = System.currentTimeMillis();
+        List<String> logs = new ArrayList<>();
+        String rendered = null;
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbFile.toAbsolutePath().normalize())) {
+            try (Statement pragma = conn.createStatement()) {
+                pragma.execute("PRAGMA query_only = ON");
+            }
+            logs.add("query_only=ON, db=" + dbFile.getFileName());
+            assertReadOnly(sql);
+            rendered = interpolate(sql, params);
+            String bounded = ensureLimit(rendered, maxResultRows);
+            logs.add("exec " + timeoutSeconds + "s timeout, limit=" + maxResultRows);
+
+            try (Statement stmt = conn.createStatement()) {
+                stmt.setQueryTimeout(timeoutSeconds);
+                try (ResultSet rs = stmt.executeQuery(bounded)) {
+                    ResultSetMetaData md = rs.getMetaData();
+                    int cols = md.getColumnCount();
+                    List<String> outHeader = new ArrayList<>(cols);
+                    for (int i = 1; i <= cols; i++) {
+                        outHeader.add(md.getColumnLabel(i));
+                    }
+                    List<List<String>> rows = new ArrayList<>();
+                    while (rs.next() && rows.size() < maxResultRows) {
+                        List<String> row = new ArrayList<>(cols);
+                        for (int i = 1; i <= cols; i++) {
+                            Object v = rs.getObject(i);
+                            row.add(v == null ? "" : String.valueOf(v));
+                        }
+                        rows.add(row);
+                    }
+                    long elapsed = System.currentTimeMillis() - start;
+                    return new SqlResult(outHeader, rows, 0, rows.size(), elapsed, logs);
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": SQL 执行失败 - "
+                    + e.getMessage() + "（" + (rendered == null ? "" : truncate(rendered, 200)) + "）");
+        }
     }
 
+    /* ------------------------------ 内部实现 ------------------------------ */
+
     private static void createSourceTable(Connection conn, List<String> safeCols,
-            List<String> header, List<List<String>> data, List<String> logs) throws SQLException {
+            List<List<String>> data, List<String> logs) throws SQLException {
         int cols = safeCols.size();
-        List<String> types = new ArrayList<>(cols);
-        for (int c = 0; c < cols; c++) {
-            List<String> values = new ArrayList<>(data.size());
-            for (List<String> row : data) {
-                values.add(row.size() > c ? row.get(c) : "");
-            }
-            types.add(inferType(values));
-        }
+        List<String> types = SqliteTableLoader.inferColumnTypes(safeCols, data);
         StringBuilder ddl = new StringBuilder("CREATE TABLE src (");
         for (int c = 0; c < cols; c++) {
             if (c > 0) {
@@ -207,46 +233,6 @@ public final class DevSqlEngine {
             ps.executeBatch();
         }
         logs.add("loaded " + data.size() + " source rows");
-    }
-
-    /** 扫描前 100 行推断列类型：全部可解析为 long → INTEGER；否则全部可解析为 double → REAL；其余 TEXT。 */
-    private static String inferType(List<String> values) {
-        boolean allLong = true;
-        boolean allDouble = true;
-        int nonEmpty = 0;
-        int n = Math.min(values.size(), 100);
-        for (int i = 0; i < n; i++) {
-            String v = values.get(i);
-            if (v == null || v.isBlank()) {
-                continue;
-            }
-            nonEmpty++;
-            String t = v.trim();
-            if (allLong) {
-                try {
-                    Long.parseLong(t);
-                } catch (NumberFormatException e) {
-                    allLong = false;
-                }
-            }
-            if (allDouble) {
-                try {
-                    Double.parseDouble(t);
-                } catch (NumberFormatException e) {
-                    allDouble = false;
-                }
-            }
-        }
-        if (nonEmpty == 0) {
-            return "TEXT";
-        }
-        if (allLong) {
-            return "INTEGER";
-        }
-        if (allDouble) {
-            return "REAL";
-        }
-        return "TEXT";
     }
 
     private static void assertReadOnly(String sql) {

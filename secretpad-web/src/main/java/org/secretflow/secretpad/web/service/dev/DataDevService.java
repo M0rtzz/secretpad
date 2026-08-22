@@ -16,12 +16,13 @@ import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.util.UUIDUtils;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
-import org.secretflow.secretpad.manager.integration.datatable.DatatableManager;
+import org.secretflow.secretpad.manager.integration.datatable.AbstractDatatableManager;
 import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.NodeDO;
 import org.secretflow.secretpad.persistence.repository.NodeRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -82,10 +83,11 @@ public class DataDevService {
     private final JdbcTemplate jdbc;
     private final ObjectMapper objectMapper;
     private final KusciaGrpcClientAdapter kuscia;
-    private final DatatableManager datatableManager;
+    private final AbstractDatatableManager datatableManager;
     private final NodeRepository nodeRepository;
     private final DataSandboxMvpService mvp;
     private final DevJobExecutor devJobExecutor;
+    private final SandboxDbService sandboxDb;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -115,10 +117,11 @@ public class DataDevService {
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             KusciaGrpcClientAdapter kuscia,
-            DatatableManager datatableManager,
+            AbstractDatatableManager datatableManager,
             NodeRepository nodeRepository,
             DataSandboxMvpService mvp,
-            DevJobExecutor devJobExecutor) {
+            DevJobExecutor devJobExecutor,
+            SandboxDbService sandboxDb) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
@@ -126,6 +129,7 @@ public class DataDevService {
         this.nodeRepository = nodeRepository;
         this.mvp = mvp;
         this.devJobExecutor = devJobExecutor;
+        this.sandboxDb = sandboxDb;
     }
 
     /* ============================== 权限 ============================== */
@@ -493,6 +497,202 @@ public class DataDevService {
             default:
                 throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 未知 execType " + execType);
         }
+    }
+
+    /* ============================== 沙箱表源任务（Stage 4） ============================== */
+
+    /**
+     * 沙箱表源任务：源表取自 {@code sandbox_data.db} 清单（沙箱创建人已授权，跳过 CSV 权限校验）。
+     * SQL → {@link DevSqlEngine#executeOnDb} 文件库只读执行；JAR/PYTHON → CSV base64 通道
+     * + {@code input_table/output_table/jdbc_url} 沙箱库契约。结果 PROD 成功回填沙箱库与数据目录。
+     */
+    public Map<String, Object> submitSandboxTask(Map<String, Object> request) {
+        String sandboxId = required(request, "sandboxId");
+        String sourceTable = required(request, "sourceTable");
+        String runMode = value(request, "runMode", "DEV").trim().toUpperCase(Locale.ROOT);
+        if (!RUN_MODES.contains(runMode)) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": runMode 必须是 DEV/PROD");
+        }
+        String execType = required(request, "execType").trim().toUpperCase(Locale.ROOT);
+        if (!EXEC_TYPES.contains(execType)) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON");
+        }
+        requireSandboxCreator(sandboxId, "");
+        Map<String, Object> sandbox = requireRow("select project_id,owner_id from ds_sandbox where id=?", sandboxId);
+        request.put("projectId", sandbox.get("project_id"));
+        if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
+            throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 沙箱内无此表: " + sourceTable);
+        }
+        Map<String, Object> src = sandboxDb.readTable(sandboxId, sourceTable);
+        List<String> header = stringList(src.get("header"));
+        List<List<String>> data = rowList(src.get("rows"));
+        if (data.size() > maxInputRows) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": 源表行数 " + data.size() + " 超过上限 " + maxInputRows);
+        }
+        if (header.isEmpty()) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 源表表头为空");
+        }
+        Map<String, Object> params = new LinkedHashMap<>();
+        if (request.get("params") instanceof Map<?, ?> paramsMap) {
+            params.putAll(castMap(paramsMap));
+        }
+        String nodeId = string(sandbox.get("owner_id"));
+        switch (execType) {
+            case "SQL" -> {
+                return submitSandboxSqlTask(request, runMode, sandboxId, nodeId, sourceTable, header, data, params);
+            }
+            case "JAR" -> {
+                return submitSandboxJarTask(request, runMode, sandboxId, nodeId, sourceTable, header, data, params);
+            }
+            case "PYTHON" -> {
+                return submitSandboxPythonTask(request, runMode, sandboxId, nodeId, sourceTable, header, data, params);
+            }
+            default -> throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 未知 execType " + execType);
+        }
+    }
+
+    /** 沙箱 SQL 任务：对 sandbox_data.db 预置表直接只读执行（不建 src 表）。 */
+    private Map<String, Object> submitSandboxSqlTask(Map<String, Object> request, String runMode, String sandboxId,
+            String nodeId, String sourceTable, List<String> header, List<List<String>> data,
+            Map<String, Object> params) {
+        String sql = resolveScript(request, "SQL");
+        String taskId = createTask(request, runMode, "SQL", nodeId, sourceTable, "sandbox-db://" + sourceTable,
+                params, sql, List.of());
+        audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId,
+                "type=SQL mode=" + runMode + " sandbox=" + sandboxId + " table=" + sourceTable, true);
+        dispatch("dev.task.submitted", Map.of("id", taskId, "type", "SQL", "mode", runMode));
+        try {
+            claimTask(taskId);
+            runSandboxSqlFlow(taskId, runMode, sandboxId, nodeId, header, data, params, sql);
+        } catch (Exception e) {
+            log.warn("Dev sandbox SQL task {} failed: {}", taskId, e.getMessage(), e);
+            failTask(taskId, e);
+        }
+        return taskDetail(taskId);
+    }
+
+    /** 沙箱 JAR 任务：源表导出 CSV base64 通道 + 沙箱库 JDBC 契约注入。 */
+    private Map<String, Object> submitSandboxJarTask(Map<String, Object> request, String runMode, String sandboxId,
+            String nodeId, String sourceTable, List<String> header, List<List<String>> data,
+            Map<String, Object> params) {
+        String artifactId = required(request, "artifactId");
+        int version = intValue(request.get("version"), 0);
+        if (version <= 0) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 缺少 JAR 版本号 version");
+        }
+        Map<String, Object> artifact = requireArtifact(artifactId);
+        requireCreator(artifact, "制品");
+        if (!"JAR".equals(string(artifact.get("type")))) {
+            throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 制品不是 JAR 类型");
+        }
+        Map<String, Object> versionRow = requireVersion(artifactId, version);
+        String filePath = string(versionRow.get("file_path"));
+        if (!notBlank(filePath)) {
+            throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 该版本无 JAR 文件");
+        }
+        byte[] jarBytes;
+        try {
+            jarBytes = Files.readAllBytes(resolveStorePath(filePath));
+        } catch (IOException e) {
+            throw new IllegalStateException(DevErrors.DEV_NOT_FOUND + ": 读取 JAR 文件失败: " + e.getMessage(), e);
+        }
+        if (jarBytes.length > maxJarBytes) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": JAR " + jarBytes.length + " 字节超过上限 " + maxJarBytes);
+        }
+        String jarB64 = Base64.getEncoder().encodeToString(jarBytes);
+        String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+        if (inputB64.length() > maxInputBytes) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": 输入数据超过 " + maxInputBytes + " 字节上限");
+        }
+        String taskId = createTask(request, runMode, "JAR", nodeId, sourceTable, "sandbox-db://" + sourceTable,
+                params, "jar " + artifactId + " v" + version, List.of());
+        audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId,
+                "type=JAR mode=" + runMode + " sandbox=" + sandboxId + " table=" + sourceTable, true);
+        dispatch("dev.task.submitted", Map.of("id", taskId, "type", "JAR", "mode", runMode));
+        try {
+            claimTask(taskId);
+            devJobExecutor.submitSandbox(taskId, nodeId, inputB64, "JAR", jarB64, params, List.of(),
+                    sourceTable, string(request.get("outputTable")));
+        } catch (Exception e) {
+            log.warn("Dev sandbox JAR task {} failed: {}", taskId, e.getMessage(), e);
+            failTask(taskId, e);
+        }
+        return taskDetail(taskId);
+    }
+
+    /** 沙箱 PYTHON 任务：脚本 + 依赖白名单校验 → CSV base64 通道 + 沙箱库 JDBC 契约注入。 */
+    private Map<String, Object> submitSandboxPythonTask(Map<String, Object> request, String runMode, String sandboxId,
+            String nodeId, String sourceTable, List<String> header, List<List<String>> data,
+            Map<String, Object> params) {
+        String script = resolveScript(request, "PYTHON");
+        Set<String> whitelist = enabledWhitelist();
+        DevDependencyChecker.validate(script, whitelist);
+        List<String> dependencyNames = new ArrayList<>(whitelist);
+        String inputB64 = Base64.getEncoder().encodeToString(CsvUtil.toCsv(header, data).getBytes(StandardCharsets.UTF_8));
+        if (inputB64.length() > maxInputBytes) {
+            throw new IllegalArgumentException(DevErrors.DEV_INPUT_TOO_LARGE
+                    + ": 输入数据超过 " + maxInputBytes + " 字节上限");
+        }
+        String taskId = createTask(request, runMode, "PYTHON", nodeId, sourceTable, "sandbox-db://" + sourceTable,
+                params, script, dependencyNames);
+        audit("DEV_TASK_SUBMIT", "DEV_TASK", taskId,
+                "type=PYTHON mode=" + runMode + " sandbox=" + sandboxId + " table=" + sourceTable, true);
+        dispatch("dev.task.submitted", Map.of("id", taskId, "type", "PYTHON", "mode", runMode));
+        try {
+            claimTask(taskId);
+            devJobExecutor.submitSandbox(taskId, nodeId, inputB64, "PYTHON", script, params, dependencyNames,
+                    sourceTable, string(request.get("outputTable")));
+        } catch (Exception e) {
+            log.warn("Dev sandbox PYTHON task {} failed: {}", taskId, e.getMessage(), e);
+            failTask(taskId, e);
+        }
+        return taskDetail(taskId);
+    }
+
+    /** 沙箱 SQL 执行流：文件库只读执行；DEV 仅预览+日志，PROD 结果回填沙箱库与数据目录。 */
+    private void runSandboxSqlFlow(String taskId, String runMode, String sandboxId, String nodeId,
+            List<String> header, List<List<String>> data, Map<String, Object> params, String sql) {
+        DevSqlEngine.SqlResult result = DevSqlEngine.executeOnDb(
+                sandboxDb.sandboxDbPath(sandboxId), sql, params, sqlLimit, sqlTimeoutSeconds);
+        int attempt = currentRetryCount(taskId);
+        appendRunLog(taskId, attempt, String.join("\n", result.logLines()));
+        String taskName = string(requireRow("select name from ds_dev_task where id=?", taskId).get("name"));
+        if ("PROD".equals(runMode)) {
+            String resultTable = string(sandboxDb.backfillResultTable(sandboxId, taskId, taskName,
+                    result.header(), result.rows()).get("tableName"));
+            // 一键挂载复用 mountResult：结果亦注册为节点 DomainData（结果 CSV 属计算产出，非源数据）
+            String resultUri = writeResultCsv(nodeId, taskId, result.header(), result.rows());
+            String domainDataId = registerResultDomainData(nodeId, taskId, resultUri, result.header(), null);
+            String preview = previewJson(result.header(), result.rows(), resultPreviewRows);
+            jdbc.update("update ds_dev_task set status=?,result_node_id=?,result_datatable_id=?,result_table_name=?,result_preview=?,"
+                            + "source_rows=?,result_rows=?,finished_at=?,updated_at=? where id=? and status=?",
+                    STATUS_SUCCEEDED, nodeId, domainDataId, resultTable, preview,
+                    data.size(), result.rows().size(), now(), now(), taskId, STATUS_RUNNING);
+            audit("DEV_TASK_SUCCEEDED", "DEV_TASK", taskId,
+                    "sandbox=" + sandboxId + " rows=" + data.size() + "->" + result.rows().size()
+                            + " result=" + resultTable, true);
+            dispatch("dev.task.succeeded", Map.of("id", taskId, "sourceRows", data.size(),
+                    "resultRows", result.rows().size(), "resultTable", resultTable));
+        } else {
+            String preview = json(Map.of("header", result.header(), "rows", result.rows(),
+                    "sourceRows", data.size(), "resultRows", result.rows().size(), "elapsedMs", result.elapsedMs()));
+            jdbc.update("update ds_dev_task set status=?,result_preview=?,result_rows=?,finished_at=?,"
+                            + "updated_at=? where id=? and status=?",
+                    STATUS_SUCCEEDED, preview, result.rows().size(), now(), now(), taskId, STATUS_RUNNING);
+            audit("DEV_TASK_DEBUG_SUCCEEDED", "DEV_TASK", taskId,
+                    "sandbox=" + sandboxId + " rows=" + data.size() + "->" + result.rows().size(), true);
+            dispatch("dev.task.debugSucceeded", Map.of("id", taskId, "sourceRows", data.size(),
+                    "resultRows", result.rows().size()));
+        }
+    }
+
+    /** 沙箱表预览（任务 Modal 即时预览），仅创建人。 */
+    public Map<String, Object> previewSandboxTable(String sandboxId, String tableName, int limit) {
+        requireSandboxCreator(sandboxId, "");
+        return sandboxDb.previewTable(sandboxId, tableName, limit);
     }
 
     /** SQL 任务：进程内只读 SQLite 执行（DEV 仅预览+日志；PROD 注册结果+血缘）。 */
@@ -1368,5 +1568,10 @@ public class DataDevService {
             value.forEach((key, item) -> result.put(String.valueOf(key), item));
         }
         return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<List<String>> rowList(Object value) {
+        return value == null ? new ArrayList<>() : new ArrayList<>((List<List<String>>) value);
     }
 }

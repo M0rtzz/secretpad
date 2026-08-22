@@ -12,6 +12,10 @@ import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.ProjectAssetDO;
 import org.secretflow.secretpad.persistence.repository.ProjectAssetRepository;
 import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
+import org.secretflow.secretpad.web.service.storage.NodeDatasetStore;
+import org.secretflow.secretpad.web.service.sync.AssetSyncService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -31,20 +35,45 @@ import java.util.*;
 /** Unified metadata catalog for local, governed and project-shared assets. */
 @Service
 public class DataAssetService {
+    private static final Logger log = LoggerFactory.getLogger(DataAssetService.class);
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
     private final MinioAssetStorage storage;
     private final ProjectAssetRepository projectAssetRepository;
     private final SandboxApprovalService approvalService;
+    private final NodeDatasetStore nodeDatasetStore;
+    private final AssetSyncService assetSyncService;
 
     public DataAssetService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc, ObjectMapper mapper,
             MinioAssetStorage storage, ProjectAssetRepository projectAssetRepository,
-            SandboxApprovalService approvalService) {
+            SandboxApprovalService approvalService, NodeDatasetStore nodeDatasetStore,
+            AssetSyncService assetSyncService) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.storage = storage;
         this.projectAssetRepository = projectAssetRepository;
         this.approvalService = approvalService;
+        this.nodeDatasetStore = nodeDatasetStore;
+        this.assetSyncService = assetSyncService;
+    }
+
+    /**
+     * 导入即入库（eager ingest）：资产目录登记后立即物化到节点权威库。
+     * 仅本节点物理持有（owned 或已物化同步）的资产物化；远端 schema-only 资产跳过。
+     */
+    private void ensureMaterialized(Map<String, Object> asset) {
+        if (asset == null || asset.isEmpty()) {
+            return;
+        }
+        if (!matchesOwner(String.valueOf(asset.get("provider_node_id")))
+                && nodeDatasetStore.findIndex(String.valueOf(asset.get("id"))) == null) {
+            return;
+        }
+        try {
+            nodeDatasetStore.ensureMaterialized(String.valueOf(asset.get("id")));
+        } catch (Exception e) {
+            log.warn("节点库物化失败 assetId={}: {}", asset.get("id"), e.getMessage());
+        }
     }
 
     @Transactional
@@ -59,7 +88,9 @@ public class DataAssetService {
         String datatableId="TABULAR".equals(modality)?id:"";
         Map<String,Object> metadata=Map.of("contentType",contentType,"sizeBytes",size,"sha256",checksum);
         jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'ACTIVE',0)",id,name,owner(),owner(),ingestionType,modality,stage,"",datatableId,uri,json(metadata),actor(),now(),now());
-        return require(id);
+        Map<String, Object> asset = require(id);
+        ensureMaterialized(asset);
+        return asset;
     }
 
     /** Resolve a catalog CSV as a governance-engine table without duplicating its MinIO object. */
@@ -70,11 +101,19 @@ public class DataAssetService {
         if(!"TABULAR".equals(String.valueOf(asset.get("modality"))))throw new IllegalArgumentException("仅表格数据可以执行抽样与脱敏");
         String provider=String.valueOf(asset.get("provider_node_id"));
         if(nodeId!=null&&!nodeId.isBlank()&&!Objects.equals(nodeId,provider))throw new IllegalArgumentException("数据提供节点与目录记录不一致");
+        ensureMaterialized(asset);
         List<DatatableDTO.TableColumnDTO> schema=new ArrayList<>();
-        try(BufferedReader reader=new BufferedReader(new InputStreamReader(storage.open(String.valueOf(asset.get("storage_uri"))),StandardCharsets.UTF_8))){
-            String header=reader.readLine();
-            if(header!=null)for(String column:csvFields(header))schema.add(new DatatableDTO.TableColumnDTO(column,"str",""));
-        }catch(IOException e){throw new IllegalStateException("读取数据表结构失败",e);}
+        List<Map<String, Object>> dbSchema = nodeDatasetStore.readTableSchema(String.valueOf(asset.get("id")));
+        if (dbSchema != null && !dbSchema.isEmpty()) {
+            for (Map<String, Object> col : dbSchema) {
+                schema.add(new DatatableDTO.TableColumnDTO(String.valueOf(col.get("name")), String.valueOf(col.get("type")), ""));
+            }
+        } else {
+            try(BufferedReader reader=new BufferedReader(new InputStreamReader(storage.open(String.valueOf(asset.get("storage_uri"))),StandardCharsets.UTF_8))){
+                String header=reader.readLine();
+                if(header!=null)for(String column:csvFields(header))schema.add(new DatatableDTO.TableColumnDTO(column,"str",""));
+            }catch(IOException e){throw new IllegalStateException("读取数据表结构失败",e);}
+        }
         return Optional.of(DatatableDTO.builder().nodeId(provider).datatableId(String.valueOf(asset.get("datatable_id")))
                 .datatableName(String.valueOf(asset.get("name"))).relativeUri(String.valueOf(asset.get("storage_uri")))
                 .datasourceId("data-sandbox-minio").datasourceType("LOCAL").datasourceName("Data Sandbox MinIO")
@@ -125,7 +164,9 @@ public class DataAssetService {
         metadata.put("taskId",taskId);
         jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,sampling_method,masking_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','PROCESSED',?,?,?,?,?,?,?, ?,?,1,'ACTIVE',0)",
                 id, task.get("name"), provider, resultNodeId, "GOVERNANCE", sourceAssetId, resultDatatableId, storageUri, json(metadata), sampling, masking, task.get("created_by"), now(), now());
-        return require(id);
+        Map<String, Object> asset = require(id);
+        ensureMaterialized(asset);
+        return asset;
     }
 
     public List<Map<String, Object>> catalog(String keyword) {
@@ -163,7 +204,10 @@ public class DataAssetService {
             asset.put("owned", false);
             rows.add(asset);
         }
-        rows.forEach(this::decorateCatalogAsset);
+        rows.forEach(asset -> {
+            ensureMaterialized(asset);
+            decorateCatalogAsset(asset);
+        });
         return rows;
     }
 
@@ -189,7 +233,9 @@ public class DataAssetService {
     }
 
     public Map<String, Object> detail(String id) {
-        return requireVisible(id);
+        Map<String, Object> asset = requireVisible(id);
+        ensureMaterialized(asset);
+        return asset;
     }
 
     @Transactional
@@ -209,6 +255,7 @@ public class DataAssetService {
                         "select * from ds_data_asset where id=? and deleted=0", attachment.get("asset_id"));
                 if (!local.isEmpty()) {
                     asset.putAll(local.get(0));
+                    ensureMaterialized(asset);
                     if (matchesOwner(String.valueOf(attachment.get("provider_node_id")))) {
                         Map<String, Object> snapshot = new LinkedHashMap<>(asset);
                         snapshot.put("schema_columns", schemaColumns(asset));
@@ -227,7 +274,21 @@ public class DataAssetService {
             asset.put("attached_expires_at", attachment.get("expires_at"));
             asset.put("provider_node_id", attachment.get("provider_node_id"));
             asset.put("provider_node_name", attachment.get("provider_node_name"));
-            asset.put("owned", matchesOwner(String.valueOf(attachment.get("provider_node_id"))));
+            boolean owned = matchesOwner(String.valueOf(attachment.get("provider_node_id")));
+            asset.put("owned", owned);
+            // 跨节点资产同步状态：LOCAL / PHYSICAL / SCHEMA（读时自动拉取，幂等）
+            if (owned) {
+                asset.put("syncMode", "LOCAL");
+            } else {
+                try {
+                    Map<String, Object> synced = assetSyncService.ensureSynced(
+                            projectId, String.valueOf(attachment.get("asset_id")));
+                    asset.put("syncMode", synced.getOrDefault("syncMode", "SCHEMA"));
+                } catch (Exception e) {
+                    asset.put("syncMode", "SCHEMA");
+                    asset.put("syncError", e.getMessage());
+                }
+            }
             result.add(asset);
         }
         if (snapshotsBackfilled) projectAssetRepository.flush();
@@ -246,6 +307,7 @@ public class DataAssetService {
         requireProjectParticipant(projectId);
         Object selected = request.get("assetIds");
         if (!(selected instanceof Iterable<?> iterable)) throw new IllegalArgumentException("assetIds 必须是数组");
+        List<String> attached = new ArrayList<>();
         for (Object item : iterable) {
             String assetId = String.valueOf(item);
             Map<String, Object> asset = require(assetId);
@@ -260,8 +322,17 @@ public class DataAssetService {
                     .attachedAt(beijingNow())
                     .expiresAt(String.valueOf(asset.getOrDefault("valid_until", "")))
                     .build());
+            attached.add(assetId);
         }
         projectAssetRepository.flush();
+        // 授权自动同步钩子：挂载生效后确保跨节点 PROCESSED 物理到位（本节点资产为无操作）
+        for (String assetId : attached) {
+            try {
+                assetSyncService.ensureSynced(projectId, assetId);
+            } catch (Exception e) {
+                log.warn("授权同步未完成 projectId={} assetId={}: {}", projectId, assetId, e.getMessage());
+            }
+        }
         return projectAssets(projectId);
     }
 
@@ -288,6 +359,11 @@ public class DataAssetService {
                 .attachedAt(beijingNow())
                 .expiresAt(String.valueOf(asset.getOrDefault("valid_until", "")))
                 .build());
+        try {
+            assetSyncService.ensureSynced(projectId, assetId);
+        } catch (Exception e) {
+            log.warn("授权同步未完成 projectId={} assetId={}: {}", projectId, assetId, e.getMessage());
+        }
     }
 
     public Map<String, Object> preview(String id, int requestedLimit) {
@@ -297,13 +373,44 @@ public class DataAssetService {
         result.put("asset", asset);
         result.put("limit", limit);
         result.put("masked", "RAW".equals(String.valueOf(asset.get("data_stage"))));
-        if (!"TABULAR".equals(String.valueOf(asset.get("modality"))) || String.valueOf(asset.get("storage_uri")).isBlank()) {
+        if (!"TABULAR".equals(String.valueOf(asset.get("modality")))) {
             result.put("rows", List.of());
             return result;
         }
+        // 跨节点 SCHEMA 同步（RAW）：无本地真实行，仅返回字段信息供预览/对齐
+        if (Boolean.TRUE.equals(asset.get("schema_only"))) {
+            Object cols = asset.getOrDefault("columns", List.of());
+            result.put("columns", cols instanceof List<?> ? cols : List.of());
+            result.put("rows", List.of());
+            result.put("schemaOnly", true);
+            return result;
+        }
         boolean masked = "RAW".equals(String.valueOf(asset.get("data_stage")));
+        ensureMaterialized(asset);
+        // 节点库优先：本地/同步资产已物化 → 从 node_data.db 读，避免重复解析 MinIO 原件；
+        // 跨节点同步副本 requireVisible 已解析到本地副本 id，这里以解析后的 id 读表
+        String readId = String.valueOf(asset.get("id"));
+        List<List<String>> dbRows = nodeDatasetStore.readTableRows(readId, limit);
+        if (dbRows != null && !dbRows.isEmpty()) {
+            List<String> headers = dbRows.get(0);
+            List<Map<String, String>> rows = new ArrayList<>();
+            for (int i = 1; i < dbRows.size(); i++) {
+                List<String> values = dbRows.get(i);
+                Map<String, String> row = new LinkedHashMap<>();
+                for (int c = 0; c < headers.size(); c++) {
+                    String value = c < values.size() ? values.get(c) : "";
+                    row.put(headers.get(c), masked ? mask(value) : value);
+                }
+                rows.add(row);
+            }
+            result.put("columns", headers);
+            result.put("rows", rows);
+            return result;
+        }
+        String uri = String.valueOf(asset.get("storage_uri"));
+        if (uri.isBlank()) { result.put("rows", List.of()); return result; }
         List<Map<String, String>> rows = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(storage.open(String.valueOf(asset.get("storage_uri"))), StandardCharsets.UTF_8))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(storage.open(uri), StandardCharsets.UTF_8))) {
             String headerLine = reader.readLine();
             if (headerLine == null) { result.put("rows", rows); return result; }
             List<String> headers = csvFields(headerLine);
@@ -343,6 +450,7 @@ public class DataAssetService {
                     "projectCount", projects.size());
         }
         storage.delete(String.valueOf(asset.get("storage_uri")));
+        nodeDatasetStore.remove(id);
         int changed = jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=? and deleted=0", now(), id);
         if (changed != 1) throw new IllegalStateException("数据已被删除或状态已变化");
         return Map.of("status", "DELETED", "id", id);
@@ -390,7 +498,45 @@ public class DataAssetService {
         if (changed == 0) jdbc.update("insert into ds_asset_usage_control(asset_id,valid_from,valid_until,allow_export,access_start,access_end,version,updated_by,updated_at) values(?,?,?,?,?,?,1,?,?)", assetId, value(v,"validFrom"), value(v,"validUntil"), bool(v.get("allowExport")) ? 1 : 0, value(v,"accessStart"), value(v,"accessEnd"), actor(), now());
     }
 
-    private Map<String,Object> requireVisible(String id) { Map<String,Object> a=require(id); if (!matchesOwner(String.valueOf(a.get("provider_node_id")))) { boolean visible=c("select count(1) from project_datatable pd join project_node pn on pn.project_id=pd.project_id and pn.node_id=? and pn.is_deleted=0 where pd.datatable_id=? and pd.is_deleted=0",owner(),a.get("datatable_id"))>0||c("select count(1) from ds_project_asset pa join project_node pn on pn.project_id=pa.project_id and pn.node_id=? and pn.is_deleted=0 where pa.asset_id=? and pa.deleted=0",owner(),id)>0; if(!visible) throw new SecurityException("无权访问该数据"); } return a; }
+    private Map<String,Object> requireVisible(String id) {
+        Map<String,Object> a;
+        try {
+            a = require(id);
+        } catch (NoSuchElementException notLocal) {
+            // 跨节点物理同步副本：项目目录沿用源资产 id，预览/明细/授权校验解析到本地同步副本
+            String localId = jdbc.query("select local_asset_id from ds_asset_sync_record where asset_id=? and status='SYNCED' and local_asset_id<>'' order by synced_at desc limit 1",
+                    rs -> rs.next() ? rs.getString(1) : null, id);
+            if (localId != null && !localId.isBlank()) {
+                a = require(localId);
+            } else {
+                // 跨节点 SCHEMA 同步（RAW，不传真实行）：仅用项目授权快照返回字段信息，可预览字段/对齐特征
+                List<Map<String,Object>> snap = jdbc.queryForList(
+                        "select asset_json,provider_node_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 limit 1", id);
+                if (snap.isEmpty()) throw notLocal;
+                Map<String,Object> assetJson = parseMap(snap.get(0).get("asset_json"));
+                if (assetJson.isEmpty()) throw notLocal;
+                assetJson.put("id", id);
+                assetJson.put("provider_node_id", snap.get(0).get("provider_node_id"));
+                assetJson.put("schema_only", true);
+                assetJson.putIfAbsent("modality", "TABULAR");
+                assetJson.putIfAbsent("data_stage", "RAW");
+                List<String> cols = new ArrayList<>();
+                try {
+                    Object c = assetJson.get("schema_columns");
+                    if (c instanceof List<?> l) { for (Object o : l) cols.add(String.valueOf(o)); }
+                    else if (c != null && !String.valueOf(c).isBlank()) { cols = mapper.readValue(String.valueOf(c), List.class); }
+                } catch (Exception ignore) { /* 列名解析失败则仅返回空列 */ }
+                assetJson.put("columns", cols);
+                a = assetJson;
+            }
+        }
+        if (!matchesOwner(String.valueOf(a.get("provider_node_id")))) {
+            boolean visible = c("select count(1) from project_datatable pd join project_node pn on pn.project_id=pd.project_id and pn.node_id=? and pn.is_deleted=0 where pd.datatable_id=? and pd.is_deleted=0",owner(),a.get("datatable_id"))>0
+                    || c("select count(1) from ds_project_asset pa join project_node pn on pn.project_id=pa.project_id and pn.node_id=? and pn.is_deleted=0 where pa.asset_id=? and pa.deleted=0",owner(),id)>0;
+            if (!visible) throw new SecurityException("无权访问该数据");
+        }
+        return a;
+    }
     private Map<String,Object> require(String id) { List<Map<String,Object>> r=jdbc.queryForList("select * from ds_data_asset where id=? and deleted=0",id); if(r.isEmpty()) throw new NoSuchElementException("数据不存在"); return r.get(0); }
     private void requireProvider(Map<String,Object> a){ if(!matchesOwner(String.valueOf(a.get("provider_node_id")))) throw new SecurityException("仅数据提供方可删除"); }
     private void requireProjectMember(String projectId){if(c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())==0)throw new SecurityException("当前节点不是项目成员");}
@@ -411,7 +557,14 @@ public class DataAssetService {
     @SuppressWarnings("unchecked")
     private Map<String,Object> parseMap(Object value){try{if(value==null||String.valueOf(value).isBlank()||"{}".equals(String.valueOf(value)))return new LinkedHashMap<>();return new LinkedHashMap<>(mapper.readValue(String.valueOf(value),Map.class));}catch(Exception e){return new LinkedHashMap<>();}}
     private List<String> schemaColumns(Map<String,Object> asset){
-        if(!"TABULAR".equals(String.valueOf(asset.get("modality")))||String.valueOf(asset.getOrDefault("storage_uri","")).isBlank())return List.of();
+        if(!"TABULAR".equals(String.valueOf(asset.get("modality"))))return List.of();
+        // 节点库优先：本地/同步资产已物化 → 从 node_data.db 读 schema，避免依赖 MinIO 原件
+        String id = String.valueOf(asset.get("id"));
+        List<Map<String, Object>> dbSchema = nodeDatasetStore.readTableSchema(id);
+        if (dbSchema != null && !dbSchema.isEmpty()) {
+            return dbSchema.stream().map(col -> String.valueOf(col.get("name"))).toList();
+        }
+        if(String.valueOf(asset.getOrDefault("storage_uri","")).isBlank())return List.of();
         try(BufferedReader reader=new BufferedReader(new InputStreamReader(storage.open(String.valueOf(asset.get("storage_uri"))),StandardCharsets.UTF_8))){String header=reader.readLine();return header==null?List.of():csvFields(header);}catch(IOException e){return List.of();}
     }
     private String required(Map<String,Object> m,String k){String v=value(m,k);if(v.isBlank())throw new IllegalArgumentException(k+" 不能为空");return v;}

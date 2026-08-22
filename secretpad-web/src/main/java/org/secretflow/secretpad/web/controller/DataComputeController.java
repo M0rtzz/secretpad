@@ -3,6 +3,8 @@ package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataComputeService;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.Map;
@@ -22,4 +24,7 @@ public class DataComputeController {
     @GetMapping("/canvases") public SecretPadResponse<List<Map<String,Object>>> canvases(@RequestParam String sandboxId){return SecretPadResponse.success(service.canvases(sandboxId));}
     @PostMapping("/canvases/save") public SecretPadResponse<Map<String,Object>> saveCanvas(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.saveCanvas(request));}
     @GetMapping("/reports") public SecretPadResponse<List<Map<String,Object>>> reports(@RequestParam String sandboxId,@RequestParam(defaultValue="") String type){return SecretPadResponse.success(service.reports(sandboxId,type));}
+    @GetMapping("/sandbox-db/directory") public SecretPadResponse<Map<String,Object>> sandboxDbDirectory(@RequestParam String sandboxId){return SecretPadResponse.success(service.sandboxDbDirectory(sandboxId));}
+    @GetMapping("/sandbox-db/table-preview") public SecretPadResponse<Map<String,Object>> sandboxDbTablePreview(@RequestParam String sandboxId,@RequestParam String tableName,@RequestParam(defaultValue="20") int limit){return SecretPadResponse.success(service.sandboxDbTablePreview(sandboxId,tableName,limit));}
+    @GetMapping("/sandbox-db/download") public ResponseEntity<byte[]> sandboxDbDownload(@RequestParam String sandboxId){byte[] bytes=service.sandboxDbDownload(sandboxId);return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION,"attachment; filename=\"sandbox_data.db\"").contentType(org.springframework.http.MediaType.APPLICATION_OCTET_STREAM).body(bytes);}
 }

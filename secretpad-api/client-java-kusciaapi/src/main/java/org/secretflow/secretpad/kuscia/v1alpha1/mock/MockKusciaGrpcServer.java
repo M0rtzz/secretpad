@@ -106,6 +106,11 @@ public class MockKusciaGrpcServer {
         }
     }
 
+    /** 实际监听端口：以 0 启动（随机端口）时可取得真实绑定端口；未启动返回 -1。 */
+    public int getPort() {
+        return server != null ? server.getPort() : -1;
+    }
+
     private ServerBuilder<?> getServerBuilder(int port) throws IOException, InterruptedException, CertificateException {
         ServerBuilder<?> serverBuilder;
         initCerts();
