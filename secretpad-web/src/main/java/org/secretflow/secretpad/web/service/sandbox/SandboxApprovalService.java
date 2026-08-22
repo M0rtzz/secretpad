@@ -108,6 +108,7 @@ public class SandboxApprovalService {
 
     public List<Map<String, Object>> listApprovals(String status, String type, String keyword) {
         applySyncedApprovals();
+        promoteLegacyOperatorReviews();
         String current = operator();
         String currentNode = gate.effectiveOwner();
         boolean admin = gate.isAdmin(gate.currentUser());
@@ -393,6 +394,7 @@ public class SandboxApprovalService {
     @Scheduled(fixedDelayString = "${secretpad.data-sandbox.approval.executor-interval-ms:10000}")
     public void executeApprovals() {
         applySyncedApprovals();
+        promoteLegacyOperatorReviews();
         for (Map<String, Object> row : jdbc.queryForList(
                 "select id from ds_sandbox_approval where status='APPROVED' and deleted=0 "
                         + "and (applicant_node_id=? or (coalesce(applicant_node_id,'')='' and owner_id=?)) "
@@ -408,6 +410,16 @@ public class SandboxApprovalService {
             executeOne(id);
         }
         reclaimStuckExecuting();
+    }
+
+    /**
+     * Compatibility for approvals created before sandbox review became single-stage.
+     * OPERATOR_REVIEW is no longer a required gate, so promote those records before
+     * listing or executing them instead of leaving them permanently invisible to the executor.
+     */
+    private void promoteLegacyOperatorReviews() {
+        jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',approved_at=case when coalesce(approved_at,'')='' then ? else approved_at end,updated_at=? where status='OPERATOR_REVIEW' and deleted=0",
+                now(), now());
     }
 
     /** 执行单条申请单：按类型分发，成功 complete，异常 failAndRetry（自动重试/置 FAILED）。 */
