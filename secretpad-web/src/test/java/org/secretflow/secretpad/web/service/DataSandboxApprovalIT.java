@@ -70,6 +70,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "secretpad.data-sandbox.kuscia.enabled=true",
         "secretpad.data-sandbox.approval.required=true",
         "secretpad.node-id=kuscia-system",
+        "secretpad.data-sandbox.approval.executor-node-id=alice",
         "secretpad.data-sandbox.snapshot-root=${java.io.tmpdir}/ds-sandbox-apr-snapshots",
         "secretpad.data-sandbox.backup-root=${java.io.tmpdir}/ds-sandbox-apr-backups",
         "spring.datasource.default.jdbc-url=jdbc:sqlite:${java.io.tmpdir}/ds-sandbox-approval-it.sqlite",
@@ -77,7 +78,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 })
 public class DataSandboxApprovalIT {
 
-    private static final String IMAGE_ID = "img-secretflow";
+    private static final String IMAGE_ID = "img-jupyter-scipy";
     private static final int MOCK_PORT = 50053;
     private static final int FAIL_CODE = 1;
 
@@ -189,6 +190,7 @@ public class DataSandboxApprovalIT {
 
     /** alice 提交 CREATE 申请单（含完整规格与镜像）。 */
     private String submitCreate() {
+        UserContext.setBaseUser(alice());
         Map<String, Object> payload = createPayload("CREATE", null);
         payload.put("ownerId", "alice");
         payload.put("projectId", "p1");
@@ -209,13 +211,12 @@ public class DataSandboxApprovalIT {
         approvalService.approvalAction(Map.of("id", id, "action", "APPROVE", "comment", "供数方确认"));
     }
 
-    /** admin 阶段2 通过（运营方）。 */
+    /** 兼容旧测试调用：单级项目节点审批后已是 APPROVED。 */
     private void approveStage2(String id) {
-        UserContext.setBaseUser(admin());
-        approvalService.approvalAction(Map.of("id", id, "action", "APPROVE", "comment", "运营方确认"));
+        assertEquals("APPROVED", approvalStatus(id));
     }
 
-    /** 完整提交+两级审批 → APPROVED。 */
+    /** 完整提交+项目节点审批 → APPROVED。 */
     private String submitAndApprove() {
         String id = submitCreate();
         approveStage1(id);
@@ -242,7 +243,7 @@ public class DataSandboxApprovalIT {
 
     /* ------------------------------- 用例 ------------------------------- */
 
-    /** 1. CREATE 全链路：提交→两级审批→执行引擎自动建沙箱并拉起→同步 RUNNING/BOUND。 */
+    /** 1. CREATE 全链路：提交→项目节点审批→执行引擎自动建沙箱并拉起→同步 RUNNING/BOUND。 */
     @Test
     public void createFullLifecycleAutoExecutes() {
         String id = submitAndApprove();
@@ -265,8 +266,8 @@ public class DataSandboxApprovalIT {
         assertEquals("RUNNING", String.valueOf(sbx.get("status")));
         assertEquals("BOUND", String.valueOf(sbx.get("alloc_state")));
         assertTrue(String.valueOf(sbx.get("endpoint")).contains("10.0.0.1"));
-        // 审批历史完整：SUBMIT / APPROVE / APPROVE / EXECUTE / COMPLETE
-        assertEquals(5L, count("select count(1) from ds_sandbox_approval_history where approval_id=?", id));
+        // 审批历史完整：SUBMIT / APPROVE / EXECUTE / COMPLETE
+        assertEquals(4L, count("select count(1) from ds_sandbox_approval_history where approval_id=?", id));
     }
 
     /** 2. 驳回与复审：阶段1 REJECT → REJECTED；申请人 RESUBMIT → version=2 → 复审通过。 */
@@ -289,46 +290,15 @@ public class DataSandboxApprovalIT {
         assertEquals("APPROVED", approvalStatus(id));
     }
 
-    /** 3. 并发审批：阶段2 两审核人同时 APPROVE，恰一个成功，另一个收到冲突。 */
+    /** 3. 单级审批：项目节点同意后直接批准，后续重复审批被拒绝。 */
     @Test
-    public void concurrentStageTwoApproveOnlyOneWins() throws Exception {
+    public void projectNodeApproveIsSingleStage() {
         String id = submitCreate();
         approveStage1(id);
-        assertEquals("OPERATOR_REVIEW", approvalStatus(id));
-
-        CountDownLatch latch = new CountDownLatch(1);
-        AtomicInteger success = new AtomicInteger();
-        AtomicInteger conflict = new AtomicInteger();
-        Runnable adminApprove = () -> {
-            UserContext.setBaseUser(admin());
-            try {
-                latch.await();
-                approvalService.approvalAction(Map.of("id", id, "action", "APPROVE", "comment", "admin"));
-                success.incrementAndGet();
-            } catch (Exception e) {
-                conflict.incrementAndGet();
-            }
-        };
-        Runnable opsApprove = () -> {
-            UserContext.setBaseUser(opsAlice());
-            try {
-                latch.await();
-                approvalService.approvalAction(Map.of("id", id, "action", "APPROVE", "comment", "ops"));
-                success.incrementAndGet();
-            } catch (Exception e) {
-                conflict.incrementAndGet();
-            }
-        };
-        Thread t1 = new Thread(adminApprove);
-        Thread t2 = new Thread(opsApprove);
-        t1.start();
-        t2.start();
-        latch.countDown();
-        t1.join(5000);
-        t2.join(5000);
-        assertEquals(1, success.get(), "恰有一个审核人胜出");
-        assertEquals(1, conflict.get(), "另一审核人应收到并发冲突");
         assertEquals("APPROVED", approvalStatus(id));
+        UserContext.setBaseUser(admin());
+        assertThrows(IllegalStateException.class,
+                () -> approvalService.approvalAction(Map.of("id", id, "action", "APPROVE", "comment", "重复")));
     }
 
     /** 4. 失败自动重试与 FAILED：createJob 先失败回退 APPROVED，恢复后 COMPLETED；持续失败达上限 FAILED+告警。 */
@@ -414,6 +384,7 @@ public class DataSandboxApprovalIT {
         // 已回收沙箱无可续 → 视为完成
         Map<String, Object> recyclePayload = createPayload("RECYCLE", sandboxId);
         recyclePayload.put("days", 7);
+        UserContext.setBaseUser(alice());
         String recycled = String.valueOf(approvalService.submit(recyclePayload).get("id"));
         approveStage1(recycled);
         approveStage2(recycled);

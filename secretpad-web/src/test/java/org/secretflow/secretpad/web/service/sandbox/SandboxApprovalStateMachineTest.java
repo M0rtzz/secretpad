@@ -48,7 +48,7 @@ public class SandboxApprovalStateMachineTest {
         Map<SandboxApprovalStateMachine.Action, String> m = new EnumMap<>(EXPECTED);
         switch (SandboxApprovalStateMachine.Status.valueOf(from)) {
             case DATA_PROVIDER_REVIEW -> {
-                m.put(SandboxApprovalStateMachine.Action.APPROVE, "OPERATOR_REVIEW");
+                m.put(SandboxApprovalStateMachine.Action.APPROVE, "APPROVED");
                 m.put(SandboxApprovalStateMachine.Action.REJECT, "REJECTED");
                 m.put(SandboxApprovalStateMachine.Action.CANCEL, "CANCELLED");
             }
@@ -104,8 +104,8 @@ public class SandboxApprovalStateMachineTest {
     /* ------------------------------- targeted checks ------------------------------- */
 
     @Test
-    public void firstStageApproveAdvancesToOperatorReview() {
-        assertEquals("OPERATOR_REVIEW",
+    public void projectNodeApproveAdvancesToApproved() {
+        assertEquals("APPROVED",
                 SandboxApprovalStateMachine.transition("DATA_PROVIDER_REVIEW", SandboxApprovalStateMachine.Action.APPROVE));
     }
 

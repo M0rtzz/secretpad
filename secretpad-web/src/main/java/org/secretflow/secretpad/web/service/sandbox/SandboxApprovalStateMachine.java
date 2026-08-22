@@ -17,8 +17,8 @@ import java.util.Set;
  * Pure state machine for the Z-03 sandbox resource application / approval flow.
  *
  * <p>An application (创建/延期/规格变更/回收) goes through two review stages: 供数方审核
- * ({@code DATA_PROVIDER_REVIEW}) then 运营方审核 ({@code OPERATOR_REVIEW}). Once both approve
- * the application becomes {@code APPROVED} and an executor claims it
+ * ({@code DATA_PROVIDER_REVIEW}). Once all required project nodes approve, the application
+ * becomes {@code APPROVED} and an executor claims it
  * ({@code EXECUTING → COMPLETED}), with {@code REJECTED} (re-review via RESUBMIT, version+1),
  * {@code FAILED} (manual RETRY) and {@code CANCELLED} (withdrawal) branches.</p>
  *
@@ -75,7 +75,8 @@ public final class SandboxApprovalStateMachine {
         }
         Status status = Status.valueOf(upper(from));
         return switch (action) {
-            case APPROVE -> status == Status.DATA_PROVIDER_REVIEW ? "OPERATOR_REVIEW" : "APPROVED";
+            // Keep legacy OPERATOR_REVIEW records finishable, while new approvals are single-stage.
+            case APPROVE -> "APPROVED";
             case REJECT -> "REJECTED";
             case RESUBMIT -> "DATA_PROVIDER_REVIEW";
             case CANCEL -> "CANCELLED";
