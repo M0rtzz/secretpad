@@ -47,6 +47,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -104,6 +105,7 @@ public class VoteInviteStatusMonitor {
                         }
                     }
                 }
+                syncPartyVoteInfos(voteRequestDO, voteInviteDOS);
                 if (voteInviteDOS.stream().anyMatch(e -> VoteStatusEnum.REJECTED.name().equals(e.getAction()))) {
                     voteRequestDO.setStatus(VoteStatusEnum.REJECTED.getCode());
                 } else if (voteInviteDOS.stream().allMatch(e -> VoteStatusEnum.APPROVED.name().equals(e.getAction()))) {
@@ -114,6 +116,23 @@ public class VoteInviteStatusMonitor {
             });
         }
 
+    }
+
+    private void syncPartyVoteInfos(VoteRequestDO voteRequestDO, List<VoteInviteDO> voteInviteDOS) {
+        Set<VoteRequestDO.PartyVoteInfo> partyVoteInfos = voteRequestDO.getPartyVoteInfos();
+        if (partyVoteInfos == null) {
+            partyVoteInfos = new HashSet<>();
+            voteRequestDO.setPartyVoteInfos(partyVoteInfos);
+        }
+        for (VoteInviteDO voteInviteDO : voteInviteDOS) {
+            VoteRequestDO.PartyVoteInfo partyVoteInfo = VoteRequestDO.PartyVoteInfo.builder()
+                    .partyId(voteInviteDO.getUpk().getVotePartitionID())
+                    .action(voteInviteDO.getAction())
+                    .reason(voteInviteDO.getReason())
+                    .build();
+            partyVoteInfos.remove(partyVoteInfo);
+            partyVoteInfos.add(partyVoteInfo);
+        }
     }
 
     private void verify(VoteRequestDO voteRequestDO, List<VoteInviteDO> voteInviteDOS) {
@@ -191,4 +210,3 @@ public class VoteInviteStatusMonitor {
     }
 
 }
-

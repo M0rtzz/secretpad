@@ -18,19 +18,26 @@ package org.secretflow.secretpad.persistence.datasync.rest.p2p;
 
 import org.secretflow.secretpad.common.dto.SecretPadResponse;
 import org.secretflow.secretpad.common.dto.SyncDataDTO;
+import org.secretflow.secretpad.persistence.datasync.event.P2pDataSyncSendEvent;
 import org.secretflow.secretpad.persistence.datasync.listener.EntityChangeListener;
 import org.secretflow.secretpad.persistence.datasync.rest.DataSyncRestTemplate;
 import org.secretflow.secretpad.persistence.entity.BaseAggregationRoot;
 
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import jakarta.annotation.Resource;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.util.ObjectUtils;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -41,17 +48,34 @@ import java.util.concurrent.atomic.AtomicInteger;
 @RequiredArgsConstructor
 public class P2pDataSyncRestTemplate extends DataSyncRestTemplate {
 
-    Map<EntityChangeListener.DbChangeEvent<BaseAggregationRoot>, AtomicInteger> retryTimes = new ConcurrentHashMap<>();
-    static final int MAX_RETRY_TIMES = 3;
+    static final long INITIAL_RETRY_DELAY_MS = 1000L;
+    static final long MAX_RETRY_DELAY_MS = 60000L;
+
+    private final Map<String, AtomicInteger> retryTimes = new ConcurrentHashMap<>();
+    private final Map<String, Long> retryNotBefore = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> retryTasks = new ConcurrentHashMap<>();
+
+    @Resource(name = "dataSyncRetryScheduler")
+    @Setter
+    private TaskScheduler retryScheduler;
+
+    @Resource
+    @Setter
+    private ApplicationEventPublisher applicationEventPublisher;
 
     @Override
     public EntityChangeListener.DbChangeEvent<BaseAggregationRoot> send(String node) throws InterruptedException {
         int size = dataSyncDataBufferTemplate.size(node);
         EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event = null;
         while (size > 0) {
+            Long notBefore = retryNotBefore.get(node);
+            if (notBefore != null && System.currentTimeMillis() < notBefore) {
+                scheduleRetry(node, notBefore);
+                return event;
+            }
             long startTime = System.currentTimeMillis();
             log.debug("data sync start to send {}, now size {}", node, size);
-            event = dataSyncDataBufferTemplate.poll(node);
+            event = dataSyncDataBufferTemplate.peek(node);
             if (!ObjectUtils.isEmpty(event)) {
                 SecretPadResponse<EntityChangeListener.DbChangeEvent<BaseAggregationRoot>> syncResp;
                 String routeId = "";
@@ -74,12 +98,14 @@ public class P2pDataSyncRestTemplate extends DataSyncRestTemplate {
                         onError(node, event);
                         long duration = System.currentTimeMillis() - startTime;
                         recordMetrics(routeId, syncDataDTO.getTableName(), duration, syncResp.getStatus().getMsg(), size);
+                        return event;
                     }
                 } catch (Exception e) {
                     log.error("P2pDataSyncRestTemplate send error", e);
                     onError(node, event);
                     long duration = System.currentTimeMillis() - startTime;
                     recordMetrics(routeId, syncDataDTO.getTableName(), duration, ObjectUtils.isEmpty(e.getMessage()) ? e.getClass().getName() : e.getMessage(), size);
+                    return event;
                 }
                 size = dataSyncDataBufferTemplate.size(node);
                 log.debug("data sync end to send {}, now size {}", node, size);
@@ -93,26 +119,41 @@ public class P2pDataSyncRestTemplate extends DataSyncRestTemplate {
 
     @Override
     public void onError(String node, EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event) {
-        if (retryTimes.containsKey(event)) {
-            retryTimes.get(event).incrementAndGet();
-        } else {
-            retryTimes.put(event, new AtomicInteger(0));
-        }
-        int i = retryTimes.get(event).get();
-        if (i < MAX_RETRY_TIMES) {
-            log.warn("data sync send error, retry {} times", i);
-            dataSyncDataBufferTemplate.commit(node, event);
-            dataSyncDataBufferTemplate.push(event);
-        } else {
-            log.error("data sync send error, retry {} times, remove it", i);
-            dataSyncDataBufferTemplate.commit(node, event);
-            retryTimes.remove(event);
-        }
+        int attempt = retryTimes.computeIfAbsent(node, key -> new AtomicInteger()).incrementAndGet();
+        int exponent = Math.min(attempt - 1, 6);
+        long delay = Math.min(INITIAL_RETRY_DELAY_MS * (1L << exponent), MAX_RETRY_DELAY_MS);
+        long notBefore = System.currentTimeMillis() + delay;
+        retryNotBefore.put(node, notBefore);
+        scheduleRetry(node, notBefore);
+        log.warn("data sync to {} failed, keep durable event and retry attempt {} after {} ms",
+                node, attempt, delay);
+    }
+
+    private void scheduleRetry(String node, long notBefore) {
+        retryTasks.compute(node, (key, current) -> {
+            if (current != null && !current.isDone()) {
+                return current;
+            }
+            return retryScheduler.schedule(() -> {
+                retryTasks.remove(node);
+                applicationEventPublisher.publishEvent(new P2pDataSyncSendEvent(this, node));
+            }, Instant.ofEpochMilli(notBefore));
+        });
     }
 
     @Override
     public void onSuccess(String node, EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event) {
         dataSyncDataBufferTemplate.commit(node, event);
+        clearRetry(node);
+    }
+
+    private void clearRetry(String node) {
+        retryTimes.remove(node);
+        retryNotBefore.remove(node);
+        ScheduledFuture<?> retryTask = retryTasks.remove(node);
+        if (retryTask != null && !retryTask.isDone()) {
+            retryTask.cancel(false);
+        }
     }
 
     private void recordMetrics(String target, String tableName, long duration, String status, int size) {

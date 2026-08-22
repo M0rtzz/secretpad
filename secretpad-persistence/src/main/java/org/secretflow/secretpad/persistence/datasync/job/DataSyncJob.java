@@ -72,18 +72,23 @@ public class DataSyncJob implements ApplicationListener<P2pDataSyncSendEvent> {
     @Override
     public void onApplicationEvent(P2pDataSyncSendEvent event) {
         String node = event.getNode();
+        String threadName = Thread.currentThread().getName();
+        boolean acquired = false;
         try {
             log.debug("start data sync to {}", node);
-            if (NODE_WORK_THREAD_NAME.containsKey(node)) {
-                log.info("{} is working now {}, skip it", node, NODE_WORK_THREAD_NAME.get(node));
+            String currentWorker = NODE_WORK_THREAD_NAME.putIfAbsent(node, threadName);
+            if (currentWorker != null) {
+                log.info("{} is working now {}, skip it", node, currentWorker);
                 return;
             }
-            NODE_WORK_THREAD_NAME.put(node, Thread.currentThread().getName());
+            acquired = true;
             work(node);
         } catch (Exception e) {
             log.error("dataSyncJob work error", e);
         } finally {
-            NODE_WORK_THREAD_NAME.remove(node);
+            if (acquired) {
+                NODE_WORK_THREAD_NAME.remove(node, threadName);
+            }
         }
     }
 }

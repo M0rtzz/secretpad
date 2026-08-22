@@ -443,7 +443,7 @@ public class DataAssetService {
     private void requireProjectParticipant(String projectId){
         boolean member=c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())>0;
         boolean initiator=c("select count(1) from project where project_id=? and owner_id in (?,?) and is_deleted=0",projectId,owner(),legacyOwner())>0;
-        boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action='REVIEWING'",projectId,owner(),legacyOwner())>0;
+        boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action in ('REVIEWING','APPROVED')",projectId,owner(),legacyOwner())>0;
         if(!member&&!initiator&&!invitee)throw new SecurityException("当前节点不是项目参与方");
     }
     private long c(String sql,Object...args){Long n=jdbc.queryForObject(sql,Long.class,args);return n==null?0:n;}

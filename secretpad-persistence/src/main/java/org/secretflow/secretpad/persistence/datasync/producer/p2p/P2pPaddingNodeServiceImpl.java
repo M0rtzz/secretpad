@@ -88,12 +88,29 @@ public class P2pPaddingNodeServiceImpl implements PaddingNodeService {
                 }
             }
         }
-        List<String> collect = nodeIds.stream().distinct().collect(Collectors.toList());
+        // Vote records use node IDs as their voter/partition identifiers so the
+        // receiving node can query its inbox by platform node ID.  P2P routing,
+        // however, is addressed by institution ID (which is mapped to the
+        // institution's master node route below).  Translate only node IDs here
+        // and retain institution IDs that are already present (for example the
+        // vote initiator).
+        if (event.getSource() instanceof VoteRequestDO || event.getSource() instanceof VoteInviteDO) {
+            nodeIds = nodeIds.stream().map(this::toInstitutionRouteId).collect(Collectors.toList());
+        }
+        List<String> collect = nodeIds.stream().filter(Objects::nonNull).distinct().collect(Collectors.toList());
         event.setNodeIds(collect);
         List<NodeInstDTO> nodeDOList = nodeRepository.findInstMasterNodeId();
         for (NodeInstDTO nodeInstDto : nodeDOList) {
             inst_Node.put(nodeInstDto.getInstId(), nodeInstDto.getMasterNodeId());
         }
+    }
+
+    private String toInstitutionRouteId(String id) {
+        if (StringUtils.isBlank(id)) {
+            return id;
+        }
+        NodeDO node = nodeRepository.findByNodeId(id);
+        return node == null || StringUtils.isBlank(node.getInstId()) ? id : node.getInstId();
     }
 
     @Override

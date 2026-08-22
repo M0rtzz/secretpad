@@ -49,6 +49,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.support.WebClientAdapter;
 import org.springframework.web.service.invoker.HttpServiceProxyFactory;
@@ -145,5 +146,14 @@ public class P2pDataSyncConfigurable {
         threadPoolTaskExecutor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
         threadPoolTaskExecutor.initialize();
         return threadPoolTaskExecutor;
+    }
+
+    @Bean("dataSyncRetryScheduler")
+    public ThreadPoolTaskScheduler dataSyncRetryScheduler() {
+        ThreadPoolTaskScheduler taskScheduler = new ThreadPoolTaskScheduler();
+        taskScheduler.setPoolSize(1);
+        taskScheduler.setThreadNamePrefix("DataSyncRetry-");
+        taskScheduler.initialize();
+        return taskScheduler;
     }
 }
