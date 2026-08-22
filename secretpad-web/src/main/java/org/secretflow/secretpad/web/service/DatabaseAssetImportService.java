@@ -31,7 +31,7 @@ import java.util.regex.Pattern;
 /** Read-only database preview and CSV materialization for catalog assets. */
 @Service
 public class DatabaseAssetImportService {
-    private static final Set<String> TYPES = Set.of("MYSQL", "POSTGRESQL", "OCEANBASE", "POLARDB");
+    private static final Set<String> TYPES = Set.of("MYSQL", "POSTGRESQL", "OCEANBASE", "OPENGAUSS");
     private static final Pattern TABLE = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*(\\.[A-Za-z_][A-Za-z0-9_$]*)?");
     private static final Pattern WRITE_SQL = Pattern.compile(
             "(?is)\\b(insert|update|delete|merge|replace|create|alter|drop|truncate|grant|revoke|call|copy|vacuum|analyze)\\b");
@@ -117,8 +117,12 @@ public class DatabaseAssetImportService {
         if (!TYPES.contains(type)) throw new IllegalArgumentException("不支持的数据库类型: " + type);
         String host = required(request, "host");
         String database = required(request, "database");
-        boolean postgres = "POSTGRESQL".equals(type)
-                || ("POLARDB".equals(type) && "POSTGRESQL".equalsIgnoreCase(value(request, "protocol")));
+        String protocol = value(request, "protocol").toUpperCase(Locale.ROOT);
+        if ("OCEANBASE".equals(type) && !protocol.isBlank()
+                && !Set.of("MYSQL", "ORACLE").contains(protocol)) {
+            throw new IllegalArgumentException("OceanBase 协议必须是 MYSQL 或 ORACLE");
+        }
+        boolean postgres = "POSTGRESQL".equals(type) || "OPENGAUSS".equals(type);
         int port;
         try {
             port = Integer.parseInt(String.valueOf(request.getOrDefault("port", postgres ? 5432 : 3306)));
@@ -135,10 +139,18 @@ public class DatabaseAssetImportService {
             sql = sql.replaceFirst(";\\s*$", "").trim();
             validateReadOnlySql(sql);
         }
-        String url = postgres
-                ? "jdbc:postgresql://" + host + ":" + port + "/" + database
-                : "jdbc:mysql://" + host + ":" + port + "/" + database
-                        + "?useSSL=false&serverTimezone=UTC&allowMultiQueries=false";
+        String url;
+        if ("OCEANBASE".equals(type)) {
+            // OceanBase's official driver negotiates MySQL/Oracle tenant mode with the server.
+            url = "jdbc:oceanbase://" + host + ":" + port + "/" + database;
+        } else if ("OPENGAUSS".equals(type)) {
+            url = "jdbc:opengauss://" + host + ":" + port + "/" + database;
+        } else if (postgres) {
+            url = "jdbc:postgresql://" + host + ":" + port + "/" + database;
+        } else {
+            url = "jdbc:mysql://" + host + ":" + port + "/" + database
+                    + "?useSSL=false&serverTimezone=UTC&allowMultiQueries=false";
+        }
         return new QuerySpec(url, value(request, "username"),
                 String.valueOf(request.getOrDefault("password", "")), sql, table);
     }
