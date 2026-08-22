@@ -3,6 +3,7 @@ package org.secretflow.secretpad.web.controller;
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataAssetService;
 import org.secretflow.secretpad.web.service.DatabaseAssetImportService;
+import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -21,7 +22,8 @@ import java.util.*;
 public class DataAssetController {
     private final DataAssetService service;
     private final DatabaseAssetImportService databaseImport;
-    public DataAssetController(DataAssetService service, DatabaseAssetImportService databaseImport){this.service=service;this.databaseImport=databaseImport;}
+    private final SandboxDataControlService dataControl;
+    public DataAssetController(DataAssetService service, DatabaseAssetImportService databaseImport, SandboxDataControlService dataControl){this.service=service;this.databaseImport=databaseImport;this.dataControl=dataControl;}
     @PostMapping(value="/files/upload", consumes="multipart/form-data")
     public SecretPadResponse<Map<String,Object>> upload(@RequestPart("file") MultipartFile file) throws Exception {
         String type=file.getContentType()==null?"":file.getContentType().toLowerCase(Locale.ROOT);
@@ -83,4 +85,6 @@ public class DataAssetController {
     @GetMapping("/usage-controls/requests") public SecretPadResponse<List<Map<String,Object>>> requests(){return SecretPadResponse.success(service.usageRequests());}
     @PostMapping("/usage-controls/save") public SecretPadResponse<Map<String,Object>> save(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.saveUsage(r));}
     @PostMapping("/usage-controls/review") public SecretPadResponse<Map<String,Object>> review(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.reviewUsage(r));}
+    @GetMapping("/usage-controls/mounts") public SecretPadResponse<List<Map<String,Object>>> mountControls(){return SecretPadResponse.success(dataControl.mountControls());}
+    @PostMapping("/usage-controls/mounts/save") public SecretPadResponse<Map<String,Object>> saveMountControl(@RequestBody Map<String,Object> r){return SecretPadResponse.success(dataControl.saveMountControl(r));}
 }

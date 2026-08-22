@@ -283,6 +283,42 @@ public class SandboxDbService {
         return CsvUtil.toCsv(header, rows).getBytes(StandardCharsets.UTF_8);
     }
 
+    /**
+     * Creates a short-lived SQLite database containing only one authorized input table.
+     * Callers must delete the returned file in a finally block.
+     */
+    public Path createExecutionSnapshot(String sandboxId, Set<String> tableNames) {
+        if (tableNames == null || tableNames.isEmpty()) throw new IllegalArgumentException("执行快照至少需要一个输入表");
+        try {
+            Path snapshot = Files.createTempFile("sandbox-exec-", ".db");
+            for (String tableName : tableNames) {
+                String safeTable = SqliteTableLoader.sanitizeTableName(tableName);
+                Map<String, Object> table = readTable(sandboxId, safeTable);
+                @SuppressWarnings("unchecked")
+                List<String> header = (List<String>) table.get("header");
+                @SuppressWarnings("unchecked")
+                List<List<String>> rows = (List<List<String>>) table.get("rows");
+                SqliteTableLoader.materializeToFile(snapshot, safeTable, header, rows, false);
+            }
+            return snapshot;
+        } catch (IOException e) {
+            throw new IllegalStateException("创建受限执行快照失败", e);
+        }
+    }
+
+    /** Serializes and removes a single-table execution snapshot. */
+    public byte[] executionSnapshotBytes(String sandboxId, Set<String> tableNames) {
+        Path snapshot = createExecutionSnapshot(sandboxId, tableNames);
+        try {
+            return Files.readAllBytes(snapshot);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取受限执行快照失败", e);
+        } finally {
+            try { Files.deleteIfExists(snapshot); }
+            catch (IOException e) { log.warn("删除受限执行快照失败: {}", snapshot, e); }
+        }
+    }
+
     /** 下载沙箱权威库文件（仅沙箱创建人，由控制器校验）。 */
     public byte[] downloadBytes(String sandboxId) {
         Path db = sandboxDbPath(sandboxId);

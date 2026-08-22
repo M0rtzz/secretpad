@@ -3,7 +3,6 @@ package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataComputeService;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.List;
@@ -26,6 +25,7 @@ public class DataComputeController {
     @GetMapping("/reports") public SecretPadResponse<List<Map<String,Object>>> reports(@RequestParam String sandboxId,@RequestParam(defaultValue="") String type){return SecretPadResponse.success(service.reports(sandboxId,type));}
     @GetMapping("/sandbox-db/directory") public SecretPadResponse<Map<String,Object>> sandboxDbDirectory(@RequestParam String sandboxId){return SecretPadResponse.success(service.sandboxDbDirectory(sandboxId));}
     @GetMapping("/sandbox-db/table-preview") public SecretPadResponse<Map<String,Object>> sandboxDbTablePreview(@RequestParam String sandboxId,@RequestParam String tableName,@RequestParam(defaultValue="20") int limit){return SecretPadResponse.success(service.sandboxDbTablePreview(sandboxId,tableName,limit));}
-    @GetMapping("/sandbox-db/download") public ResponseEntity<byte[]> sandboxDbDownload(@RequestParam String sandboxId){byte[] bytes=service.sandboxDbDownload(sandboxId);return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION,"attachment; filename=\"sandbox_data.db\"").contentType(org.springframework.http.MediaType.APPLICATION_OCTET_STREAM).body(bytes);}
-    @GetMapping("/sandbox-db/table-export") public ResponseEntity<byte[]> sandboxDbTableExport(@RequestParam String sandboxId,@RequestParam String tableName){byte[] bytes=service.sandboxDbTableExport(sandboxId,tableName);String filename=tableName.replaceAll("[^a-zA-Z0-9_-]","_")+".csv";return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION,"attachment; filename=\""+filename+"\"").contentType(org.springframework.http.MediaType.parseMediaType("text/csv; charset=utf-8")).body(bytes);}
+    @GetMapping("/sandbox-db/table-export") public ResponseEntity<byte[]> sandboxDbTableExport(@RequestParam String sandboxId,@RequestParam String tableName){byte[] bytes=service.sandboxDbTableExport(sandboxId,tableName);String filename=tableName.replaceAll("[^a-zA-Z0-9_-]","_")+".csv";return ResponseEntity.ok().header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,"attachment; filename=\""+filename+"\"").contentType(org.springframework.http.MediaType.parseMediaType("text/csv; charset=utf-8")).body(bytes);}
+    @GetMapping("/result-controls") public SecretPadResponse<List<Map<String,Object>>> resultControls(@RequestParam String sandboxId){return SecretPadResponse.success(service.resultControls(sandboxId));}
+    @PostMapping("/result-controls/save") public SecretPadResponse<Map<String,Object>> saveResultControl(@RequestBody Map<String,Object> request){return SecretPadResponse.success(service.saveResultControl(request));}
 }

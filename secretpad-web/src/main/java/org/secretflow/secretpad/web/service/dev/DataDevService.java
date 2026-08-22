@@ -21,6 +21,7 @@ import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.NodeDO;
 import org.secretflow.secretpad.persistence.repository.NodeRepository;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
@@ -88,6 +89,7 @@ public class DataDevService {
     private final DataSandboxMvpService mvp;
     private final DevJobExecutor devJobExecutor;
     private final SandboxDbService sandboxDb;
+    private final SandboxDataControlService dataControl;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -121,7 +123,8 @@ public class DataDevService {
             NodeRepository nodeRepository,
             DataSandboxMvpService mvp,
             DevJobExecutor devJobExecutor,
-            SandboxDbService sandboxDb) {
+            SandboxDbService sandboxDb,
+            SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
@@ -130,6 +133,7 @@ public class DataDevService {
         this.mvp = mvp;
         this.devJobExecutor = devJobExecutor;
         this.sandboxDb = sandboxDb;
+        this.dataControl = dataControl;
     }
 
     /* ============================== 权限 ============================== */
@@ -463,6 +467,7 @@ public class DataDevService {
         String datatableId;
         if (notBlank(sandboxId)) {
             Map<String, Object> mount = requireSandboxMount(sandboxId, mountId, assetId);
+            dataControl.requireMountAssetUsable(sandboxId, string(mount.get("asset_id")));
             nodeId = value(mount, "processor_node_id", string(mount.get("provider_node_id")));
             datatableId = string(mount.get("datatable_id"));
             if (!notBlank(datatableId)) throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 挂载数据没有可计算的数据表");
@@ -524,6 +529,7 @@ public class DataDevService {
             throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": execType 必须是 JAR/SQL/PYTHON/FUNCTION");
         }
         requireSandboxCreator(sandboxId, "");
+        dataControl.requireMountTableUsable(sandboxId, sourceTable);
         Map<String, Object> sandbox = requireRow("select project_id,owner_id from ds_sandbox where id=?", sandboxId);
         request.put("projectId", sandbox.get("project_id"));
         if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
@@ -763,14 +769,22 @@ public class DataDevService {
     /** 沙箱 SQL 执行流：文件库只读执行；DEV 仅预览+日志，PROD 结果回填沙箱库与数据目录。 */
     private void runSandboxSqlFlow(String taskId, String runMode, String sandboxId, String nodeId,
             List<String> header, List<List<String>> data, Map<String, Object> params, String sql) {
-        DevSqlEngine.SqlResult result = DevSqlEngine.executeOnDb(
-                sandboxDb.sandboxDbPath(sandboxId), sql, params, sqlLimit, sqlTimeoutSeconds);
+        Path executionDb = sandboxDb.createExecutionSnapshot(sandboxId, Set.of(
+                string(requireRow("select source_table_name from ds_dev_task where id=?", taskId).get("source_table_name"))));
+        DevSqlEngine.SqlResult result;
+        try {
+            result = DevSqlEngine.executeOnDb(executionDb, sql, params, sqlLimit, sqlTimeoutSeconds);
+        } finally {
+            try { Files.deleteIfExists(executionDb); }
+            catch (IOException e) { log.warn("删除受限 SQL 执行快照失败: {}", executionDb, e); }
+        }
         int attempt = currentRetryCount(taskId);
         appendRunLog(taskId, attempt, String.join("\n", result.logLines()));
         String taskName = string(requireRow("select name from ds_dev_task where id=?", taskId).get("name"));
         if ("PROD".equals(runMode)) {
             String resultTable = string(sandboxDb.backfillResultTable(sandboxId, taskId, taskName,
                     result.header(), result.rows()).get("tableName"));
+            dataControl.registerResultControl(taskId, sandboxId, resultTable);
             // 一键挂载复用 mountResult：结果亦注册为节点 DomainData（结果 CSV 属计算产出，非源数据）
             String resultUri = writeResultCsv(nodeId, taskId, result.header(), result.rows());
             String domainDataId = registerResultDomainData(nodeId, taskId, resultUri, result.header(), null);
@@ -800,6 +814,7 @@ public class DataDevService {
     /** 沙箱表预览（任务 Modal 即时预览），仅创建人。 */
     public Map<String, Object> previewSandboxTable(String sandboxId, String tableName, int limit) {
         requireSandboxCreator(sandboxId, "");
+        dataControl.requireTablePreview(sandboxId, tableName);
         return sandboxDb.previewTable(sandboxId, tableName, limit);
     }
 
@@ -937,7 +952,9 @@ public class DataDevService {
             args.add(like);
         }
         sql.append(" order by created_at desc limit 500");
-        return jdbc.queryForList(sql.toString(), args.toArray());
+        List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
+        rows.forEach(this::removeResultContent);
+        return rows;
     }
 
     public Map<String, Object> taskDetail(String id) {
@@ -955,6 +972,7 @@ public class DataDevService {
         List<Map<String, Object>> runLogs = jdbc.queryForList(
                 "select id,attempt,length(log_text) as log_len,created_at from ds_dev_run_log where task_id=? order by attempt asc", id);
         Map<String, Object> result = new LinkedHashMap<>(task);
+        removeResultContent(result);
         result.put("lineage", lineage);
         result.put("runLogs", runLogs);
         return result;
@@ -1063,6 +1081,7 @@ public class DataDevService {
         if (!sandboxDb.hasTable(sandboxId, sourceTable)) {
             throw new IllegalArgumentException(DevErrors.DEV_NOT_FOUND + ": 沙箱内无此表: " + sourceTable);
         }
+        dataControl.requireMountTableUsable(sandboxId, sourceTable);
         if (sandboxDb.isResultTable(sandboxId, sourceTable)) {
             throw new IllegalArgumentException(DevErrors.DEV_RESULT_NOT_CONSUMABLE
                     + ": 计算结果表不能作为沙箱计算源（仅支持预览与导出）: " + sourceTable);
@@ -1150,7 +1169,9 @@ public class DataDevService {
             args.add(nodeId);
         }
         sql.append(" order by finished_at desc limit 500");
-        return jdbc.queryForList(sql.toString(), args.toArray());
+        List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
+        rows.forEach(this::removeResultContent);
+        return rows;
     }
 
     /** 结果数据集挂载项目（source=IMPORTED），复用 project_datatable 授权表。仅 PROD 结果可挂载。
@@ -1227,6 +1248,7 @@ public class DataDevService {
     public Map<String, Object> viewResult(String taskId) {
         Map<String, Object> task = requireTask(taskId);
         requireCreator(task, "结果");
+        dataControl.requireTaskResultView(task);
         if (!STATUS_SUCCEEDED.equals(string(task.get("status"))) || !notBlank(string(task.get("result_preview")))) {
             throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT + ": 仅 SUCCEEDED 且有结果预览的任务可查看结果");
         }
@@ -1247,6 +1269,9 @@ public class DataDevService {
     public Map<String, Object> runLog(String taskId, Integer attempt) {
         Map<String, Object> task = requireTask(taskId);
         requireCreator(task, "任务");
+        if (notBlank(string(task.get("sandbox_id")))) {
+            dataControl.requireTaskResultView(task);
+        }
         if (attempt != null) {
             List<Map<String, Object>> rows = jdbc.queryForList(
                     "select id,attempt,log_text,created_at from ds_dev_run_log where task_id=? and attempt=?",
@@ -1330,7 +1355,15 @@ public class DataDevService {
                 string(request.get("sourceTable")), string(request.get("outputTable")),
                 string(request.get("functionName")), intValue(request.get("functionNargs"), 0),
                 string(request.get("functionSource")), string(request.get("sql")));
+        dataControl.prepareTaskResultControl(taskId, string(request.get("sandboxId")), request);
         return taskId;
+    }
+
+    /** Result payloads are exposed only by viewResult after its policy check. */
+    private void removeResultContent(Map<String, Object> task) {
+        task.remove("result_preview");
+        task.remove("content_snapshot");
+        task.remove("function_source");
     }
 
     /**

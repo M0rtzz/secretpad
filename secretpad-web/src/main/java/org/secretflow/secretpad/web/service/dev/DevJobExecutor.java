@@ -17,6 +17,7 @@ import org.secretflow.secretpad.common.util.UUIDUtils;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.kuscia.v1alpha1.service.impl.KusciaGrpcClientAdapter;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.governance.CsvUtil;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
@@ -49,6 +50,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Z-05 计算任务运行组件：JAR / PYTHON 通过一次性 Kuscia Job 运行，输入子集 base64 内联进
@@ -78,6 +80,7 @@ public class DevJobExecutor {
     private final KusciaGrpcClientAdapter kuscia;
     private final DataSandboxMvpService mvp;
     private final SandboxDbService sandboxDb;
+    private final SandboxDataControlService dataControl;
 
     @Value("${secretpad.data.dir-path:/app/data/}")
     private String storeDir;
@@ -120,12 +123,14 @@ public class DevJobExecutor {
             ObjectMapper objectMapper,
             KusciaGrpcClientAdapter kuscia,
             DataSandboxMvpService mvp,
-            SandboxDbService sandboxDb) {
+            SandboxDbService sandboxDb,
+            SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.kuscia = kuscia;
         this.mvp = mvp;
         this.sandboxDb = sandboxDb;
+        this.dataControl = dataControl;
     }
 
     /* ------------------------------- 提交 ------------------------------- */
@@ -162,7 +167,7 @@ public class DevJobExecutor {
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
             String sandboxId, String inputTable, String outputTable) {
         submitSandboxChannel(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports,
-                sandboxId, inputTable, outputTable, "dev");
+                sandboxId, inputTable, outputTable, Set.of(inputTable), "dev");
     }
 
     /**
@@ -172,7 +177,7 @@ public class DevJobExecutor {
      */
     public void submitSandboxChannel(String taskId, String nodeId, String inputB64, String execType,
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
-            String sandboxId, String inputTable, String outputTable, String channel) {
+            String sandboxId, String inputTable, String outputTable, Set<String> allowedTables, String channel) {
         Map<String, Object> extra = new LinkedHashMap<>();
         extra.put("jdbc_url", "jdbc:sqlite:/workspace/sandbox_data.db");
         extra.put("input_table", inputTable);
@@ -180,7 +185,7 @@ public class DevJobExecutor {
             extra.put("output_table", outputTable);
         }
         if (notBlank(sandboxId)) {
-            byte[] db = sandboxDb.downloadBytes(sandboxId);
+            byte[] db = sandboxDb.executionSnapshotBytes(sandboxId, allowedTables);
             if (db.length > maxSandboxDbBytes) {
                 throw new IllegalStateException(DevErrors.DEV_INPUT_TOO_LARGE
                         + ": 沙箱数据库超过 " + maxSandboxDbBytes + " 字节上限（当前 "
@@ -561,6 +566,15 @@ public class DevJobExecutor {
         String preview = previewJson(header, rows, resultPreviewRows);
         appendRunLog(taskId, retryCount(task), fetchLog(endpoint));
 
+        try {
+            // 沙箱结果与权限登记必须早于 SUCCEEDED，避免出现可见结果缺少控制记录。
+            backfillSandboxResultIfNeeded(task, header, rows);
+        } catch (Exception e) {
+            fail(taskId, "沙箱结果登记失败: " + e.getMessage(), "dev:" + taskId + ":result-control-failed");
+            delete(jobId);
+            return;
+        }
+
         if ("PROD".equals(runMode)) {
             String resultUri = writeResultCsv(nodeId, taskId, header, rows);
             String domainDataId = registerResultDomainData(nodeId, taskId, resultUri, header);
@@ -594,8 +608,6 @@ public class DevJobExecutor {
             dispatch("dev.task.debugSucceeded", Map.of("id", taskId, "sourceRows", num(task.get("source_rows")),
                     "resultRows", rows.size()));
         }
-        // Stage 4：沙箱任务 PROD 成功 → 结果表回填沙箱权威库 + 数据目录
-        backfillSandboxResultIfNeeded(task, header, rows);
         // 查询/拉取完成后删除 Job（幂等）
         delete(jobId);
     }
@@ -607,14 +619,11 @@ public class DevJobExecutor {
             return;
         }
         String taskId = string(task.get("id"));
-        try {
-            String resultTable = string(sandboxDb.backfillResultTable(sandboxId, taskId,
-                    string(task.get("name")), header, rows).get("tableName"));
-            jdbc.update("update ds_dev_task set result_table_name=? where id=?", resultTable, taskId);
-            log.info("沙箱任务 {} 结果已回填沙箱库: {}", taskId, resultTable);
-        } catch (Exception e) {
-            log.warn("沙箱任务 {} 结果回填失败（不影响任务 SUCCEEDED）: {}", taskId, e.getMessage());
-        }
+        String resultTable = string(sandboxDb.backfillResultTable(sandboxId, taskId,
+                string(task.get("name")), header, rows).get("tableName"));
+        dataControl.registerResultControl(taskId, sandboxId, resultTable);
+        jdbc.update("update ds_dev_task set result_table_name=? where id=?", resultTable, taskId);
+        log.info("沙箱任务 {} 结果已回填沙箱库: {}", taskId, resultTable);
     }
 
     private void fail(String taskId, String errorMessage, String dedupeKey) {

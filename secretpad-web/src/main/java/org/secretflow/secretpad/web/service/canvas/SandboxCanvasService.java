@@ -13,6 +13,7 @@ package org.secretflow.secretpad.web.service.canvas;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.dev.DataDevService;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
 import org.secretflow.secretpad.web.service.model.ModelApprovalService;
@@ -67,6 +68,7 @@ public class SandboxCanvasService {
     private final SandboxDbService sandboxDb;
     private final DataSandboxMvpService mvp;
     private final ModelApprovalService modelApprovalService;
+    private final SandboxDataControlService dataControl;
 
     private final ExecutorService canvasExecutor = Executors.newSingleThreadExecutor();
 
@@ -77,7 +79,8 @@ public class SandboxCanvasService {
             DevJobExecutor devJobExecutor,
             SandboxDbService sandboxDb,
             DataSandboxMvpService mvp,
-            ModelApprovalService modelApprovalService) {
+            ModelApprovalService modelApprovalService,
+            SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.dataDevService = dataDevService;
@@ -85,6 +88,7 @@ public class SandboxCanvasService {
         this.sandboxDb = sandboxDb;
         this.mvp = mvp;
         this.modelApprovalService = modelApprovalService;
+        this.dataControl = dataControl;
     }
 
     /* ============================== 整图/节点运行 ============================== */
@@ -231,6 +235,7 @@ public class SandboxCanvasService {
             empty.put("totalRows", 0);
             return empty;
         }
+        dataControl.requireMountTableUsable(sandboxId, table);
         Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, Math.max(1, Math.min(limit, 500)));
         preview.put("available", true);
         preview.put("nodeId", nodeId);
@@ -277,7 +282,7 @@ public class SandboxCanvasService {
     /** 画布可用数据资源：沙箱挂载表 + op_* 画布输出表（不含 result_*），供 data.table/compare_table/列选择。 */
     public Map<String, Object> dataResources(String sandboxId) {
         requireUsableSandbox(sandboxId, false);
-        Map<String, Object> dir = sandboxDb.directory(sandboxId);
+        Map<String, Object> dir = dataControl.enrichDirectory(sandboxDb.directory(sandboxId));
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> items = (List<Map<String, Object>>) dir.get("items");
         List<Map<String, Object>> resources = new ArrayList<>();
@@ -447,11 +452,13 @@ public class SandboxCanvasService {
                 if (sandboxDb.isResultTable(sandboxId, table)) {
                     throw new IllegalArgumentException("画布输入不能引用计算结果表（result_*）: " + table);
                 }
+                dataControl.requireMountTableUsable(sandboxId, table);
                 jdbc.update("update ds_compute_node_run set status='SUCCEEDED',input_table=?,output_table=?,finished_at=?,updated_at=? where id=?",
                         table, table, now(), now(), nodeRunId);
                 return;
             }
             String inputTable = resolveInputTable(node, graph, canvasId, sandboxId);
+            dataControl.requireMountTableUsable(sandboxId, inputTable);
             Map<String, Object> params = new LinkedHashMap<>();
             params.put("op", node.componentCode);
             params.putAll(node.params);
@@ -463,6 +470,7 @@ public class SandboxCanvasService {
                 if (sandboxDb.isResultTable(sandboxId, compareTable)) {
                     throw new IllegalArgumentException("参考表不能引用计算结果表（result_*）: " + compareTable);
                 }
+                dataControl.requireMountTableUsable(sandboxId, compareTable);
                 params.put("compare_table", compareTable);
             }
             byte[] inputCsv = sandboxDb.readTableCsv(sandboxId, inputTable);
@@ -474,8 +482,13 @@ public class SandboxCanvasService {
             String taskId = dataDevService.createCanvasTask(sandboxId, canvasId, node.id, node.componentCode,
                     CanvasOperatorRegistry.RENDER_SCRIPT, params, List.of(), outputTable);
             dataDevService.claimCanvasTask(taskId);
+            Set<String> allowedTables = new LinkedHashSet<>(Set.of(inputTable));
+            if (CanvasOperatorRegistry.needsCompareTable(node.componentCode)) {
+                allowedTables.add(string(params.get("compare_table")));
+            }
             devJobExecutor.submitSandboxChannel(taskId, nodeDomain, inputB64, "PYTHON",
-                    CanvasOperatorRegistry.RENDER_SCRIPT, params, List.of(), sandboxId, inputTable, outputTable, "canvas");
+                    CanvasOperatorRegistry.RENDER_SCRIPT, params, List.of(), sandboxId, inputTable, outputTable,
+                    allowedTables, "canvas");
             Map<String, Object> result = devJobExecutor.runAndAwait(taskId);
             if (!"SUCCEEDED".equals(string(result.get("status")))) {
                 throw new IllegalStateException("节点执行失败: " + string(result.get("errorMessage")));
@@ -910,6 +923,7 @@ public class SandboxCanvasService {
         if (sandboxDb.isResultTable(sandboxId, table)) {
             throw new IllegalArgumentException("画布节点不能引用计算结果表（result_*）作为输入: " + table);
         }
+        dataControl.requireMountTableUsable(sandboxId, table);
         return table;
     }
 

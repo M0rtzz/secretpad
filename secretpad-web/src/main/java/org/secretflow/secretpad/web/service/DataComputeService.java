@@ -33,17 +33,20 @@ public class DataComputeService {
     private final SandboxApprovalService approvals;
     private final DataAssetService assets;
     private final SandboxDbService sandboxDb;
+    private final SandboxDataControlService dataControl;
 
     public DataComputeService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc,
                               ObjectMapper mapper,
                               SandboxApprovalService approvals,
                               DataAssetService assets,
-                              SandboxDbService sandboxDb) {
+                              SandboxDbService sandboxDb,
+                              SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.mapper = mapper;
         this.approvals = approvals;
         this.assets = assets;
         this.sandboxDb = sandboxDb;
+        this.dataControl = dataControl;
     }
 
     public List<Map<String, Object>> overview() {
@@ -111,25 +114,31 @@ public class DataComputeService {
     /** 沙箱数据目录（MOUNT + RESULT），仅创建人。 */
     public Map<String, Object> sandboxDbDirectory(String sandboxId) {
         requireUsableSandbox(sandboxId, true);
-        return sandboxDb.directory(sandboxId);
+        return dataControl.enrichDirectory(sandboxDb.directory(sandboxId));
     }
 
     /** 沙箱表预览（schema + 前 limit 行），仅创建人。 */
     public Map<String, Object> sandboxDbTablePreview(String sandboxId, String tableName, int limit) {
         requireUsableSandbox(sandboxId, true);
+        dataControl.requireTablePreview(sandboxId, tableName);
         return sandboxDb.previewTable(sandboxId, tableName, limit);
     }
 
-    /** 沙箱权威库文件（Jupyter 会话按需拉取），仅创建人。 */
-    public byte[] sandboxDbDownload(String sandboxId) {
-        requireUsableSandbox(sandboxId, true);
-        return sandboxDb.downloadBytes(sandboxId);
-    }
-
-    /** 沙箱单表 CSV 导出（MOUNT/RESULT 均可，仅创建人）。 */
+    /** 沙箱开发结果 CSV 导出；挂载数据不可导出。 */
     public byte[] sandboxDbTableExport(String sandboxId, String tableName) {
         requireUsableSandbox(sandboxId, true);
+        dataControl.requireResultExport(sandboxId, tableName);
         return sandboxDb.readTableCsv(sandboxId, tableName);
+    }
+
+    public List<Map<String, Object>> resultControls(String sandboxId) {
+        requireUsableSandbox(sandboxId, true);
+        return dataControl.resultControls(sandboxId);
+    }
+
+    public Map<String, Object> saveResultControl(Map<String, Object> request) {
+        requireUsableSandbox(required(request, "sandboxId"), true);
+        return dataControl.saveResultControl(request);
     }
 
     public Map<String, Object> requestMount(Map<String, Object> request) {
@@ -234,7 +243,6 @@ public class DataComputeService {
             payload.put("resultRows", task.get("result_rows"));
             payload.put("resultNodeId", task.get("result_node_id"));
             payload.put("resultDatatableId", task.get("result_datatable_id"));
-            payload.put("preview", parse(string(task.get("result_preview"))));
             result.add(reportRow("task-report-" + task.get("id"), task.get("project_id"), sandboxId,
                     task.get("id"), "PROGRAM_RESULT", string(task.get("name")) + " - 运行结果",
                     json(payload), json(List.of(task.get("source_asset_id"), task.get("source_mount_id"))),
@@ -248,7 +256,6 @@ public class DataComputeService {
             payload.put("metrics", parse(string(test.get("metrics"))));
             payload.put("inputSummary", parse(string(test.get("input_summary"))));
             payload.put("outputSummary", parse(string(test.get("output_summary"))));
-            payload.put("resultPreview", parse(string(test.get("result_preview"))));
             result.add(reportRow("model-report-" + test.get("id"), test.get("project_id"), sandboxId,
                     test.get("id"), "MODEL_EVALUATION", string(test.get("model_name")) + " - 模型评估",
                     json(payload), "[]", "v" + test.get("model_version"), test.get("created_by"), test.get("finished_at")));
