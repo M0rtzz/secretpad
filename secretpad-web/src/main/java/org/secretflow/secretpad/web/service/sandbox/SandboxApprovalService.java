@@ -78,6 +78,10 @@ public class SandboxApprovalService {
     @Value("${secretpad.node-id:kuscia-system}")
     private String nodeId;
 
+    /** Local node whose approved applications this process is allowed to execute. */
+    @Value("${secretpad.data-sandbox.approval.executor-node-id:${secretpad.node-id:kuscia-system}}")
+    private String executorNodeId;
+
     @Value("${secretpad.data-sandbox.approval.max-retries:3}")
     private int maxRetries;
 
@@ -106,8 +110,13 @@ public class SandboxApprovalService {
         applySyncedApprovals();
         String current = operator();
         String currentNode = gate.effectiveOwner();
-        StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?)");
+        boolean admin = gate.isAdmin(gate.currentUser());
+        StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?");
         List<Object> args = new ArrayList<>(List.of(current, currentNode, currentNode));
+        if (admin) {
+            sql.append(" or 1=1");
+        }
+        sql.append(")");
         if (notBlank(status)) {
             sql.append(" and a.status=?");
             args.add(status.toUpperCase(Locale.ROOT));
@@ -218,6 +227,11 @@ public class SandboxApprovalService {
         String sandboxId = "CREATE".equals(type) ? "" : required(request, "sandboxId");
         String applicantNodeId = gate.effectiveOwner();
         String ownerId = "CREATE".equals(type) ? applicantNodeId : sandboxOwner(sandboxId);
+        // Check CREATE idempotency before project/payload validation so a retried
+        // request reports the existing open approval instead of a missing field.
+        if ("CREATE".equals(type)) {
+            assertNoOpenApproval(type, ownerId, sandboxId);
+        }
         if (!"CREATE".equals(type) && !gate.matchesCurrentNode(ownerId)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "只能为当前所属节点提交沙箱申请");
         }
@@ -316,8 +330,18 @@ public class SandboxApprovalService {
         assertApprovalVisible(approval);
         switch (action) {
             case "APPROVE", "REJECT" -> {
-                if (!"DATA_PROVIDER_REVIEW".equals(from)) throw new IllegalStateException("当前申请不在项目成员审核中");
-                vote(id, action, comment);
+                if ("DATA_PROVIDER_REVIEW".equals(from)) {
+                    vote(id, action, comment);
+                } else if ("OPERATOR_REVIEW".equals(from)) {
+                    if (!gate.isAdminOrOperator(gate.currentUser(), string(approval.get("applicant_node_id")))) {
+                        throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅运营方可处理运营审核");
+                    }
+                    if (conditionalUpdate(id, from, action, "", comment) != 1) {
+                        throw new IllegalStateException("申请状态已被其他审核人更新，请刷新后重试");
+                    }
+                } else {
+                    throw new IllegalStateException("当前申请不在审核中");
+                }
             }
             case "RESUBMIT" -> {
                 if (!isApplicant(approval)) {
@@ -337,7 +361,10 @@ public class SandboxApprovalService {
                 jdbc.update("update ds_sandbox_approval set status='CANCELLED',current_stage='CANCELLED',updated_at=? where id=? and status=?", now(), id, from);
             }
             case "RETRY" -> {
-                if (!isApplicant(approval)) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可重试");
+                boolean operator = gate.isAdminOrOperator(gate.currentUser(), string(approval.get("applicant_node_id")));
+                if (!isApplicant(approval) && !operator) {
+                    throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人或运营方可重试");
+                }
                 if (!"FAILED".equals(from)) throw new IllegalStateException("只有执行失败申请可重试");
                 jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,retry_count=0,last_error='',updated_at=? where id=? and status='FAILED'", operator(), now(), id);
             }
@@ -367,8 +394,9 @@ public class SandboxApprovalService {
     public void executeApprovals() {
         applySyncedApprovals();
         for (Map<String, Object> row : jdbc.queryForList(
-                "select id from ds_sandbox_approval where status='APPROVED' and applicant_node_id=? and deleted=0 order by approved_at asc limit 20",
-                nodeId)) {
+                "select id from ds_sandbox_approval where status='APPROVED' and deleted=0 "
+                        + "and (applicant_node_id=? or (coalesce(applicant_node_id,'')='' and owner_id=?)) "
+                        + "order by approved_at asc limit 20", executorNodeId, executorNodeId)) {
             String id = string(row.get("id"));
             int claimed = jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,updated_at=? "
                             + "where id=? and status='APPROVED' and deleted=0",
@@ -925,7 +953,11 @@ public class SandboxApprovalService {
     private void assertApprovalVisible(Map<String, Object> approval) {
         String currentNode = gate.effectiveOwner();
         boolean voter = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and voter_node_id=?", approval.get("id"), currentNode) > 0;
-        if (!isApplicant(approval) && !voter) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+        String applicantNodeId = string(approval.get("applicant_node_id"));
+        boolean operator = gate.isAdminOrOperator(gate.currentUser(), applicantNodeId);
+        if (!isApplicant(approval) && !voter && !operator) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+        }
     }
 
     private boolean isApplicant(Map<String, Object> approval) {
@@ -945,7 +977,7 @@ public class SandboxApprovalService {
         if ("REJECTED".equals(voteStatus)) {
             jdbc.update("update ds_sandbox_approval set status='REJECTED',current_stage='REJECTED',reviewer=?,review_comment=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), approvalId);
         } else if (count("select count(1) from ds_sandbox_approval_vote where approval_id=? and status='PENDING'", approvalId) == 0) {
-            jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',reviewer=?,review_comment=?,approved_at=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), now(), approvalId);
+            jdbc.update("update ds_sandbox_approval set status='OPERATOR_REVIEW',current_stage='OPERATOR_REVIEW',reviewer=?,review_comment=?,updated_at=? where id=? and status='DATA_PROVIDER_REVIEW'", operator(), comment, now(), approvalId);
         }
     }
 

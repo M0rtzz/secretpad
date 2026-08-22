@@ -27,13 +27,6 @@
 --   app_id/secret_hash  调用凭证（sha256 存储，明文一次性展示）
 --   authorized_users JSON 用户名数组（空=仅凭证调用）；ip_whitelist JSON IP/CIDR（空=任意 IP）
 --   valid_from/valid_to 有效时间窗口
-alter table ds_model_approval add column artifact_id varchar(64) not null default '';
-alter table ds_model_approval add column artifact_version_id varchar(64) not null default '';
-alter table ds_model_approval add column test_evidence varchar(4096) not null default '';
-
-alter table ds_dev_task add column channel varchar(16) not null default 'dev';
-alter table ds_dev_task add column result_uri varchar(255) default '';
-
 create table if not exists ds_model (
     id varchar(64) primary key,                 -- 'dm-' + shortId()
     name varchar(128) not null,

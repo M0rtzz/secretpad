@@ -70,6 +70,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "secretpad.data-sandbox.kuscia.enabled=true",
         "secretpad.data-sandbox.approval.required=true",
         "secretpad.node-id=kuscia-system",
+        "secretpad.data-sandbox.approval.executor-node-id=alice",
         "secretpad.data-sandbox.snapshot-root=${java.io.tmpdir}/ds-sandbox-apr-snapshots",
         "secretpad.data-sandbox.backup-root=${java.io.tmpdir}/ds-sandbox-apr-backups",
         "spring.datasource.default.jdbc-url=jdbc:sqlite:${java.io.tmpdir}/ds-sandbox-approval-it.sqlite",
@@ -77,7 +78,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 })
 public class DataSandboxApprovalIT {
 
-    private static final String IMAGE_ID = "img-secretflow";
+    private static final String IMAGE_ID = "img-jupyter-scipy";
     private static final int MOCK_PORT = 50053;
     private static final int FAIL_CODE = 1;
 
@@ -189,6 +190,7 @@ public class DataSandboxApprovalIT {
 
     /** alice 提交 CREATE 申请单（含完整规格与镜像）。 */
     private String submitCreate() {
+        UserContext.setBaseUser(alice());
         Map<String, Object> payload = createPayload("CREATE", null);
         payload.put("ownerId", "alice");
         payload.put("projectId", "p1");
@@ -414,6 +416,7 @@ public class DataSandboxApprovalIT {
         // 已回收沙箱无可续 → 视为完成
         Map<String, Object> recyclePayload = createPayload("RECYCLE", sandboxId);
         recyclePayload.put("days", 7);
+        UserContext.setBaseUser(alice());
         String recycled = String.valueOf(approvalService.submit(recyclePayload).get("id"));
         approveStage1(recycled);
         approveStage2(recycled);
@@ -539,6 +542,9 @@ public class DataSandboxApprovalIT {
 
         UserContext.setBaseUser(carol());
         approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意删除"));
+        assertEquals("OPERATOR_REVIEW", approvalStatus(approvalId));
+        UserContext.setBaseUser(admin());
+        approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "运营方确认"));
         assertEquals("APPROVED", approvalStatus(approvalId));
         jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING' where id=?", approvalId);
         UserContext.setBaseUser(alice());
@@ -565,6 +571,9 @@ public class DataSandboxApprovalIT {
                 () -> approvalService.approvalAction(Map.of("id", approvalId, "action", "CANCEL")));
 
         approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意"));
+        assertEquals("OPERATOR_REVIEW", approvalStatus(approvalId));
+        UserContext.setBaseUser(admin());
+        approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "运营方确认"));
         assertEquals("APPROVED", approvalStatus(approvalId));
     }
 
