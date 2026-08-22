@@ -252,6 +252,9 @@ public class SandboxApprovalService {
         if (!legacyRecycle) {
             requireProjectMembership(projectId, applicantNodeId);
         }
+        if (Set.of("CREATE", "DATA_CHANGE").contains(type)) {
+            requireActiveProject(projectId, "CREATE".equals(type) ? "创建沙箱" : "挂载数据");
+        }
         if ("CREATE".equals(type)) {
             validateCreatePayload(request);
             validateDatasetAssets(projectId, request.get("datasetAssetIds"));
@@ -424,6 +427,10 @@ public class SandboxApprovalService {
         Map<String, Object> approval = requireApproval(id);
         String type = string(approval.get("approval_type"));
         try {
+            if (Set.of("CREATE", "DATA_CHANGE").contains(type)) {
+                requireActiveProject(string(approval.get("project_id")),
+                        "CREATE".equals(type) ? "创建沙箱" : "挂载数据");
+            }
             if (!service.isKusciaEnabled() && ("CREATE".equals(type) || "SPEC_CHANGE".equals(type))) {
                 throw new IllegalStateException("Kuscia 运行时未启用，无法执行沙箱拉起类申请");
             }
@@ -913,6 +920,17 @@ public class SandboxApprovalService {
         }
         if (count("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0", projectId, memberNodeId) == 0) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前节点不是该项目参与方");
+        }
+    }
+
+    private void requireActiveProject(String projectId, String operation) {
+        List<Integer> statuses = jdbc.queryForList(
+                "select status from project where project_id=? and is_deleted=0", Integer.class, projectId);
+        if (statuses.isEmpty()) {
+            throw new IllegalArgumentException("项目不存在: " + projectId);
+        }
+        if (!Integer.valueOf(1).equals(statuses.get(0))) {
+            throw new IllegalStateException("项目已归档，不能" + operation);
         }
     }
 

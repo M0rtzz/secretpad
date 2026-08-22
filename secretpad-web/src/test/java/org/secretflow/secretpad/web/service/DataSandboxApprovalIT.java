@@ -154,7 +154,7 @@ public class DataSandboxApprovalIT {
         jdbc.update("delete from ds_alert_event");
         jdbc.update("delete from project_node where project_id='p1'");
         jdbc.update("delete from project where project_id='p1'");
-        jdbc.update("insert into project(project_id,name,owner_id,is_deleted) values('p1','Approval IT','alice',0)");
+        jdbc.update("insert into project(project_id,name,owner_id,status,is_deleted) values('p1','Approval IT','alice',1,0)");
         jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','alice',0)");
         jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','carol',0)");
         jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at=''");
@@ -241,6 +241,39 @@ public class DataSandboxApprovalIT {
     }
 
     /* ------------------------------- 用例 ------------------------------- */
+
+    /** 已归档项目不可创建沙箱或挂载数据，审批执行前再次校验项目状态。 */
+    @Test
+    public void archivedProjectRejectsSandboxCreationAndDataMounts() {
+        String sandboxId = createSandbox();
+        jdbc.update("update project set status=2 where project_id='p1'");
+
+        assertThrows(IllegalStateException.class, this::submitCreate);
+        assertThrows(IllegalStateException.class, () -> service.createSandbox(Map.of(
+                "name", "archived-project-sbx", "ownerId", "alice", "projectId", "p1",
+                "imageId", IMAGE_ID)));
+        assertThrows(IllegalStateException.class, () -> dataAssetService.attachProjectAssets(
+                Map.of("projectId", "p1", "assetIds", List.of())));
+
+        Map<String, Object> dataChange = createPayload("DATA_CHANGE", sandboxId);
+        dataChange.put("datasetAssetIds", List.of());
+        assertThrows(IllegalStateException.class, () -> approvalService.submit(dataChange));
+    }
+
+    /** 项目在申请批准后归档时，执行器不得继续创建沙箱。 */
+    @Test
+    public void archivedProjectBlocksApprovedCreateExecution() {
+        String id = submitAndApprove();
+        jdbc.update("update project set status=2 where project_id='p1'");
+
+        approvalService.executeApprovals();
+
+        assertEquals("APPROVED", approvalStatus(id), "归档后的创建申请应保留为可诊断的失败重试状态");
+        assertEquals(0L, count("select count(1) from ds_sandbox where deleted=0"));
+        assertTrue(String.valueOf(jdbc.queryForMap(
+                "select last_error from ds_sandbox_approval where id=?", id).get("last_error"))
+                .contains("项目已归档"));
+    }
 
     /** 1. CREATE 全链路：提交→两级审批→执行引擎自动建沙箱并拉起→同步 RUNNING/BOUND。 */
     @Test

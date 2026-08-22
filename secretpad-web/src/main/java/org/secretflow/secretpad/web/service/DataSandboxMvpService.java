@@ -121,7 +121,7 @@ public class DataSandboxMvpService {
     /* ------------------------------- Sandbox ------------------------------- */
 
     public List<Map<String, Object>> listSandboxes(String ownerId, String keyword, String status) {
-        StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref,n.name owner_node_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id left join node n on (n.node_id=s.owner_id or n.inst_id=s.owner_id) and n.is_deleted=0 where s.deleted=0");
+        StringBuilder sql = new StringBuilder("select s.*, i.name image_name, i.image_ref,n.name owner_node_name,p.name project_name from ds_sandbox s left join ds_sandbox_image i on i.id=s.image_id left join node n on (n.node_id=s.owner_id or n.inst_id=s.owner_id) and n.is_deleted=0 left join project p on p.project_id=s.project_id and p.is_deleted=0 where s.deleted=0");
         List<Object> args = new ArrayList<>();
         if (notBlank(ownerId)) {
             // 页面路由历史上使用机构实例 ID（node.inst_id），而审批创建的沙箱使用节点 ID。
@@ -152,6 +152,8 @@ public class DataSandboxMvpService {
         String id = "sbx-" + shortId();
         String name = required(request, "name");
         String ownerId = value(request, "ownerId", currentOwner());
+        String projectId = required(request, "projectId");
+        requireActiveProject(projectId, "创建沙箱");
         String imageId = required(request, "imageId");
         String networkPolicy = value(request, "networkPolicy", "INTERNAL_ONLY").toUpperCase(Locale.ROOT);
         if (!NETWORK_POLICIES.contains(networkPolicy)) {
@@ -167,7 +169,7 @@ public class DataSandboxMvpService {
         assertCapacity(ownerId, cpu, memory, gpu, storage);
         String now = now();
         jdbc.update("insert into ds_sandbox(id,name,description,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
-                id, name, value(request, "description", ""), ownerId, value(request, "projectId", ""), imageId,
+                id, name, value(request, "description", ""), ownerId, projectId, imageId,
                 LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
                 value(request, "createdBy", actor()), now, now);
         audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);
@@ -1733,6 +1735,17 @@ public class DataSandboxMvpService {
 
     private static String now() {
         return LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString();
+    }
+
+    private void requireActiveProject(String projectId, String operation) {
+        List<Integer> statuses = jdbc.queryForList(
+                "select status from project where project_id=? and is_deleted=0", Integer.class, projectId);
+        if (statuses.isEmpty()) {
+            throw new IllegalArgumentException("项目不存在: " + projectId);
+        }
+        if (!Integer.valueOf(1).equals(statuses.get(0))) {
+            throw new IllegalStateException("项目已归档，不能" + operation);
+        }
     }
 
     private static String shortId() {

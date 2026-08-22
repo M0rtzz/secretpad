@@ -326,6 +326,7 @@ public class DataAssetService {
     public List<Map<String, Object>> attachProjectAssets(Map<String, Object> request) {
         String projectId = required(request, "projectId");
         requireProjectParticipant(projectId);
+        requireActiveProject(projectId);
         Object selected = request.get("assetIds");
         if (!(selected instanceof Iterable<?> iterable)) throw new IllegalArgumentException("assetIds 必须是数组");
         List<String> attached = new ArrayList<>();
@@ -361,6 +362,7 @@ public class DataAssetService {
     @Transactional
     public void attachGovernedResult(String projectId, String assetId) {
         requireProjectParticipant(projectId);
+        requireActiveProject(projectId);
         Map<String, Object> asset = require(assetId);
         requireProvider(asset);
         if (!"PROCESSED".equals(String.valueOf(asset.get("data_stage")))) {
@@ -591,6 +593,11 @@ public class DataAssetService {
         boolean initiator=c("select count(1) from project where project_id=? and owner_id in (?,?) and is_deleted=0",projectId,owner(),legacyOwner())>0;
         boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action in ('REVIEWING','APPROVED')",projectId,owner(),legacyOwner())>0;
         if(!member&&!initiator&&!invitee)throw new SecurityException("当前节点不是项目参与方");
+    }
+    private void requireActiveProject(String projectId){
+        List<Integer> statuses=jdbc.queryForList("select status from project where project_id=? and is_deleted=0",Integer.class,projectId);
+        if(statuses.isEmpty())throw new IllegalArgumentException("项目不存在: "+projectId);
+        if(!Integer.valueOf(1).equals(statuses.get(0)))throw new IllegalStateException("项目已归档，不能挂载数据");
     }
     private long c(String sql,Object...args){Long n=jdbc.queryForObject(sql,Long.class,args);return n==null?0:n;}
     private String owner(){UserContextDTO u=UserContext.getUserOrNotExist();if(u==null)return "kuscia-system";return u.getPlatformNodeId()!=null&&!u.getPlatformNodeId().isBlank()?u.getPlatformNodeId():(u.getOwnerId()==null?"kuscia-system":u.getOwnerId());}
