@@ -79,6 +79,26 @@ public class ProjectCreateMessageHandler extends AbstractAutonomyVoteTypeHandler
     }
 
     @Override
+    protected List<String> getVoters(String initiatorId, AbstractVoteConfig voteConfig) {
+        ProjectCreateApprovalConfig projectCreateApprovalConfig = (ProjectCreateApprovalConfig) voteConfig;
+
+        List<String> inviteeNodeIds = projectCreateApprovalConfig.getParticipantNodeInstVOS().stream()
+                .flatMap(item -> item.getInvitees().stream())
+                .map(ParticipantNodeInstVO.NodeInstVO::getInviteeId)
+                .filter(Objects::nonNull)
+                .filter(nodeId -> !nodeId.isBlank())
+                .distinct()
+                .toList();
+        if (inviteeNodeIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<String> voters = new ArrayList<>(nodeRepository.findInstIdsByNodeIds(inviteeNodeIds));
+        voters.remove(initiatorId);
+        return voters;
+    }
+
+    @Override
     protected void preCheck(String initiatorId, AbstractVoteConfig voteConfig) {
         try {
             ProjectCreateApprovalConfig projectCreateApprovalConfig = (ProjectCreateApprovalConfig) voteConfig;

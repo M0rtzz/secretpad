@@ -122,6 +122,27 @@ public class DataAssetService {
 
     public InputStream openStored(String uri){return storage.open(uri);}
 
+    /** Stream an image asset after applying the same catalog visibility check as metadata preview. */
+    public ImageContent previewImage(String id) {
+        Map<String, Object> asset = catalogAsset(id);
+        if (!"IMAGE".equals(String.valueOf(asset.get("modality")))) {
+            throw new IllegalArgumentException("仅图片数据支持图片预览");
+        }
+        try (InputStream input = storage.open(String.valueOf(asset.get("storage_uri")))) {
+            byte[] content = input.readAllBytes();
+            if (content.length > 20L * 1024 * 1024) {
+                throw new IllegalArgumentException("图片预览超过 20MB 限制");
+            }
+            Map<String, Object> metadata = parseMap(asset.get("metadata_json"));
+            String contentType = String.valueOf(metadata.getOrDefault("contentType", "image/png"));
+            return new ImageContent(contentType, content);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取图片预览失败", e);
+        }
+    }
+
+    public record ImageContent(String contentType, byte[] content) {}
+
     public MinioAssetStorage storage(){ return storage; }
 
     @Transactional
@@ -367,7 +388,7 @@ public class DataAssetService {
     }
 
     public Map<String, Object> preview(String id, int requestedLimit) {
-        Map<String, Object> asset = requireVisible(id);
+        Map<String, Object> asset = catalogAsset(id);
         int limit = Math.max(1, Math.min(requestedLimit, 100));
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("asset", asset);
@@ -430,6 +451,31 @@ public class DataAssetService {
             throw new IllegalStateException("读取数据预览失败", e);
         }
         return result;
+    }
+
+    /** Resolve both local catalog assets and metadata snapshots for project-shared assets. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> catalogAsset(String id) {
+        List<Map<String, Object>> local = jdbc.queryForList(
+                "select * from ds_data_asset where id=? and deleted=0", id);
+        if (!local.isEmpty()) return requireVisible(id);
+        List<Map<String, Object>> shared = jdbc.queryForList(
+                "select pa.asset_json,pa.provider_node_id from ds_project_asset pa "
+                        + "join project_node pn on pn.project_id=pa.project_id and pn.node_id in (?,?) and pn.is_deleted=0 "
+                        + "where pa.asset_id=? and pa.deleted=0 and coalesce(pa.is_deleted,0)=0",
+                owner(), legacyOwner(), id);
+        for (Map<String, Object> row : shared) {
+            try {
+                Map<String, Object> asset = new LinkedHashMap<>(mapper.readValue(String.valueOf(row.get("asset_json")), Map.class));
+                asset.put("id", id);
+                asset.put("provider_node_id", row.get("provider_node_id"));
+                asset.put("owned", false);
+                return asset;
+            } catch (Exception ignored) {
+                // Try another project snapshot if a legacy attachment is malformed.
+            }
+        }
+        throw new NoSuchElementException("数据不存在");
     }
 
     @Transactional
@@ -543,7 +589,7 @@ public class DataAssetService {
     private void requireProjectParticipant(String projectId){
         boolean member=c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())>0;
         boolean initiator=c("select count(1) from project where project_id=? and owner_id in (?,?) and is_deleted=0",projectId,owner(),legacyOwner())>0;
-        boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action='REVIEWING'",projectId,owner(),legacyOwner())>0;
+        boolean invitee=c("select count(1) from project_approval_config pac join vote_invite vi on vi.vote_id=pac.vote_id and vi.is_deleted=0 where pac.project_id=? and pac.type='PROJECT_CREATE' and pac.is_deleted=0 and vi.vote_participant_id in (?,?) and vi.action in ('REVIEWING','APPROVED')",projectId,owner(),legacyOwner())>0;
         if(!member&&!initiator&&!invitee)throw new SecurityException("当前节点不是项目参与方");
     }
     private long c(String sql,Object...args){Long n=jdbc.queryForObject(sql,Long.class,args);return n==null?0:n;}

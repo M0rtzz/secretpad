@@ -19,7 +19,6 @@ package org.secretflow.secretpad.service.test;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.enums.PlatformTypeEnum;
 import org.secretflow.secretpad.common.util.UserContext;
-import org.secretflow.secretpad.persistence.entity.NodeDO;
 import org.secretflow.secretpad.persistence.entity.VoteInviteDO;
 import org.secretflow.secretpad.persistence.entity.VoteRequestDO;
 import org.secretflow.secretpad.persistence.repository.NodeRepository;
@@ -31,6 +30,7 @@ import org.secretflow.secretpad.service.enums.VoteTypeEnum;
 import org.secretflow.secretpad.service.schedule.VoteInviteStatusMonitor;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -40,6 +40,12 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.verify;
 
 /**
  * @author yutu
@@ -69,31 +75,78 @@ public class VoteInviteStatusMonitorTest {
         UserContext.setBaseUser(userContextDTO);
     }
 
+    @AfterEach
+    void tearDown() {
+        UserContext.remove();
+    }
+
     @Test
-    void test() {
+    void syncShouldConvergeApprovedInviteToVoteRequest() {
+        VoteRequestDO voteRequestDO = voteRequest(VoteStatusEnum.REVIEWING.name());
+        VoteInviteDO voteInviteDO = voteInvite(VoteStatusEnum.APPROVED.name(), "approved");
+        arrange(voteRequestDO, voteInviteDO);
+
+        voteInviteStatusMonitor.sync();
+
+        assertEquals(VoteStatusEnum.APPROVED.getCode(), voteRequestDO.getStatus());
+        assertPartyStatus(voteRequestDO, "bob", VoteStatusEnum.APPROVED.name(), "approved");
+        assertPartyStatus(voteRequestDO, "alice", VoteStatusEnum.APPROVED.name(), null);
+        assertEquals(2, voteRequestDO.getPartyVoteInfos().size());
+        verify(voteRequestRepository).save(voteRequestDO);
+    }
+
+    @Test
+    void syncShouldConvergeRejectedInviteToVoteRequest() {
+        VoteRequestDO voteRequestDO = voteRequest(VoteStatusEnum.REVIEWING.name());
+        VoteInviteDO voteInviteDO = voteInvite(VoteStatusEnum.REJECTED.name(), "rejected");
+        arrange(voteRequestDO, voteInviteDO);
+
+        voteInviteStatusMonitor.sync();
+
+        assertEquals(VoteStatusEnum.REJECTED.getCode(), voteRequestDO.getStatus());
+        assertPartyStatus(voteRequestDO, "bob", VoteStatusEnum.REJECTED.name(), "rejected");
+        assertEquals(2, voteRequestDO.getPartyVoteInfos().size());
+        verify(voteRequestRepository).save(voteRequestDO);
+    }
+
+    private void arrange(VoteRequestDO voteRequestDO, VoteInviteDO voteInviteDO) {
         voteInviteStatusMonitor.setVoteRequestRepository(voteRequestRepository);
         voteInviteStatusMonitor.setVoteInviteRepository(voteInviteRepository);
         voteInviteStatusMonitor.setEnvService(envService);
         voteInviteStatusMonitor.setNodeRepository(nodeRepository);
+        Mockito.when(voteRequestRepository.findByStatus(anyInt())).thenReturn(List.of(voteRequestDO));
+        Mockito.when(voteInviteRepository.findByVoteID(anyString())).thenReturn(List.of(voteInviteDO));
+        Mockito.when(nodeRepository.findByInstId("alice")).thenReturn(List.of());
+    }
+
+    private VoteRequestDO voteRequest(String inviteeAction) {
         VoteRequestDO voteRequestDO = new VoteRequestDO();
         voteRequestDO.setType(VoteTypeEnum.PROJECT_CREATE.name());
-        voteRequestDO.setExecutors(List.of("alice"));
+        voteRequestDO.setExecutors(List.of());
         voteRequestDO.setVoteID("vote");
         voteRequestDO.setInitiator("alice");
-        VoteRequestDO.PartyVoteInfo partyVoteInfo = VoteRequestDO.PartyVoteInfo.builder().action(null).partyId("alice").reason(null).build();
-        HashSet<VoteRequestDO.PartyVoteInfo> partyVoteInfos = new HashSet<>();
-        partyVoteInfos.add(partyVoteInfo);
+        voteRequestDO.setStatus(VoteStatusEnum.REVIEWING.getCode());
+        HashSet<VoteRequestDO.PartyVoteInfo> partyVoteInfos = new HashSet<>(Set.of(
+                VoteRequestDO.PartyVoteInfo.builder().action(VoteStatusEnum.APPROVED.name()).partyId("alice").build(),
+                VoteRequestDO.PartyVoteInfo.builder().action(inviteeAction).partyId("bob").build()));
         voteRequestDO.setPartyVoteInfos(partyVoteInfos);
-        List<VoteRequestDO> voteRequestDOS = List.of(voteRequestDO);
-        Mockito.when(voteRequestRepository.findByStatus(Mockito.anyInt())).thenReturn(voteRequestDOS);
-        NodeDO alice1 = NodeDO.builder().instId("alice").nodeId("alice1").build();
-        NodeDO alice2 = NodeDO.builder().instId("alice").nodeId("alice2").build();
-        Mockito.when(nodeRepository.findByInstId("alice")).thenReturn(List.of(alice1,alice2));
+        return voteRequestDO;
+    }
+
+    private VoteInviteDO voteInvite(String action, String reason) {
         VoteInviteDO voteInviteDO = new VoteInviteDO();
-        voteInviteDO.setUpk(new VoteInviteDO.UPK("1", "alice"));
-        voteInviteDO.setAction(VoteStatusEnum.APPROVED.name());
-        List<VoteInviteDO> voteInviteDOS = List.of(voteInviteDO);
-        Mockito.when(voteInviteRepository.findByVoteID(Mockito.any())).thenReturn(voteInviteDOS);
-        voteInviteStatusMonitor.sync();
+        voteInviteDO.setUpk(new VoteInviteDO.UPK("vote", "bob"));
+        voteInviteDO.setAction(action);
+        voteInviteDO.setReason(reason);
+        return voteInviteDO;
+    }
+
+    private void assertPartyStatus(VoteRequestDO voteRequestDO, String partyId, String action, String reason) {
+        VoteRequestDO.PartyVoteInfo partyVoteInfo = voteRequestDO.getPartyVoteInfos().stream()
+                .filter(item -> partyId.equals(item.getPartyId()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(action, partyVoteInfo.getAction());
+        assertEquals(reason, partyVoteInfo.getReason());
     }
 }

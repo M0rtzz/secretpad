@@ -82,6 +82,10 @@ public class SandboxApprovalService {
     @Value("${secretpad.node-id:kuscia-system}")
     private String nodeId;
 
+    /** Local node whose approved applications this process is allowed to execute. */
+    @Value("${secretpad.data-sandbox.approval.executor-node-id:${secretpad.node-id:kuscia-system}}")
+    private String executorNodeId;
+
     @Value("${secretpad.data-sandbox.approval.max-retries:3}")
     private int maxRetries;
 
@@ -114,8 +118,13 @@ public class SandboxApprovalService {
         applySyncedApprovals();
         String current = operator();
         String currentNode = gate.effectiveOwner();
-        StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?)");
+        boolean admin = gate.isAdmin(gate.currentUser());
+        StringBuilder sql = new StringBuilder("select distinct a.* from ds_sandbox_approval a left join ds_sandbox_approval_vote v on v.approval_id=a.id where a.deleted=0 and (a.submitter=? or a.applicant_node_id=? or v.voter_node_id=?");
         List<Object> args = new ArrayList<>(List.of(current, currentNode, currentNode));
+        if (admin) {
+            sql.append(" or 1=1");
+        }
+        sql.append(")");
         if (notBlank(status)) {
             sql.append(" and a.status=?");
             args.add(status.toUpperCase(Locale.ROOT));
@@ -142,7 +151,57 @@ public class SandboxApprovalService {
         assertApprovalVisible(data);
         data.put("history", approvalHistory(id));
         data.put("votes", jdbc.queryForList("select * from ds_sandbox_approval_vote where approval_id=? order by voter_node_id", id));
+        if ("ASSET_DELETE".equals(String.valueOf(data.get("approval_type")))) {
+            data.put("asset_detail", assetDeletionDetail(data));
+        }
         return data;
+    }
+
+    /** Enrich data deletion approvals with the catalog metadata users need to review. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> assetDeletionDetail(Map<String, Object> approval) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        try {
+            Object raw = approval.get("payload_json");
+            if (raw != null && !String.valueOf(raw).isBlank()) {
+                payload.putAll(objectMapper.readValue(String.valueOf(raw), Map.class));
+            }
+        } catch (Exception ignored) {
+            // Keep the approval visible even when a legacy payload is malformed.
+        }
+        String assetId = string(payload.get("assetId"));
+        detail.put("asset_id", assetId);
+        detail.put("name", string(payload.get("assetName")));
+        detail.put("provider_node_id", "");
+        detail.put("provider_node_name", "");
+        detail.put("uploaded_at", "");
+        detail.put("data_stage", "");
+        detail.put("project_shared", false);
+        detail.put("projects", List.of());
+        if (assetId.isBlank()) return detail;
+
+        List<Map<String, Object>> assets = jdbc.queryForList(
+                "select a.name,a.provider_node_id,a.created_at,a.data_stage,n.name provider_node_name "
+                        + "from ds_data_asset a left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) "
+                        + "and n.is_deleted=0 where a.id=? and a.deleted=0", assetId);
+        if (!assets.isEmpty()) {
+            Map<String, Object> asset = assets.get(0);
+            detail.put("name", string(asset.get("name")));
+            detail.put("provider_node_id", string(asset.get("provider_node_id")));
+            detail.put("provider_node_name", string(asset.get("provider_node_name")));
+            detail.put("uploaded_at", string(asset.get("created_at")));
+            detail.put("data_stage", string(asset.get("data_stage")));
+        }
+        List<Map<String, Object>> projects = jdbc.queryForList(
+                "select distinct p.project_id,p.name from project p join ("
+                        + "select project_id from ds_project_asset where asset_id=? and deleted=0 "
+                        + "union select project_id from project_datatable where datatable_id=(select datatable_id from ds_data_asset where id=?) and is_deleted=0"
+                        + ") mounted on mounted.project_id=p.project_id where p.is_deleted=0 order by p.name,p.project_id",
+                assetId, assetId);
+        detail.put("projects", projects);
+        detail.put("project_shared", !projects.isEmpty());
+        return detail;
     }
 
     public List<Map<String, Object>> approvalHistory(String id) {
@@ -176,6 +235,11 @@ public class SandboxApprovalService {
         String sandboxId = "CREATE".equals(type) ? "" : required(request, "sandboxId");
         String applicantNodeId = gate.effectiveOwner();
         String ownerId = "CREATE".equals(type) ? applicantNodeId : sandboxOwner(sandboxId);
+        // Check CREATE idempotency before project/payload validation so a retried
+        // request reports the existing open approval instead of a missing field.
+        if ("CREATE".equals(type)) {
+            assertNoOpenApproval(type, ownerId, sandboxId);
+        }
         if (!"CREATE".equals(type) && !gate.matchesCurrentNode(ownerId)) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "只能为当前所属节点提交沙箱申请");
         }
@@ -274,8 +338,18 @@ public class SandboxApprovalService {
         assertApprovalVisible(approval);
         switch (action) {
             case "APPROVE", "REJECT" -> {
-                if (!"DATA_PROVIDER_REVIEW".equals(from)) throw new IllegalStateException("当前申请不在项目成员审核中");
-                vote(id, action, comment);
+                if ("DATA_PROVIDER_REVIEW".equals(from)) {
+                    vote(id, action, comment);
+                } else if ("OPERATOR_REVIEW".equals(from)) {
+                    if (!gate.isAdminOrOperator(gate.currentUser(), string(approval.get("applicant_node_id")))) {
+                        throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅运营方可处理运营审核");
+                    }
+                    if (conditionalUpdate(id, from, action, "", comment) != 1) {
+                        throw new IllegalStateException("申请状态已被其他审核人更新，请刷新后重试");
+                    }
+                } else {
+                    throw new IllegalStateException("当前申请不在审核中");
+                }
             }
             case "RESUBMIT" -> {
                 if (!isApplicant(approval)) {
@@ -295,7 +369,10 @@ public class SandboxApprovalService {
                 jdbc.update("update ds_sandbox_approval set status='CANCELLED',current_stage='CANCELLED',updated_at=? where id=? and status=?", now(), id, from);
             }
             case "RETRY" -> {
-                if (!isApplicant(approval)) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人可重试");
+                boolean operator = gate.isAdminOrOperator(gate.currentUser(), string(approval.get("applicant_node_id")));
+                if (!isApplicant(approval) && !operator) {
+                    throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅申请人或运营方可重试");
+                }
                 if (!"FAILED".equals(from)) throw new IllegalStateException("只有执行失败申请可重试");
                 jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,retry_count=0,last_error='',updated_at=? where id=? and status='FAILED'", operator(), now(), id);
             }
@@ -325,8 +402,9 @@ public class SandboxApprovalService {
     public void executeApprovals() {
         applySyncedApprovals();
         for (Map<String, Object> row : jdbc.queryForList(
-                "select id from ds_sandbox_approval where status='APPROVED' and applicant_node_id=? and deleted=0 order by approved_at asc limit 20",
-                nodeId)) {
+                "select id from ds_sandbox_approval where status='APPROVED' and deleted=0 "
+                        + "and (applicant_node_id=? or (coalesce(applicant_node_id,'')='' and owner_id=?)) "
+                        + "order by approved_at asc limit 20", executorNodeId, executorNodeId)) {
             String id = string(row.get("id"));
             int claimed = jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING',executor=?,updated_at=? "
                             + "where id=? and status='APPROVED' and deleted=0",
@@ -339,6 +417,7 @@ public class SandboxApprovalService {
         }
         reclaimStuckExecuting();
     }
+
 
     /** 执行单条申请单：按类型分发，成功 complete，异常 failAndRetry（自动重试/置 FAILED）。 */
     public void executeOne(String id) {
@@ -895,7 +974,11 @@ public class SandboxApprovalService {
     private void assertApprovalVisible(Map<String, Object> approval) {
         String currentNode = gate.effectiveOwner();
         boolean voter = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and voter_node_id=?", approval.get("id"), currentNode) > 0;
-        if (!isApplicant(approval) && !voter) throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+        String applicantNodeId = string(approval.get("applicant_node_id"));
+        boolean operator = gate.isAdminOrOperator(gate.currentUser(), applicantNodeId);
+        if (!isApplicant(approval) && !voter && !operator) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "无权查看该项目申请");
+        }
     }
 
     private boolean isApplicant(Map<String, Object> approval) {

@@ -2,7 +2,11 @@ package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.DataAssetService;
+import org.secretflow.secretpad.web.service.DatabaseAssetImportService;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.multipart.MultipartFile;
 import java.io.*;
 import java.nio.file.*;
@@ -16,7 +20,8 @@ import java.util.*;
 @RequestMapping("/api/v1alpha1/data-assets")
 public class DataAssetController {
     private final DataAssetService service;
-    public DataAssetController(DataAssetService service){this.service=service;}
+    private final DatabaseAssetImportService databaseImport;
+    public DataAssetController(DataAssetService service, DatabaseAssetImportService databaseImport){this.service=service;this.databaseImport=databaseImport;}
     @PostMapping(value="/files/upload", consumes="multipart/form-data")
     public SecretPadResponse<Map<String,Object>> upload(@RequestPart("file") MultipartFile file) throws Exception {
         String type=file.getContentType()==null?"":file.getContentType().toLowerCase(Locale.ROOT);
@@ -66,6 +71,14 @@ public class DataAssetController {
     @PostMapping("/projects/attach") public SecretPadResponse<List<Map<String,Object>>> attachProjectAssets(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.attachProjectAssets(r));}
     @GetMapping("/sandboxes/mounts") public SecretPadResponse<List<Map<String,Object>>> sandboxMounts(@RequestParam String sandboxId){return SecretPadResponse.success(service.sandboxMounts(sandboxId));}
     @GetMapping("/preview") public SecretPadResponse<Map<String,Object>> preview(@RequestParam String id,@RequestParam(defaultValue="5") int limit){return SecretPadResponse.success(service.preview(id,limit));}
+    @GetMapping("/content") public ResponseEntity<byte[]> imageContent(@RequestParam String id){
+        DataAssetService.ImageContent image=service.previewImage(id);
+        MediaType type=MediaType.parseMediaType(image.contentType());
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL,"private, max-age=300").contentType(type).body(image.content());
+    }
+    @PostMapping("/database/preview") public SecretPadResponse<Map<String,Object>> databasePreview(@RequestBody Map<String,Object> request){return SecretPadResponse.success(databaseImport.preview(request));}
+    @PostMapping("/database/test") public SecretPadResponse<Map<String,Object>> databaseTest(@RequestBody Map<String,Object> request){return SecretPadResponse.success(databaseImport.testConnection(request));}
+    @PostMapping("/database/import") public SecretPadResponse<Map<String,Object>> databaseImport(@RequestBody Map<String,Object> request){return SecretPadResponse.success(databaseImport.importAsset(request));}
     @PostMapping("/delete") public SecretPadResponse<Map<String,Object>> delete(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.delete(String.valueOf(r.get("id"))));}
     @GetMapping("/usage-controls/requests") public SecretPadResponse<List<Map<String,Object>>> requests(){return SecretPadResponse.success(service.usageRequests());}
     @PostMapping("/usage-controls/save") public SecretPadResponse<Map<String,Object>> save(@RequestBody Map<String,Object> r){return SecretPadResponse.success(service.saveUsage(r));}
