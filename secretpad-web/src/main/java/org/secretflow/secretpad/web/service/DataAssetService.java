@@ -83,6 +83,27 @@ public class DataAssetService {
 
     public InputStream openStored(String uri){return storage.open(uri);}
 
+    /** Stream an image asset after applying the same catalog visibility check as metadata preview. */
+    public ImageContent previewImage(String id) {
+        Map<String, Object> asset = catalogAsset(id);
+        if (!"IMAGE".equals(String.valueOf(asset.get("modality")))) {
+            throw new IllegalArgumentException("仅图片数据支持图片预览");
+        }
+        try (InputStream input = storage.open(String.valueOf(asset.get("storage_uri")))) {
+            byte[] content = input.readAllBytes();
+            if (content.length > 20L * 1024 * 1024) {
+                throw new IllegalArgumentException("图片预览超过 20MB 限制");
+            }
+            Map<String, Object> metadata = parseMap(asset.get("metadata_json"));
+            String contentType = String.valueOf(metadata.getOrDefault("contentType", "image/png"));
+            return new ImageContent(contentType, content);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取图片预览失败", e);
+        }
+    }
+
+    public record ImageContent(String contentType, byte[] content) {}
+
     public MinioAssetStorage storage(){ return storage; }
 
     @Transactional

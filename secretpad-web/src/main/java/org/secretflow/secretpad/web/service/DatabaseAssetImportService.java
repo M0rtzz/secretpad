@@ -31,7 +31,7 @@ import java.util.regex.Pattern;
 /** Read-only database preview and CSV materialization for catalog assets. */
 @Service
 public class DatabaseAssetImportService {
-    private static final Set<String> TYPES = Set.of("MYSQL", "POSTGRESQL", "OCEANBASE", "OPENGAUSS");
+    private static final Set<String> TYPES = Set.of("MYSQL", "POSTGRESQL", "GREATSQL", "OPENGAUSS");
     private static final Pattern TABLE = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*(\\.[A-Za-z_][A-Za-z0-9_$]*)?");
     private static final Pattern WRITE_SQL = Pattern.compile(
             "(?is)\\b(insert|update|delete|merge|replace|create|alter|drop|truncate|grant|revoke|call|copy|vacuum|analyze)\\b");
@@ -64,6 +64,26 @@ public class DatabaseAssetImportService {
             }
         } catch (SQLException e) {
             throw new IllegalArgumentException("数据库只读查询失败: " + e.getMessage(), e);
+        }
+    }
+
+    public Map<String, Object> testConnection(Map<String, Object> request) {
+        QuerySpec spec = querySpec(request, "");
+        try (Connection connection = connect(spec)) {
+            var metadata = connection.getMetaData();
+            List<String> tables = new ArrayList<>();
+            try (ResultSet result = metadata.getTables(null, null, "%", new String[]{"TABLE", "VIEW"})) {
+                while (result.next()) {
+                    String schema = result.getString("TABLE_SCHEM");
+                    String name = result.getString("TABLE_NAME");
+                    if (name == null || name.isBlank()) continue;
+                    if (!isVisibleSchema(spec, schema)) continue;
+                    tables.add(schema == null || schema.isBlank() ? name : schema + "." + name);
+                }
+            }
+            return Map.of("connected", true, "tables", tables);
+        } catch (SQLException e) {
+            throw new IllegalArgumentException("数据库连接失败: " + e.getMessage(), e);
         }
     }
 
@@ -113,43 +133,31 @@ public class DatabaseAssetImportService {
     }
 
     private QuerySpec querySpec(Map<String, Object> request) {
+        return querySpec(request, value(request, "tableName").trim());
+    }
+
+    private QuerySpec querySpec(Map<String, Object> request, String requestedTable) {
         String type = required(request, "databaseType").toUpperCase(Locale.ROOT);
         if (!TYPES.contains(type)) throw new IllegalArgumentException("不支持的数据库类型: " + type);
-        String host = required(request, "host");
-        String database = required(request, "database");
-        String protocol = value(request, "protocol").toUpperCase(Locale.ROOT);
-        if ("OCEANBASE".equals(type) && !protocol.isBlank()
-                && !Set.of("MYSQL", "ORACLE").contains(protocol)) {
-            throw new IllegalArgumentException("OceanBase 协议必须是 MYSQL 或 ORACLE");
+        String url = required(request, "jdbcUrl");
+        String expectedPrefix = switch (type) {
+            case "MYSQL" -> "jdbc:mysql:";
+            case "POSTGRESQL" -> "jdbc:postgresql:";
+            case "GREATSQL" -> "jdbc:mysql:";
+            case "OPENGAUSS" -> "jdbc:opengauss:";
+            default -> "";
+        };
+        if (!url.toLowerCase(Locale.ROOT).startsWith(expectedPrefix)) {
+            throw new IllegalArgumentException("JDBC 地址与数据库类型不匹配");
         }
-        boolean postgres = "POSTGRESQL".equals(type) || "OPENGAUSS".equals(type);
-        int port;
-        try {
-            port = Integer.parseInt(String.valueOf(request.getOrDefault("port", postgres ? 5432 : 3306)));
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("端口必须是数字");
-        }
-        if (port < 1 || port > 65535) throw new IllegalArgumentException("端口范围无效");
-        String table = value(request, "tableName").trim();
+        String table = requestedTable;
         String sql = value(request, "sql").trim();
+        if (!sql.isBlank()) throw new IllegalArgumentException("SQL 过滤已停用，请选择数据表");
         if (sql.isBlank()) {
-            if (!TABLE.matcher(table).matches()) throw new IllegalArgumentException("表名格式无效");
-            sql = "select * from " + table;
-        } else {
-            sql = sql.replaceFirst(";\\s*$", "").trim();
-            validateReadOnlySql(sql);
-        }
-        String url;
-        if ("OCEANBASE".equals(type)) {
-            // OceanBase's official driver negotiates MySQL/Oracle tenant mode with the server.
-            url = "jdbc:oceanbase://" + host + ":" + port + "/" + database;
-        } else if ("OPENGAUSS".equals(type)) {
-            url = "jdbc:opengauss://" + host + ":" + port + "/" + database;
-        } else if (postgres) {
-            url = "jdbc:postgresql://" + host + ":" + port + "/" + database;
-        } else {
-            url = "jdbc:mysql://" + host + ":" + port + "/" + database
-                    + "?useSSL=false&serverTimezone=UTC&allowMultiQueries=false";
+            if (!table.isBlank()) {
+                if (!TABLE.matcher(table).matches()) throw new IllegalArgumentException("表名格式无效");
+                sql = "select * from " + table;
+            }
         }
         return new QuerySpec(url, value(request, "username"),
                 String.valueOf(request.getOrDefault("password", "")), sql, table);
@@ -168,6 +176,26 @@ public class DatabaseAssetImportService {
 
     private Connection connect(QuerySpec spec) throws SQLException {
         return DriverManager.getConnection(spec.url(), spec.username(), spec.password());
+    }
+
+    private boolean isSystemSchema(String url, String schema) {
+        if (schema == null || schema.isBlank()) return false;
+        String normalized = schema.toLowerCase(Locale.ROOT);
+        if (normalized.equals("information_schema") || normalized.equals("pg_catalog")
+                || normalized.equals("pg_toast") || normalized.startsWith("pg_temp_")) return true;
+        // openGauss exposes optional DB4AI and PL/Developer schemas through
+        // JDBC metadata; they are tools, not user data assets.
+        return url.toLowerCase(Locale.ROOT).startsWith("jdbc:opengauss:")
+                && (normalized.equals("db4ai") || normalized.equals("dbe_pldeveloper"));
+    }
+
+    private boolean isVisibleSchema(QuerySpec spec, String schema) {
+        if (spec.url().toLowerCase(Locale.ROOT).startsWith("jdbc:opengauss:")) {
+            // openGauss exposes many dbe_* monitoring schemas through JDBC.
+            // A catalog connection should list only the current user's schema.
+            return schema != null && schema.equalsIgnoreCase(spec.username());
+        }
+        return !isSystemSchema(spec.url(), schema);
     }
 
     private List<String> columns(ResultSetMetaData metadata) throws SQLException {
