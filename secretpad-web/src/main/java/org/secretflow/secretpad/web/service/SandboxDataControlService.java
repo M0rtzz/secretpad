@@ -35,14 +35,14 @@ public class SandboxDataControlService {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select m.sandbox_id,m.asset_id,m.id mount_id,s.name sandbox_name,s.project_id," 
                         + "a.name asset_name,a.provider_node_id,n.name provider_node_name," 
-                        + "coalesce(c.allow_use,1) allow_use,coalesce(c.version,0) version,c.updated_at "
+                        + "coalesce(c.allow_use,1) allow_use,c.use_until,coalesce(c.version,0) version,c.updated_at "
                         + "from ds_sandbox_dataset_mount m join ds_sandbox s on s.id=m.sandbox_id and s.deleted=0 "
                         + "join ds_data_asset a on a.id=m.asset_id and a.deleted=0 "
                         + "left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 "
                         + "left join ds_sandbox_mount_control c on c.sandbox_id=m.sandbox_id and c.asset_id=m.asset_id "
                         + "where m.deleted=0 and m.status='READY' and (s.owner_id=? or s.owner_id=?) and s.created_by=? "
                         + "order by s.created_at desc,a.name", node, ownerId(), actor());
-        rows.forEach(row -> row.put("controlled", intValue(row.get("version"), 0) > 0));
+        rows.forEach(this::addMountState);
         return rows;
     }
 
@@ -54,22 +54,27 @@ public class SandboxDataControlService {
         requireRow("select m.id from ds_sandbox_dataset_mount m where m.sandbox_id=? and m.asset_id=? "
                 + "and m.deleted=0 and m.status='READY'", sandboxId, assetId);
         boolean allowUse = bool(request.get("allowUse"), true);
+        String useUntil = normalizeTime(string(request.get("useUntil")), "使用截止时间");
+        if (useUntil.isBlank()) throw new IllegalArgumentException("必须设置使用截止时间");
         int expected = intValue(request.get("version"), 0);
         List<Map<String, Object>> existing = jdbc.queryForList(
                 "select * from ds_sandbox_mount_control where sandbox_id=? and asset_id=?", sandboxId, assetId);
         String now = now();
         if (existing.isEmpty()) {
             if (expected != 0) throw new IllegalStateException("使用控制已被其他用户更新，请刷新后重试");
-            jdbc.update("insert into ds_sandbox_mount_control(id,sandbox_id,asset_id,allow_use,version,updated_by,updated_at) "
-                            + "values(?,?,?,?,1,?,?)",
-                    UUID.randomUUID().toString(), sandboxId, assetId, allowUse ? 1 : 0, actor(), now);
+            jdbc.update("insert into ds_sandbox_mount_control(id,sandbox_id,asset_id,allow_use,use_until,version,updated_by,updated_at) "
+                            + "values(?,?,?,?,?,1,?,?)",
+                    UUID.randomUUID().toString(), sandboxId, assetId, allowUse ? 1 : 0, useUntil, actor(), now);
         } else {
-            int affected = jdbc.update("update ds_sandbox_mount_control set allow_use=?,version=version+1,updated_by=?,updated_at=? "
+            int affected = jdbc.update("update ds_sandbox_mount_control set allow_use=?,use_until=?,version=version+1,updated_by=?,updated_at=? "
                             + "where sandbox_id=? and asset_id=? and version=?",
-                    allowUse ? 1 : 0, actor(), now, sandboxId, assetId, expected);
+                    allowUse ? 1 : 0, useUntil, actor(), now, sandboxId, assetId, expected);
             if (affected != 1) throw new IllegalStateException("使用控制已被其他用户更新，请刷新后重试");
         }
-        return requireRow("select * from ds_sandbox_mount_control where sandbox_id=? and asset_id=?", sandboxId, assetId);
+        Map<String, Object> result = requireRow(
+                "select * from ds_sandbox_mount_control where sandbox_id=? and asset_id=?", sandboxId, assetId);
+        addMountState(result);
+        return result;
     }
 
     public List<Map<String, Object>> resultControls(String sandboxId) {
@@ -165,9 +170,9 @@ public class SandboxDataControlService {
             String kind = string(item.get("kind"));
             String table = string(item.get("tableName"));
             if ("MOUNT".equals(kind)) {
-                boolean allowed = mountAllowed(sandboxId, string(item.get("assetId")));
-                item.put("canUse", allowed);
-                item.put("canPreview", allowed);
+                Map<String, Object> policy = mountPolicy(sandboxId, string(item.get("assetId")));
+                item.putAll(policy);
+                item.put("canPreview", policy.get("canUse"));
                 item.put("canExport", false);
             } else if ("RESULT".equals(kind)) {
                 Map<String, Object> policy = resultPolicy(sandboxId, table);
@@ -186,7 +191,7 @@ public class SandboxDataControlService {
         Map<String, Object> dir = dataDir(sandboxId, tableName);
         String kind = string(dir.get("kind"));
         if ("MOUNT".equals(kind) && !mountAllowed(sandboxId, string(dir.get("asset_id")))) {
-            throw new SecurityException("该挂载数据已被禁止使用");
+            throw new SecurityException("该挂载数据已被禁止使用或已超过使用截止时间");
         }
         if ("RESULT".equals(kind) && !bool(resultPolicy(sandboxId, tableName).get("canPreview"), false)) {
             throw new SecurityException("开发结果已超过查看截止时间");
@@ -201,7 +206,9 @@ public class SandboxDataControlService {
     }
 
     public void requireMountAssetUsable(String sandboxId, String assetId) {
-        if (!mountAllowed(sandboxId, assetId)) throw new SecurityException("该挂载数据已被禁止使用");
+        if (!mountAllowed(sandboxId, assetId)) {
+            throw new SecurityException("该挂载数据已被禁止使用或已超过使用截止时间");
+        }
     }
 
     public void requireResultExport(String sandboxId, String tableName) {
@@ -245,10 +252,27 @@ public class SandboxDataControlService {
         row.put("controlled", intValue(row.get("version"), 0) > 0);
     }
 
+    private void addMountState(Map<String, Object> row) {
+        boolean allowed = bool(row.get("allow_use"), true);
+        String useUntil = string(row.get("use_until"));
+        boolean canUse = allowed && !expired(useUntil);
+        row.put("canUse", canUse);
+        row.put("controlled", intValue(row.get("version"), 0) > 0);
+        row.put("disabledReason", canUse ? "" : allowed ? "已超过使用截止时间" : "已禁止使用");
+    }
+
+    private Map<String, Object> mountPolicy(String sandboxId, String assetId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select allow_use,use_until,version from ds_sandbox_mount_control where sandbox_id=? and asset_id=?",
+                sandboxId, assetId);
+        Map<String, Object> policy = rows.isEmpty() ? new LinkedHashMap<>() : new LinkedHashMap<>(rows.get(0));
+        policy.putIfAbsent("allow_use", 1);
+        addMountState(policy);
+        return policy;
+    }
+
     private boolean mountAllowed(String sandboxId, String assetId) {
-        List<Map<String, Object>> rows = jdbc.queryForList("select allow_use from ds_sandbox_mount_control "
-                + "where sandbox_id=? and asset_id=?", sandboxId, assetId);
-        return rows.isEmpty() || bool(rows.get(0).get("allow_use"), true);
+        return bool(mountPolicy(sandboxId, assetId).get("canUse"), false);
     }
 
     private Map<String, Object> dataDir(String sandboxId, String tableName) {
