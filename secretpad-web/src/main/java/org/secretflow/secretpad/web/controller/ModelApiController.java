@@ -49,6 +49,12 @@ public class ModelApiController {
         return SecretPadResponse.success(service.create(request));
     }
 
+    @Operation(summary = "统一发布受控 API（sourceType=ARTIFACT|MODEL，跳过审批直接可用；一次性 app_id+secret 明文仅本次返回）")
+    @PostMapping("/publish")
+    public SecretPadResponse<Map<String, Object>> publish(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(service.publish(request));
+    }
+
     @Operation(summary = "制品→API 一键发布（自动注册 APPROVED 模型 + 创建 API；一次性 app_id+secret 明文仅本次返回）")
     @PostMapping("/create-from-artifact")
     public SecretPadResponse<Map<String, Object>> createFromArtifact(@RequestBody Map<String, Object> request) {

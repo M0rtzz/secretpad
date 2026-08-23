@@ -70,6 +70,34 @@ public final class DevSqlEngine {
      */
     public static SqlResult execute(String csvText, String sql,
             Map<String, Object> params, int maxResultRows, int timeoutSeconds) {
+        return execute(csvText, sql, params, maxResultRows, timeoutSeconds, "src");
+    }
+
+    /**
+     * 同 {@link #execute}，但输入表名取自 SQL 的 FROM/JOIN 引用（{@link #detectTableName}）：
+     * 使 API 进程内 SQL 调用无需强制书写 {@code src}，兼容「沙箱源表名」与「src」两种书写习惯。
+     */
+    public static SqlResult executeNamed(String csvText, String sql,
+            Map<String, Object> params, int maxResultRows, int timeoutSeconds) {
+        return execute(csvText, sql, params, maxResultRows, timeoutSeconds, detectTableName(sql));
+    }
+
+    /**
+     * 提取 SQL 首个 FROM/JOIN 引用的表名（去掉字符串字面量后扫描，无显式引用默认 {@code src}）。
+     * 供 API 函数/进程内 SQL 调用以正确表名装载调用方输入行。
+     */
+    public static String detectTableName(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return "src";
+        }
+        String body = TRAILING_SEMIS.matcher(sql).replaceFirst("");
+        String withoutLiterals = body.replaceAll("'([^']|'')*'", "''");
+        Matcher m = TABLE_REF.matcher(withoutLiterals);
+        return m.find() ? m.group(1) : "src";
+    }
+
+    private static SqlResult execute(String csvText, String sql,
+            Map<String, Object> params, int maxResultRows, int timeoutSeconds, String tableName) {
         if (csvText == null || csvText.isBlank()) {
             throw new IllegalArgumentException(DevErrors.DEV_PARAM_INVALID + ": 源 CSV 为空");
         }
@@ -94,7 +122,7 @@ public final class DevSqlEngine {
         try (Connection conn = DriverManager.getConnection("jdbc:sqlite::memory:")) {
             conn.setAutoCommit(true);
             List<String> safeCols = SqliteTableLoader.sanitizeColumns(header);
-            createSourceTable(conn, safeCols, data, logs);
+            createSourceTable(conn, tableName, safeCols, data, logs);
             try (Statement pragma = conn.createStatement()) {
                 pragma.execute("PRAGMA query_only = ON");
             }
@@ -208,11 +236,11 @@ public final class DevSqlEngine {
 
     /* ------------------------------ 内部实现 ------------------------------ */
 
-    private static void createSourceTable(Connection conn, List<String> safeCols,
+    private static void createSourceTable(Connection conn, String tableName, List<String> safeCols,
             List<List<String>> data, List<String> logs) throws SQLException {
         int cols = safeCols.size();
         List<String> types = SqliteTableLoader.inferColumnTypes(safeCols, data);
-        StringBuilder ddl = new StringBuilder("CREATE TABLE src (");
+        StringBuilder ddl = new StringBuilder("CREATE TABLE ").append(tableName).append(" (");
         for (int c = 0; c < cols; c++) {
             if (c > 0) {
                 ddl.append(", ");
@@ -223,9 +251,9 @@ public final class DevSqlEngine {
         try (Statement stmt = conn.createStatement()) {
             stmt.execute(ddl.toString());
         }
-        logs.add("created src table " + cols + " cols, " + data.size() + " rows");
+        logs.add("created " + tableName + " table " + cols + " cols, " + data.size() + " rows");
 
-        StringBuilder ins = new StringBuilder("INSERT INTO src (");
+        StringBuilder ins = new StringBuilder("INSERT INTO ").append(tableName).append(" (");
         for (int c = 0; c < cols; c++) {
             if (c > 0) {
                 ins.append(", ");

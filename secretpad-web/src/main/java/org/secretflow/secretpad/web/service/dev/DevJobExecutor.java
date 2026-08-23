@@ -196,6 +196,30 @@ public class DevJobExecutor {
         doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, channel, extra);
     }
 
+    /**
+     * 携带预置 SQLite 快照提交计算任务（函数 API 调用通道）：与 {@link #submitSandboxChannel} 的
+     * 快照机制一致，但 DB 字节由调用方按「调用方输入行」构造（不再按 sandboxId 打包整库），
+     * channel='api' 由 runAndAwait 同步收官。
+     */
+    public void submitWithSnapshot(String taskId, String nodeId, String inputB64, String execType,
+            String jarB64OrScript, Map<String, Object> params, List<String> allowedImports,
+            String channel, byte[] dbBytes, String inputTable, String outputTable) {
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("jdbc_url", "jdbc:sqlite:/workspace/sandbox_data.db");
+        extra.put("input_table", inputTable);
+        if (notBlank(outputTable)) {
+            extra.put("output_table", outputTable);
+        }
+        if (dbBytes != null && dbBytes.length > 0) {
+            if (dbBytes.length > maxSandboxDbBytes) {
+                throw new IllegalStateException(DevErrors.DEV_INPUT_TOO_LARGE
+                        + ": 沙箱数据库超过 " + maxSandboxDbBytes + " 字节上限（当前 " + dbBytes.length + " 字节）");
+            }
+            extra.put("sandbox_db_b64", Base64.getEncoder().encodeToString(dbBytes));
+        }
+        doSubmit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, channel, extra);
+    }
+
     private void doSubmit(String taskId, String nodeId, String inputB64, String execType,
             String jarB64OrScript, Map<String, Object> params, List<String> allowedImports, String channel,
             Map<String, Object> extraConfig) {

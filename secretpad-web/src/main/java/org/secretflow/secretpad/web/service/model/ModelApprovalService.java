@@ -52,6 +52,8 @@ import java.util.UUID;
 public class ModelApprovalService {
 
     private static final Set<String> MODEL_TYPES = Set.of("JAR", "PYTHON");
+    /** 自动注册（画布训练 / 制品一键发布 API）放行全部可执行制品类型，SQL/函数走进程内/包装器执行。 */
+    private static final Set<String> AUTO_MODEL_TYPES = Set.of("JAR", "PYTHON", "SQL", "FUNCTION");
     private static final Set<String> NON_TERMINAL_STATUSES = Set.of("DRAFT", "APPROVING", "APPROVED", "PUBLISHED");
     private static final Set<String> EDITABLE_STATUSES = Set.of("DRAFT", "REJECTED");
     private static final Set<String> APPROVAL_ACTIONS = Set.of("APPROVE", "REJECT", "RESUBMIT", "PUBLISH");
@@ -147,9 +149,9 @@ public class ModelApprovalService {
             String artifactVersionId, String sandboxId, String description) {
         Map<String, Object> artifact = requireArtifact(artifactId);
         String artifactType = string(artifact.get("type"));
-        if (!MODEL_TYPES.contains(artifactType)) {
+        if (!AUTO_MODEL_TYPES.contains(artifactType)) {
             throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID
-                    + ": 仅 JAR/PYTHON 制品可作为模型（当前 " + artifactType + "）");
+                    + ": 仅 JAR/PYTHON/SQL/FUNCTION 制品可作为自动注册模型（当前 " + artifactType + "）");
         }
         requireVersion(artifactId, artifactVersionId);
         requireProject(projectId);

@@ -18,7 +18,11 @@ import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.service.EnvService;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.dev.DevDependencyChecker;
+import org.secretflow.secretpad.web.service.dev.DevFunctionWrapper;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
+import org.secretflow.secretpad.web.service.dev.DevSqlEngine;
+import org.secretflow.secretpad.web.service.storage.SqliteTableLoader;
 import org.secretflow.secretpad.web.util.RequestUtils;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -31,7 +35,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
@@ -81,6 +88,9 @@ public class ModelApiService {
     private ModelTestService modelTestService;
 
     @Resource
+    private ModelApprovalService modelApprovalService;
+
+    @Resource
     private EnvService envService;
 
     @Value("${secretpad.deploy-mode:}")
@@ -91,6 +101,12 @@ public class ModelApiService {
 
     @Value("${secretpad.data-sandbox.model.api.max-input-bytes:262144}")
     private int maxInputBytes;
+
+    @Value("${secretpad.data-sandbox.dev.sql-limit:100}")
+    private int sqlLimit;
+
+    @Value("${secretpad.data-sandbox.dev.sql-timeout-seconds:30}")
+    private int sqlTimeoutSeconds;
 
     private final SecureRandom random = new SecureRandom();
 
@@ -107,19 +123,89 @@ public class ModelApiService {
             throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
                     + ": 仅已通过审批的模型可发布 API（当前 " + modelStatus + "）");
         }
+        return createApiForModel(modelId, name, string(value(request, "description", "")),
+                parseStringList(jsonArrayString(request.get("authorizedUsers"), "[]")),
+                parseStringList(jsonArrayString(request.get("ipWhitelist"), "[]")),
+                string(value(request, "validFrom", "")), string(value(request, "validTo", "")));
+    }
+
+    /**
+     * 统一发布受控 API（轻量化发布体系核心）：{@code sourceType=MODEL|ARTIFACT} 双入口，跳过审批状态机
+     * 直接建立受控 API（status=ENABLED + 一次性 app_id+secret）。
+     *
+     * <ul>
+     *   <li>MODEL：{@code sourceId} 为模型 id，要求画布已保存且 APPROVED/PUBLISHED（复用既有门禁）。</li>
+     *   <li>ARTIFACT：{@code sourceId} 为制品 id，{@code version} 为版本号或版本 id（缺省取最新），
+     *       经 {@link ModelApprovalService#registerModelAutoApproved} 幂等注册 APPROVED 模型后发布，
+     *       JAR/PYTHON/SQL/FUNCTION 制品均可。</li>
+     * </ul>
+     */
+    public Map<String, Object> publish(Map<String, Object> request) {
+        String sourceType = required(request, "sourceType");
+        String sourceId = required(request, "sourceId");
+        String name = required(request, "apiName");
+        String description = string(value(request, "description", ""));
+        List<String> authorizedUsers = parseStringList(jsonArrayString(request.get("authUsers"), "[]"));
+        List<String> ipWhitelist = parseStringList(jsonArrayString(request.get("ipWhitelist"), "[]"));
+        String validFrom = string(value(request, "validFrom", ""));
+        String validTo = string(value(request, "validTo", ""));
+        String modelId;
+        if ("MODEL".equalsIgnoreCase(sourceType)) {
+            modelId = sourceId;
+            Map<String, Object> model = requireModel(modelId);
+            requireSavedCanvasWorkflow(modelId);
+            String modelStatus = string(model.get("status"));
+            if (!Set.of("APPROVED", "PUBLISHED").contains(modelStatus)) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                        + ": 仅已通过审批的模型可发布 API（当前 " + modelStatus + "）");
+            }
+        } else if ("ARTIFACT".equalsIgnoreCase(sourceType)) {
+            Map<String, Object> artifact = requireArtifact(sourceId);
+            String versionId = resolveVersionId(sourceId, value(request, "version", ""));
+            Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
+                    name, string(artifact.get("project_id")), sourceId, versionId,
+                    string(artifact.get("sandbox_id")), description);
+            modelId = string(model.get("id"));
+        } else {
+            throw new IllegalArgumentException(ModelErrors.MODEL_PARAM_INVALID
+                    + ": sourceType 仅支持 ARTIFACT/MODEL（当前 " + sourceType + "）");
+        }
+        return createApiForModel(modelId, name, description, authorizedUsers, ipWhitelist, validFrom, validTo);
+    }
+
+    /**
+     * 制品→API 一键发布（旧参数形态兼容）：{artifactId, artifactVersionId, name, description,
+     * authorizedUsers, ipWhitelist, validFrom, validTo} → 统一 publish ARTIFACT 分支。
+     */
+    public Map<String, Object> createFromArtifact(Map<String, Object> request) {
+        String artifactId = required(request, "artifactId");
+        Map<String, Object> artifact = requireArtifact(artifactId);
+        Map<String, Object> publish = new LinkedHashMap<>();
+        publish.put("sourceType", "ARTIFACT");
+        publish.put("sourceId", artifactId);
+        publish.put("version", string(value(request, "artifactVersionId", "")));
+        publish.put("apiName", required(request, "name"));
+        publish.put("description", value(request, "description", ""));
+        publish.put("authUsers", request.get("authorizedUsers"));
+        publish.put("ipWhitelist", request.get("ipWhitelist"));
+        publish.put("validFrom", value(request, "validFrom", ""));
+        publish.put("validTo", value(request, "validTo", ""));
+        return publish(publish);
+    }
+
+    /** 建 API 行（ENABLED + 一次性 app_id+secret）并把模型置为 PUBLISHED。 */
+    private Map<String, Object> createApiForModel(String modelId, String name, String description,
+            List<String> authorizedUsers, List<String> ipWhitelist, String validFrom, String validTo) {
         String id = "mapi-" + shortId();
         String appId = "ai-" + shortId();
         String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
         String now = now();
-        List<String> authorizedUsers = parseStringList(jsonArrayString(request.get("authorizedUsers"), "[]"));
-        List<String> ipWhitelist = parseStringList(jsonArrayString(request.get("ipWhitelist"), "[]"));
         jdbc.update("insert into ds_model_api(id,model_id,name,description,status,app_id,secret_hash,authorized_users,"
                         + "ip_whitelist,valid_from,valid_to,call_count,last_called_at,created_by,created_at,updated_at,deleted)"
                         + " values(?,?,?,?,'ENABLED',?,?,?,?,?,?,0,'',?,?,?,0)",
-                id, modelId, name, string(value(request, "description", "")),
+                id, modelId, name, description,
                 appId, sha256(secret), json(authorizedUsers), json(ipWhitelist),
-                string(value(request, "validFrom", "")), string(value(request, "validTo", "")),
-                actor(), now, now);
+                validFrom, validTo, actor(), now, now);
         // 发布 API 即发布模型
         jdbc.update("update ds_model set status='PUBLISHED',published_at=?,updated_at=? where id=? and deleted=0 and status<>'PUBLISHED'",
                 now, now, modelId);
@@ -129,15 +215,6 @@ public class ModelApiService {
         result.put("secret", secret);
         result.put("notice", "调用密钥只显示一次，请立即保存");
         return result;
-    }
-
-    /**
-     * 制品→API 一键发布（发布源双入口之「制品」侧）：选沙箱制品+版本，自动注册 APPROVED 模型
-     * （幂等，同制品同版本复用），再发布受控 API。返回与 {@link #create} 相同结构（含一次性 app_id+secret）。
-     */
-    public Map<String, Object> createFromArtifact(Map<String, Object> request) {
-        throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
-                + ": 请先在可视化建模画布中将工作流保存为模型，再发布 API");
     }
 
     public List<Map<String, Object>> list(String keyword) {
@@ -296,7 +373,7 @@ public class ModelApiService {
                 deny("MODEL_API_USER_DENIED", "调用用户 " + caller + " 不在授权名单", apiId, ip);
             }
         }
-        // ⑤ 执行
+        // ⑤ 执行：按制品类型分发（SQL 进程内内存计算 / FUNCTION python-runner 预置快照 / PYTHON+JAR 无状态容器）
         String modelId = string(api.get("model_id"));
         Map<String, Object> model = requireModel(modelId);
         List<Map<String, Object>> rows = parseRows(body.get("rows"));
@@ -315,6 +392,93 @@ public class ModelApiService {
         String execType = string(artifact.get("type"));
         String nodeId = notBlank(string(model.get("node_id"))) ? string(model.get("node_id")) : envService.getPlatformNodeId();
         Map<String, Object> params = modelTestService.mergedParams(version, body.get("params"));
+        String inputB64 = Base64.getEncoder().encodeToString(inputCsv.getBytes(StandardCharsets.UTF_8));
+        String taskId = createInvokeTask(modelId, nodeId, execType, params, rows.size());
+
+        if ("SQL".equals(execType)) {
+            return invokeSql(apiId, modelId, taskId, version, params, inputCsv, rows, caller, ip);
+        }
+        if ("FUNCTION".equals(execType)) {
+            return invokeFunction(apiId, modelId, taskId, nodeId, version, params, inputB64, inputCsv, rows, caller, ip);
+        }
+        return invokeContainer(apiId, modelId, taskId, nodeId, execType, version, params, inputB64, rows, caller, ip);
+    }
+
+    /** SQL 制品：进程内只读 SQLite 内存计算（{@link DevSqlEngine#executeNamed}），不拉起容器。 */
+    private Map<String, Object> invokeSql(String apiId, String modelId, String taskId, Map<String, Object> version,
+            Map<String, Object> params, String inputCsv, List<Map<String, Object>> rows, String caller, String ip) {
+        String sql = string(version.get("content_text"));
+        claimTask(taskId);
+        DevSqlEngine.SqlResult result;
+        try {
+            result = DevSqlEngine.executeNamed(inputCsv, sql, params, sqlLimit, sqlTimeoutSeconds);
+        } catch (Exception e) {
+            jdbc.update("update ds_dev_task set status='FAILED',error_message=?,finished_at=?,updated_at=? where id=?",
+                    truncate(e.getMessage(), 1900), now(), now(), taskId);
+            throw e;
+        }
+        jdbc.update("update ds_dev_task set status='SUCCEEDED',result_preview=?,result_rows=?,finished_at=?,updated_at=?"
+                        + " where id=? and status=?",
+                json(Map.of("header", result.header(), "rows", result.rows(), "sourceRows", rows.size(),
+                        "resultRows", result.rows().size(), "elapsedMs", result.elapsedMs())),
+                result.rows().size(), now(), now(), taskId, "RUNNING");
+        recordInvoke(apiId, modelId, taskId, caller, ip, rows.size(), true, result.elapsedMs(), "");
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("header", result.header());
+        response.put("rows", result.rows());
+        response.put("resultRows", result.rows().size());
+        response.put("elapsedMs", result.elapsedMs());
+        return response;
+    }
+
+    /** FUNCTION（UDF）制品：调用方输入行物化为 SQLite 快照送 pod，包装器注册 UDF 后执行渲染 SQL。 */
+    private Map<String, Object> invokeFunction(String apiId, String modelId, String taskId, String nodeId,
+            Map<String, Object> version, Map<String, Object> params, String inputB64, String inputCsv,
+            List<Map<String, Object>> rows, String caller, String ip) {
+        String functionName = string(version.get("function_name"));
+        int nargs = intValue(version.get("function_nargs"), 0);
+        String source = string(version.get("content_text"));
+        String sqlTemplate = string(version.get("sql_template"));
+        String renderedSql = DevSqlEngine.renderBounded(sqlTemplate, params, sqlLimit);
+        String tableName = DevSqlEngine.detectTableName(renderedSql);
+        String wrapper = DevFunctionWrapper.generate(functionName, nargs, source, renderedSql);
+        List<String> allowedImports = DevDependencyChecker.extractImports(source);
+        byte[] dbBytes;
+        try {
+            Path tmp = Files.createTempFile("api-fn-", ".db");
+            try {
+                SqliteTableLoader.materializeCsvToFile(tmp, tableName, inputCsv, true);
+                dbBytes = Files.readAllBytes(tmp);
+            } finally {
+                Files.deleteIfExists(tmp);
+            }
+        } catch (IOException e) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_API_INVOKE_FAILED + ": 构建函数输入库失败: " + e.getMessage());
+        }
+        claimTask(taskId);
+        try {
+            devJobExecutor.submitWithSnapshot(taskId, nodeId, inputB64, "FUNCTION", wrapper, params,
+                    allowedImports, "api", dbBytes, tableName, "");
+        } catch (Exception e) {
+            jdbc.update("update ds_dev_task set status='FAILED',error_message=?,finished_at=?,updated_at=? where id=?",
+                    truncate(e.getMessage(), 1900), now(), now(), taskId);
+            throw e;
+        }
+        Map<String, Object> result = devJobExecutor.runAndAwait(taskId);
+        boolean success = "SUCCEEDED".equals(string(result.get("status")));
+        recordInvoke(apiId, modelId, taskId, caller, ip, rows.size(), success, result.get("elapsedMs"),
+                string(result.get("errorMessage")));
+        if (!success) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_API_INVOKE_FAILED
+                    + ": " + string(result.get("errorMessage")));
+        }
+        return buildInvokeResult(result);
+    }
+
+    /** PYTHON/JAR 制品：无状态评分容器（channel='api'，runAndAwait 同步收官）。 */
+    private Map<String, Object> invokeContainer(String apiId, String modelId, String taskId, String nodeId,
+            String execType, Map<String, Object> version, Map<String, Object> params, String inputB64,
+            List<Map<String, Object>> rows, String caller, String ip) {
         String jarB64OrScript;
         List<String> allowedImports;
         if ("PYTHON".equals(execType)) {
@@ -325,8 +489,6 @@ public class ModelApiService {
             jarB64OrScript = Base64.getEncoder().encodeToString(modelTestService.readJar(string(version.get("file_path"))));
             allowedImports = new ArrayList<>();
         }
-        String inputB64 = Base64.getEncoder().encodeToString(inputCsv.getBytes(StandardCharsets.UTF_8));
-        String taskId = createInvokeTask(modelId, nodeId, execType, params, rows.size());
         claimTask(taskId);
         try {
             devJobExecutor.submit(taskId, nodeId, inputB64, execType, jarB64OrScript, params, allowedImports, "api");
@@ -337,23 +499,33 @@ public class ModelApiService {
         }
         Map<String, Object> result = devJobExecutor.runAndAwait(taskId);
         boolean success = "SUCCEEDED".equals(string(result.get("status")));
-        jdbc.update("update ds_model_api set call_count=call_count+1,last_called_at=? where id=? and deleted=0",
-                now(), apiId);
-        audit("MODEL_API_INVOKE", "MODEL_API", apiId,
-                "caller=" + caller + " ip=" + ip + " rows=" + rows.size() + " task=" + taskId
-                        + " elapsedMs=" + result.get("elapsedMs") + (success ? "" : " err=" + result.get("errorMessage")),
-                success);
-        dispatch("model.api.invoked", Map.of("id", apiId, "modelId", modelId, "taskId", taskId, "success", success));
+        recordInvoke(apiId, modelId, taskId, caller, ip, rows.size(), success, result.get("elapsedMs"),
+                string(result.get("errorMessage")));
         if (!success) {
             throw new IllegalArgumentException(ModelErrors.MODEL_API_INVOKE_FAILED
                     + ": " + string(result.get("errorMessage")));
         }
+        return buildInvokeResult(result);
+    }
+
+    private Map<String, Object> buildInvokeResult(Map<String, Object> result) {
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("header", result.get("header"));
         response.put("rows", result.get("rows"));
         response.put("resultRows", result.get("rows") == null ? 0 : ((List<?>) result.get("rows")).size());
         response.put("elapsedMs", result.get("elapsedMs"));
         return response;
+    }
+
+    private void recordInvoke(String apiId, String modelId, String taskId, String caller, String ip,
+            int sourceRows, boolean success, Object elapsedMs, String errorMessage) {
+        jdbc.update("update ds_model_api set call_count=call_count+1,last_called_at=? where id=? and deleted=0",
+                now(), apiId);
+        audit("MODEL_API_INVOKE", "MODEL_API", apiId,
+                "caller=" + caller + " ip=" + ip + " rows=" + sourceRows + " task=" + taskId
+                        + " elapsedMs=" + elapsedMs + (success ? "" : " err=" + errorMessage),
+                success);
+        dispatch("model.api.invoked", Map.of("id", apiId, "modelId", modelId, "taskId", taskId, "success", success));
     }
 
     /* ============================== 内部 ============================== */
@@ -471,7 +643,12 @@ public class ModelApiService {
     }
 
     private Map<String, Object> modelDetailLight(String modelId) {
-        List<Map<String, Object>> rows = jdbc.queryForList("select id,name,artifact_id,artifact_version_id,node_id,version,status from ds_model where id=? and deleted=0", modelId);
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select m.id,m.name,m.artifact_id,m.artifact_version_id,m.node_id,m.version,m.status,"
+                        + "a.name artifact_name,a.type artifact_type,v.version artifact_version_no "
+                        + "from ds_model m left join ds_dev_artifact a on a.id=m.artifact_id "
+                        + "left join ds_dev_artifact_version v on v.id=m.artifact_version_id "
+                        + "where m.id=? and m.deleted=0", modelId);
         return rows.isEmpty() ? Map.of() : new LinkedHashMap<>(rows.get(0));
     }
 
@@ -508,6 +685,37 @@ public class ModelApiService {
             throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 制品版本不存在: " + artifactId + "/" + versionId);
         }
         return new LinkedHashMap<>(rows.get(0));
+    }
+
+    /** 版本引用解析：优先版本行 id，其次版本号（{@code version} 列），缺省取最新版本。 */
+    private String resolveVersionId(String artifactId, String versionRef) {
+        if (!notBlank(versionRef)) {
+            List<Map<String, Object>> rows = jdbc.queryForList(
+                    "select id from ds_dev_artifact_version where artifact_id=? and deleted=0 order by version desc limit 1",
+                    artifactId);
+            if (rows.isEmpty()) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 制品无可用版本: " + artifactId);
+            }
+            return string(rows.get(0).get("id"));
+        }
+        List<Map<String, Object>> byId = jdbc.queryForList(
+                "select id from ds_dev_artifact_version where id=? and artifact_id=? and deleted=0", versionRef, artifactId);
+        if (!byId.isEmpty()) {
+            return string(byId.get(0).get("id"));
+        }
+        try {
+            int vno = Integer.parseInt(versionRef);
+            List<Map<String, Object>> byNo = jdbc.queryForList(
+                    "select id from ds_dev_artifact_version where artifact_id=? and version=? and deleted=0 order by version desc limit 1",
+                    artifactId, vno);
+            if (!byNo.isEmpty()) {
+                return string(byNo.get(0).get("id"));
+            }
+        } catch (NumberFormatException ignored) {
+            // 非版本号，按 id 已查无 → 下方抛不存在
+        }
+        throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND
+                + ": 制品版本不存在: " + artifactId + "/" + versionRef);
     }
 
     private Map<String, Object> requireApi(String id) {
@@ -591,6 +799,20 @@ public class ModelApiService {
     private String value(Map<String, Object> request, String key, String defaultValue) {
         Object value = request.get(key);
         return value == null ? defaultValue : String.valueOf(value);
+    }
+
+    private int intValue(Object value, int defaultValue) {
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 
     private static String string(Object value) {
