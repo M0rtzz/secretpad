@@ -45,6 +45,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -61,6 +62,7 @@ public class ModelApiService {
 
     private static final String STATUS_ENABLED = "ENABLED";
     private static final String STATUS_DISABLED = "DISABLED";
+    private static final Pattern APP_SECRET_PATTERN = Pattern.compile("[A-Za-z0-9_-]{43}");
 
     @Resource
     @Qualifier("jdbcTemplate")
@@ -223,34 +225,40 @@ public class ModelApiService {
      * UserContext（name={@code api:{appId}}）供审计/授权使用。失败抛 {@link SecretpadException} AUTH_FAILED。
      */
     public void authenticateInvoke(HttpServletRequest request, String appId, String secret) {
-        if (!notBlank(appId) || !notBlank(secret)) {
+        String normalizedAppId = appId == null ? "" : appId.trim();
+        String normalizedSecret = secret == null ? "" : secret.trim();
+        if (!notBlank(normalizedAppId) || !notBlank(normalizedSecret)) {
             audit("MODEL_API_AUTH", "MODEL_API", "", "missing credential appId=" + appId, false);
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "model api credential missing");
         }
+        if (!APP_SECRET_PATTERN.matcher(normalizedSecret).matches()) {
+            audit("MODEL_API_AUTH", "MODEL_API", "", "invalid secret format appId=" + normalizedAppId, false);
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "invalid model api credential");
+        }
         Map<String, Object> api;
         try {
-            api = requireApiByAppId(appId);
+            api = requireApiByAppId(normalizedAppId);
         } catch (IllegalArgumentException e) {
-            audit("MODEL_API_AUTH", "MODEL_API", "", "unknown appId=" + appId, false);
+            audit("MODEL_API_AUTH", "MODEL_API", "", "unknown appId=" + normalizedAppId, false);
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "invalid model api credential");
         }
         byte[] expected = string(api.get("secret_hash")).getBytes(StandardCharsets.UTF_8);
-        byte[] actual = sha256(secret).getBytes(StandardCharsets.UTF_8);
+        byte[] actual = sha256(normalizedSecret).getBytes(StandardCharsets.UTF_8);
         if (!MessageDigest.isEqual(expected, actual)) {
-            audit("MODEL_API_AUTH", "MODEL_API", string(api.get("id")), "secret mismatch appId=" + appId, false);
+            audit("MODEL_API_AUTH", "MODEL_API", string(api.get("id")), "secret mismatch appId=" + normalizedAppId, false);
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "invalid model api credential");
         }
         request.setAttribute("modelApiId", api.get("id"));
         UserContextDTO apiUser = new UserContextDTO();
-        apiUser.setName("api:" + appId);
-        apiUser.setOwnerId(appId);
+        apiUser.setName("api:" + normalizedAppId);
+        apiUser.setOwnerId(normalizedAppId);
         apiUser.setOwnerType(UserOwnerTypeEnum.CENTER);
         apiUser.setToken("token");
         apiUser.setPlatformType(PlatformTypeEnum.CENTER);
         apiUser.setPlatformNodeId(envService.getPlatformNodeId());
         apiUser.setDeployMode(deployMode);
         UserContext.setBaseUser(apiUser);
-        audit("MODEL_API_AUTH", "MODEL_API", string(api.get("id")), "appId=" + appId, true);
+        audit("MODEL_API_AUTH", "MODEL_API", string(api.get("id")), "appId=" + normalizedAppId, true);
     }
 
     /* ============================== 推理调用 ============================== */

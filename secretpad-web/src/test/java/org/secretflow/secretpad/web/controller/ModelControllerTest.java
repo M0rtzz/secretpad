@@ -479,6 +479,7 @@ public class ModelControllerTest {
                 ALICE_TOKEN);
         String onceSecret = createdApi.path("data").path("secret").asText();
         String onceAppId = createdApi.path("data").path("app_id").asText();
+        assertTrue(onceSecret.matches("[A-Za-z0-9_-]{43}"), onceSecret);
 
         JobService.State.jobState = "Succeeded";
         JobService.State.withEndpoints = true;
@@ -493,6 +494,16 @@ public class ModelControllerTest {
         assertEquals(0L, jdbc.queryForObject("select call_count from ds_model_api where id=?", Long.class, apiId));
         assertEquals(1L, jdbc.queryForObject("select call_count from ds_model_api where app_id=?", Long.class, onceAppId));
         String onceApiId = createdApi.path("data").path("id").asText();
+
+        // 复制时意外带入首尾空白仍可认证；逗号等非法字符不得被静默接受。
+        JsonNode invokeWithWhitespace = doPostWithHeaders("/api/v1alpha1/model-api/invoke",
+                json(Map.of("rows", List.of(Map.of("id", 1, "score", 60)))), null,
+                Map.of("X-APP-ID", " " + onceAppId + " ", "X-APP-SECRET", " " + onceSecret + " "));
+        assertEquals(0, invokeWithWhitespace.path("status").path("code").asInt(), invokeWithWhitespace.toString());
+        JsonNode invalidFormat = doPostWithHeaders("/api/v1alpha1/model-api/invoke", json(Map.of("rows", List.of())),
+                null, Map.of("X-APP-ID", onceAppId, "X-APP-SECRET", "," + onceSecret));
+        assertTrue(invalidFormat.path("status").path("msg").asText().contains("model api credential"),
+                invalidFormat.toString());
 
         // 错误凭证 → AUTH_FAILED
         JsonNode badCred = doPostWithHeaders("/api/v1alpha1/model-api/invoke", json(Map.of("rows", List.of())),
