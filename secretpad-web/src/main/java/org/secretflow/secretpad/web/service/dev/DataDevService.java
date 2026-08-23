@@ -1397,7 +1397,16 @@ public class DataDevService {
 
     private Map<String, Object> requireSandboxMount(String sandboxId, String mountId, String assetId) {
         requireSandboxCreator(sandboxId, "");
-        StringBuilder sql = new StringBuilder("select m.*,a.datatable_id,a.processor_node_id,s.project_id from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id join ds_sandbox s on s.id=m.sandbox_id where m.sandbox_id=? and m.deleted=0 and m.status='READY' and a.deleted=0 and a.status='ACTIVE' and a.data_stage='PROCESSED'");
+        StringBuilder sql = new StringBuilder("select m.*,coalesce(a.datatable_id,la.datatable_id) datatable_id,"
+                + "coalesce(a.processor_node_id,la.processor_node_id) processor_node_id,s.project_id "
+                + "from ds_sandbox_dataset_mount m join ds_sandbox s on s.id=m.sandbox_id "
+                + "left join ds_data_asset a on a.id=m.asset_id and a.deleted=0 "
+                + "left join ds_asset_sync_record sr on sr.project_id=s.project_id and sr.asset_id=m.asset_id "
+                + "and sr.status='SYNCED' and sr.local_asset_id<>'' "
+                + "left join ds_data_asset la on la.id=sr.local_asset_id and la.deleted=0 "
+                + "where m.sandbox_id=? and m.deleted=0 and m.status='READY' "
+                + "and ((a.status='ACTIVE' and a.data_stage='PROCESSED') "
+                + "or (la.status='ACTIVE' and la.data_stage='PROCESSED'))");
         List<Object> args = new ArrayList<>(List.of(sandboxId));
         if (notBlank(mountId)) { sql.append(" and m.id=?"); args.add(mountId); }
         else if (notBlank(assetId)) { sql.append(" and m.asset_id=?"); args.add(assetId); }

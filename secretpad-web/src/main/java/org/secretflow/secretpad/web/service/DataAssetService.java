@@ -293,6 +293,7 @@ public class DataAssetService {
             if (asset.isEmpty()) continue;
             // P2P 同步的历史 asset_json 快照可能不包含 id，以项目附件关系中的
             // asset_id 为准，保证前端可正确展示并选中已挂载数据。
+            decorateUsageControl(asset, String.valueOf(attachment.get("asset_id")));
             asset.put("id", attachment.get("asset_id"));
             asset.put("attached_at", attachment.get("attached_at"));
             asset.put("attached_expires_at", attachment.get("expires_at"));
@@ -324,7 +325,27 @@ public class DataAssetService {
         if (!matchesOwner(String.valueOf(sandbox.get("owner_id")))) {
             requireProjectParticipant(String.valueOf(sandbox.get("project_id")));
         }
-        return jdbc.queryForList("select m.*,a.name asset_name,a.data_stage,a.metadata_json from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id where m.sandbox_id=? and m.deleted=0 order by m.created_at", sandboxId);
+        String projectId = String.valueOf(sandbox.get("project_id"));
+        List<Map<String, Object>> mounts = jdbc.queryForList(
+                "select m.*,a.name asset_name,a.data_stage,a.metadata_json from ds_sandbox_dataset_mount m "
+                        + "left join ds_data_asset a on a.id=m.asset_id and a.deleted=0 "
+                        + "where m.sandbox_id=? and m.deleted=0 order by m.created_at", sandboxId);
+        for (Map<String, Object> mount : mounts) {
+            if (mount.get("asset_name") != null) continue;
+            String assetId = String.valueOf(mount.get("asset_id"));
+            List<Map<String, Object>> attachments = jdbc.queryForList(
+                    "select asset_json from ds_project_asset where project_id=? and asset_id=? "
+                            + "and deleted=0 and coalesce(is_deleted,0)=0 limit 1", projectId, assetId);
+            Map<String, Object> snapshot = attachments.isEmpty()
+                    ? Map.of() : parseMap(attachments.get(0).get("asset_json"));
+            Map<String, Object> local = assetSyncService.localSyncedAsset(projectId, assetId);
+            mount.put("asset_name", snapshot.getOrDefault("name", assetId));
+            mount.put("data_stage", snapshot.getOrDefault("data_stage",
+                    local == null ? "" : local.getOrDefault("data_stage", "")));
+            mount.put("metadata_json", snapshot.getOrDefault("metadata_json",
+                    local == null ? "{}" : local.getOrDefault("metadata_json", "{}")));
+        }
+        return mounts;
     }
 
     @Transactional
@@ -339,6 +360,7 @@ public class DataAssetService {
             String assetId = String.valueOf(item);
             Map<String, Object> asset = require(assetId);
             requireProvider(asset);
+            decorateUsageControl(asset, assetId);
             Map<String, Object> snapshot = new LinkedHashMap<>(asset);
             snapshot.put("schema_columns", schemaColumns(asset));
             projectAssetRepository.save(ProjectAssetDO.builder()
@@ -377,6 +399,7 @@ public class DataAssetService {
         if (projectAssetRepository.existsById(upk)) {
             throw new IllegalStateException("结果已挂载到该项目");
         }
+        decorateUsageControl(asset, assetId);
         Map<String, Object> snapshot = new LinkedHashMap<>(asset);
         snapshot.put("schema_columns", schemaColumns(asset));
         projectAssetRepository.saveAndFlush(ProjectAssetDO.builder()
@@ -465,11 +488,41 @@ public class DataAssetService {
     private void requireAssetAccess(String id) {
         List<Map<String, Object>> rows = jdbc.queryForList(
                 "select access_start,access_end from ds_asset_usage_control where asset_id=?", id);
-        if (rows.isEmpty()) return;
-        Map<String, Object> control = rows.get(0);
+        Map<String, Object> control;
+        if (rows.isEmpty()) {
+            List<Map<String, Object>> snapshots = jdbc.queryForList(
+                    "select asset_json from ds_project_asset where asset_id=? and deleted=0 "
+                            + "and coalesce(is_deleted,0)=0 order by attached_at desc", id);
+            control = snapshots.stream()
+                    .map(row -> parseMap(row.get("asset_json")))
+                    .filter(snapshot -> snapshot.containsKey("access_start")
+                            || snapshot.containsKey("access_end"))
+                    .findFirst()
+                    .orElse(null);
+            if (control == null) return;
+        } else {
+            control = rows.get(0);
+        }
         if (!AssetTimeWindow.within(control.get("access_start"), control.get("access_end"))) {
             throw new SecurityException("该数据已超过访问截止时间，不可预览");
         }
+    }
+
+    /**
+     * 项目挂载目录与数据目录共用同一份使用控制。当前节点持有权威控制记录时覆盖
+     * 历史附件快照；跨节点仅有快照时保留同步过来的字段。
+     */
+    private void decorateUsageControl(Map<String, Object> asset, String assetId) {
+        List<Map<String, Object>> controls = jdbc.queryForList(
+                "select valid_from,valid_until,allow_export,access_start,access_end "
+                        + "from ds_asset_usage_control where asset_id=?", assetId);
+        if (controls.isEmpty()) return;
+        Map<String, Object> control = controls.get(0);
+        asset.put("control_valid_from", control.get("valid_from"));
+        asset.put("control_valid_until", control.get("valid_until"));
+        asset.put("allow_export", control.get("allow_export"));
+        asset.put("access_start", control.get("access_start"));
+        asset.put("access_end", control.get("access_end"));
     }
 
     /** Resolve both local catalog assets and metadata snapshots for project-shared assets. */

@@ -80,11 +80,7 @@ public class DataComputeService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("sandbox", sandbox);
         result.put("project", row("select project_id,name,compute_mode,development_modes,gmt_create from project where project_id=? and is_deleted=0", projectId));
-        result.put("mounts", jdbc.queryForList(
-                "select m.*,a.name asset_name,a.data_stage,a.modality,a.datatable_id,a.processor_node_id,a.metadata_json,a.valid_until,n.name provider_node_name "
-                        + "from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id "
-                        + "left join node n on (n.node_id=a.provider_node_id or n.inst_id=a.provider_node_id) and n.is_deleted=0 "
-                        + "where m.sandbox_id=? and m.deleted=0 order by m.created_at", sandboxId));
+        result.put("mounts", assets.sandboxMounts(sandboxId));
         result.put("availableAssets", assets.projectAssets(projectId).stream()
                 .filter(asset -> "ACTIVE".equals(string(asset.get("status"))))
                 .filter(asset -> "PROCESSED".equals(string(asset.get("data_stage"))))
@@ -214,23 +210,29 @@ public class DataComputeService {
         Map<String, Object> sandbox = requireUsableSandbox(sandboxId, true);
         String graph = json(request.getOrDefault("graph", Map.of("nodes", List.of(), "edges", List.of())));
         String id = string(request.get("id"));
+        String name = required(request, "name").trim();
         String now = now();
         // 画布拖拽/连线等自动保存时前端传 snapshot=false，避免版本快照爆炸；显式「保存」才生成版本记录
         boolean snapshot = !"false".equals(String.valueOf(request.get("snapshot")));
         if (id.isBlank()) {
+            requireUniqueCanvasName(sandboxId, name, "");
             id = "canvas-" + shortId();
             jdbc.update("insert into ds_compute_canvas(id,project_id,sandbox_id,name,description,graph_json,version,status,created_by,created_at,updated_at,deleted) values(?,?,?,?,?,?,1,'DRAFT',?,?,?,0)",
-                    id, sandbox.get("project_id"), sandboxId, required(request, "name"), string(request.get("description")), graph, actor(), now, now);
-            if (snapshot) snapshotCanvasVersion(id, 1, string(request.get("name")), graph, actor(), now);
+                    id, sandbox.get("project_id"), sandboxId, name, string(request.get("description")), graph, actor(), now, now);
+            if (snapshot) snapshotCanvasVersion(id, 1, name, graph, actor(), now);
         } else {
             Map<String, Object> old = row("select * from ds_compute_canvas where id=? and deleted=0", id);
+            if (!Objects.equals(sandboxId, string(old.get("sandbox_id")))) {
+                throw new IllegalArgumentException("画布不属于当前沙箱");
+            }
             if (!Objects.equals(actor(), string(old.get("created_by")))) throw new SecurityException("仅画布创建人可编辑");
+            requireUniqueCanvasName(sandboxId, name, id);
             int newVersion = intValue(old.get("version"), 0) + 1;
-            jdbc.update("update ds_compute_canvas set name=?,description=?,graph_json=?,version=?,updated_at=? where id=? and deleted=0",
-                    required(request, "name"), string(request.get("description")), graph, newVersion, now, id);
-            if (snapshot) snapshotCanvasVersion(id, newVersion, string(request.get("name")), graph, actor(), now);
+            jdbc.update("update ds_compute_canvas set name=?,description=?,graph_json=?,version=?,updated_at=? where id=? and sandbox_id=? and deleted=0",
+                    name, string(request.get("description")), graph, newVersion, now, id, sandboxId);
+            if (snapshot) snapshotCanvasVersion(id, newVersion, name, graph, actor(), now);
         }
-        return row("select * from ds_compute_canvas where id=?", id);
+        return row("select * from ds_compute_canvas where id=? and sandbox_id=?", id, sandboxId);
     }
 
     public List<Map<String, Object>> reports(String sandboxId, String type) {
@@ -330,6 +332,20 @@ public class DataComputeService {
         }
         if (Set.of("DESTROYED", "EXPIRED").contains(string(sandbox.get("status")))) throw new IllegalStateException("沙箱已失效");
         return sandbox;
+    }
+
+    private void requireUniqueCanvasName(String sandboxId, String name, String excludedId) {
+        String sql = "select count(1) from ds_compute_canvas where sandbox_id=? and deleted=0 "
+                + "and lower(name)=lower(?)";
+        List<Object> args = new ArrayList<>(List.of(sandboxId, name));
+        if (!excludedId.isBlank()) {
+            sql += " and id<>?";
+            args.add(excludedId);
+        }
+        Long count = jdbc.queryForObject(sql, Long.class, args.toArray());
+        if (count != null && count > 0) {
+            throw new IllegalArgumentException("同一沙箱内画布名称不能重复: " + name);
+        }
     }
 
     private Map<String, Object> requireSandbox(String id) { return row("select * from ds_sandbox where id=? and deleted=0", id); }

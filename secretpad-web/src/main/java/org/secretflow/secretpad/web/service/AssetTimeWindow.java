@@ -11,14 +11,14 @@ import java.time.format.DateTimeParseException;
  * 数据目录为资产设置的访问 / 使用时间窗判定，由数据目录预览与沙箱挂载控制共用，
  * 保证同一份有效期在两处得到一致的解释。
  */
-final class AssetTimeWindow {
+public final class AssetTimeWindow {
     private static final ZoneId DISPLAY_ZONE = ZoneId.of("Asia/Shanghai");
 
     private AssetTimeWindow() {
     }
 
     /** 当前时间落在窗口内返回 true；边界为空表示不限制，取值无法解析时按不限制处理。 */
-    static boolean within(Object start, Object end) {
+    public static boolean within(Object start, Object end) {
         Instant now = Instant.now();
         Instant from = parse(start);
         Instant until = parse(end);

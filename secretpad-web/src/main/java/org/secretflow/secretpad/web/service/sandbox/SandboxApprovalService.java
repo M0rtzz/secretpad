@@ -20,6 +20,7 @@ import org.secretflow.secretpad.persistence.entity.ProjectDatatableDO;
 import org.secretflow.secretpad.persistence.repository.ProjectAssetRepository;
 import org.secretflow.secretpad.persistence.repository.ProjectDatatableRepository;
 import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncRepository;
+import org.secretflow.secretpad.web.service.AssetTimeWindow;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
@@ -266,6 +267,14 @@ public class SandboxApprovalService {
             }
         }
         assertNoOpenApproval(type, ownerId, sandboxId);
+        Map<String, Object> payload = new LinkedHashMap<>(request);
+        if (Set.of("CREATE", "DATA_CHANGE").contains(type)) {
+            payload.put("datasetNames",
+                    datasetAssetNames(projectId, request.get("datasetAssetIds")));
+        }
+        if ("RECYCLE".equals(type)) {
+            payload.put("sandboxName", string(requireSandbox(sandboxId).get("name")));
+        }
 
         String id = "apr-" + shortId();
         String now = now();
@@ -273,7 +282,7 @@ public class SandboxApprovalService {
         String initialStatus = voters.isEmpty() ? "APPROVED" : "DATA_PROVIDER_REVIEW";
         jdbc.update("insert into ds_sandbox_approval(id,approval_type,sandbox_id,owner_id,submitter,payload_json,status,current_stage,version,executor,reviewer,review_comment,last_error,retry_count,submitted_at,approved_at,created_at,updated_at,deleted,project_id,applicant_node_id,project_snapshot_at) "
                         + "values(?,?,?,?,?,?,?,?,1,'','','','',0,?,?,?,?,0,?,?,?)",
-                id, type, sandboxId, ownerId, operator(), json(new LinkedHashMap<>(request)), initialStatus, initialStatus,
+                id, type, sandboxId, ownerId, operator(), json(payload), initialStatus, initialStatus,
                 now, voters.isEmpty() ? now : "", now, now, projectId, applicantNodeId,
                 legacyRecycle ? "" : projectSnapshot(projectId));
         voters.forEach(voter -> jdbc.update("insert into ds_sandbox_approval_vote(approval_id,voter_node_id,status,voter,comment,voted_at) values(?,?,'PENDING','','','')", id, voter));
@@ -735,10 +744,12 @@ public class SandboxApprovalService {
                     stagingUri = assetStorage.encryptedSnapshot(stagingUri, "sandbox-staging/" + sandboxNode + "/" + sandboxId + "/" + assetId + "-v" + intValue(asset.get("version"), 1), checksum);
                 }
             }
+            String expiresAt = string(asset.get("control_valid_until"));
+            if (!notBlank(expiresAt)) expiresAt = string(asset.get("valid_until"));
             jdbc.update("insert into ds_sandbox_dataset_mount(id,sandbox_id,asset_id,asset_version,provider_node_id,staging_uri,mount_path,checksum,status,expires_at,created_at,updated_at,deleted) values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
                     mountId, sandboxId, assetId, intValue(asset.get("version"), 1), provider,
                     stagingUri, "/data/assets/" + assetId, checksum,
-                    "READY", string(asset.get("valid_until")), now(), now());
+                    "READY", expiresAt, now(), now());
         }
         // 挂载即重建沙箱权威库（仅 PROCESSED 注入、RAW 禁入）；START 时亦会重建兜底
         try {
@@ -908,9 +919,18 @@ public class SandboxApprovalService {
         if (positive(request.get("storageGb"), 10) <= 0) {
             throw new IllegalArgumentException("storageGb 必须大于 0");
         }
-        int days = intValue(request.get("validDays"), 7);
-        if (days < 1 || days > 365) {
-            throw new IllegalArgumentException("validDays 必须在 1-365 之间");
+        LocalDateTime expiresAt;
+        try {
+            expiresAt = LocalDateTime.parse(required(request, "expiresAt"));
+        } catch (java.time.format.DateTimeParseException e) {
+            throw new IllegalArgumentException("expiresAt 必须是有效的日期时间");
+        }
+        LocalDateTime current = LocalDateTime.now();
+        if (!expiresAt.isAfter(current)) {
+            throw new IllegalArgumentException("到期时间必须晚于当前时间");
+        }
+        if (expiresAt.isAfter(current.plusDays(365))) {
+            throw new IllegalArgumentException("到期时间不能超过一年");
         }
     }
 
@@ -957,18 +977,37 @@ public class SandboxApprovalService {
             if (count("select count(1) from ds_project_asset where project_id=? and asset_id=? and deleted=0", projectId, assetId) == 0) {
                 throw new IllegalArgumentException("数据未挂载到所选项目: " + assetId);
             }
-            String validUntil = string(asset.get("valid_until"));
-            if (notBlank(validUntil) && validUntil.compareTo(now()) < 0) throw new IllegalArgumentException("数据已过有效期: " + assetId);
+            if (!AssetTimeWindow.within(asset.get("control_valid_from"),
+                    asset.get("control_valid_until"))) {
+                throw new IllegalArgumentException("数据不在使用有效期内: " + assetId);
+            }
+            if (!AssetTimeWindow.within(asset.get("access_start"), asset.get("access_end"))) {
+                throw new IllegalArgumentException("数据不在访问有效期内: " + assetId);
+            }
             // 授权自动同步：挂载前置校验即触发跨节点 PROCESSED 物理拉取（幂等；本节点资产为无操作）
             assetSyncService.ensureSynced(projectId, assetId);
         }
+    }
+
+    /** 申请详情保存可读名称，执行仍使用 datasetAssetIds 作为稳定标识。 */
+    private List<String> datasetAssetNames(String projectId, Object selected) {
+        List<String> names = new ArrayList<>();
+        for (String assetId : stringList(selected)) {
+            String name = string(projectAsset(projectId, assetId).get("name"));
+            names.add(notBlank(name) ? name : assetId);
+        }
+        return names;
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> projectAsset(String projectId, String assetId) {
         List<Map<String, Object>> local = jdbc.queryForList(
                 "select * from ds_data_asset where id=? and deleted=0", assetId);
-        if (!local.isEmpty()) return new LinkedHashMap<>(local.get(0));
+        if (!local.isEmpty()) {
+            Map<String, Object> asset = new LinkedHashMap<>(local.get(0));
+            decorateUsageControl(asset, assetId);
+            return asset;
+        }
         List<Map<String, Object>> shared = jdbc.queryForList(
                 "select asset_json,provider_node_id from ds_project_asset where project_id=? and asset_id=? and deleted=0 and coalesce(is_deleted,0)=0",
                 projectId, assetId);
@@ -976,10 +1015,24 @@ public class SandboxApprovalService {
         try {
             Map<String, Object> snapshot = objectMapper.readValue(string(shared.get(0).get("asset_json")), Map.class);
             snapshot.put("provider_node_id", shared.get(0).get("provider_node_id"));
+            decorateUsageControl(snapshot, assetId);
             return snapshot;
         } catch (Exception e) {
             throw new IllegalStateException("项目数据元数据损坏: " + assetId, e);
         }
+    }
+
+    /** 本节点存在权威使用控制时覆盖项目附件快照。 */
+    private void decorateUsageControl(Map<String, Object> asset, String assetId) {
+        List<Map<String, Object>> controls = jdbc.queryForList(
+                "select valid_from,valid_until,access_start,access_end "
+                        + "from ds_asset_usage_control where asset_id=?", assetId);
+        if (controls.isEmpty()) return;
+        Map<String, Object> control = controls.get(0);
+        asset.put("control_valid_from", control.get("valid_from"));
+        asset.put("control_valid_until", control.get("valid_until"));
+        asset.put("access_start", control.get("access_start"));
+        asset.put("access_end", control.get("access_end"));
     }
 
     private void assertSandboxCreator(String sandboxId) {

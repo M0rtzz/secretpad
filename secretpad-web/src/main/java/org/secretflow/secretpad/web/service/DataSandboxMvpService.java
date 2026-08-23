@@ -164,13 +164,32 @@ public class DataSandboxMvpService {
         double memory = positive(request, "memoryGb", 2);
         int gpu = nonNegativeInt(request, "gpuCount", 0);
         double storage = positive(request, "storageGb", 10);
-        int days = Math.max(1, Math.min(nonNegativeInt(request, "validDays", 7), 365));
+        String expiresAt;
+        if (notBlank(string(request.get("expiresAt")))) {
+            try {
+                LocalDateTime expires = LocalDateTime.parse(string(request.get("expiresAt")))
+                        .truncatedTo(ChronoUnit.SECONDS);
+                if (!expires.isAfter(LocalDateTime.now())) {
+                    throw new IllegalArgumentException("到期时间必须晚于当前时间");
+                }
+                if (expires.isAfter(LocalDateTime.now().plusDays(365))) {
+                    throw new IllegalArgumentException("到期时间不能超过一年");
+                }
+                expiresAt = expires.toString();
+            } catch (java.time.format.DateTimeParseException e) {
+                throw new IllegalArgumentException("expiresAt 必须是有效的日期时间");
+            }
+        } else {
+            // 兼容已进入审批流程、仍使用 validDays 的历史申请。
+            int days = Math.max(1, Math.min(nonNegativeInt(request, "validDays", 7), 365));
+            expiresAt = LocalDateTime.now().plusDays(days).truncatedTo(ChronoUnit.SECONDS).toString();
+        }
         ensureQuota(ownerId);
         assertCapacity(ownerId, cpu, memory, gpu, storage);
         String now = now();
         jdbc.update("insert into ds_sandbox(id,name,description,owner_id,project_id,image_id,status,expires_at,network_policy,cpu_cores,memory_gb,gpu_count,storage_gb,created_by,created_at,updated_at) values(?,?,?,?,?,?,'STOPPED',?,?,?,?,?,?,?, ?,?)",
                 id, name, value(request, "description", ""), ownerId, projectId, imageId,
-                LocalDateTime.now().plusDays(days).toString(), networkPolicy, cpu, memory, gpu, storage,
+                expiresAt, networkPolicy, cpu, memory, gpu, storage,
                 value(request, "createdBy", actor()), now, now);
         audit("OPERATION", "SANDBOX_CREATE", "SANDBOX", id, json(request), true);
         // Z-02：创建即按规格预占资源（RESERVED），占住容量直到绑定或释放

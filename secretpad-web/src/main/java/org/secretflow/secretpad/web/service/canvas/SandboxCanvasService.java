@@ -525,7 +525,14 @@ public class SandboxCanvasService {
                 .orElseThrow(() -> new IllegalArgumentException("模板不存在: " + code));
         String now = now();
         String id = "canvas-" + shortId();
-        String canvasName = notBlank(name) ? name : string(tpl.get("name"));
+        String canvasName = (notBlank(name) ? name : string(tpl.get("name"))).trim();
+        Long duplicate = jdbc.queryForObject(
+                "select count(1) from ds_compute_canvas where sandbox_id=? and deleted=0 "
+                        + "and lower(name)=lower(?)",
+                Long.class, sandboxId, canvasName);
+        if (duplicate != null && duplicate > 0) {
+            throw new IllegalArgumentException("同一沙箱内画布名称不能重复: " + canvasName);
+        }
         String graph = json(tpl.get("graph"));
         jdbc.update("insert into ds_compute_canvas(id,project_id,sandbox_id,name,description,graph_json,version,status,created_by,created_at,updated_at,deleted) "
                         + "values(?,?,?,?,?,?,1,'DRAFT',?,?,?,0)",
