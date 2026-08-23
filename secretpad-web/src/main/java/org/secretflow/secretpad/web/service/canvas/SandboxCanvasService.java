@@ -17,6 +17,7 @@ import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.dev.DataDevService;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
 import org.secretflow.secretpad.web.service.dev.ModelMetricsEvaluator;
+import org.secretflow.secretpad.web.service.model.ModelApprovalService;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -29,6 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -51,7 +53,8 @@ import java.util.concurrent.Executors;
  *   <li>解析 {@code ds_compute_canvas.graph_json} → 拓扑排序（检测环）；</li>
  *   <li>逐节点渲染 {@code import modeling_ops} 脚本（虚拟节点 data.table 不执行，直接映射挂载表）；</li>
  *   <li>上游输出表 {@code op_{runId}_{nodeId}} 落沙箱库（{@link SandboxDbService#backfillOperatorTable}）；</li>
- *   <li>ml.* 训练节点成功 → joblib(base64) 保存在画布节点运行记录中，不进入开发制品体系；</li>
+ *   <li>ml.* 训练节点成功 → joblib(base64) 注册为 {@code source='CANVAS'} 的制品与模型（对开发制品列表不可见），
+ *       并回填 {@code ds_compute_node_run.model_id}，供工作流模型保存与 API 发布；</li>
  *   <li>{@code ds_compute_run / ds_compute_node_run} 记录整图/节点状态，节点输出/日志对前端可见。</li>
  * </ol>
  *
@@ -61,12 +64,16 @@ import java.util.concurrent.Executors;
 @Service
 public class SandboxCanvasService {
 
+    /** 画布自动注册产物的来源标记：开发制品/任务列表据此隔离。 */
+    private static final String ARTIFACT_SOURCE_CANVAS = "CANVAS";
+
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
     private final DataDevService dataDevService;
     private final DevJobExecutor devJobExecutor;
     private final SandboxDbService sandboxDb;
     private final DataSandboxMvpService mvp;
+    private final ModelApprovalService modelApprovalService;
     private final SandboxDataControlService dataControl;
 
     private final ExecutorService canvasExecutor = Executors.newSingleThreadExecutor();
@@ -78,6 +85,7 @@ public class SandboxCanvasService {
             DevJobExecutor devJobExecutor,
             SandboxDbService sandboxDb,
             DataSandboxMvpService mvp,
+            ModelApprovalService modelApprovalService,
             SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.mapper = mapper;
@@ -85,6 +93,7 @@ public class SandboxCanvasService {
         this.devJobExecutor = devJobExecutor;
         this.sandboxDb = sandboxDb;
         this.mvp = mvp;
+        this.modelApprovalService = modelApprovalService;
         this.dataControl = dataControl;
     }
 
@@ -707,9 +716,296 @@ public class SandboxCanvasService {
         result.put("excludedFields", excluded);
         result.put("preprocessingSteps", preprocessing);
         result.put("evaluation", modelEvaluation(string(canvasModel.get("model_id")), testId,
-                sandboxId, trainRun, trainNode));
+                sandboxId, trainRun, trainNode, graph, sourceRunId));
         result.put("testHistory", modelTestHistory(string(canvasModel.get("model_id"))));
+        result.put("featureImportance", cachedFeatureImportance(trainRun, trainNode));
+        result.put("treeStructure", cachedTreeStructure(trainRun, trainNode));
         return result;
+    }
+
+    /**
+     * 特征重要性缓存：joblib 模型只能在执行侧解析，此处只读已落库的结果。
+     * 未计算时返回 {@code NOT_COMPUTED}，由 {@link #computeFeatureImportance(String)} 按需触发。
+     */
+    private Map<String, Object> cachedFeatureImportance(Map<String, Object> trainRun, Node trainNode) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("componentCode", trainNode.componentCode);
+        result.put("supported", supportsFeatureImportance(trainNode.componentCode));
+        Map<String, Object> cached = parseMapOrEmpty(string(trainRun.get("feature_importance")));
+        if (cached.isEmpty()) {
+            result.put("status", Boolean.TRUE.equals(result.get("supported")) ? "NOT_COMPUTED" : "UNSUPPORTED");
+            result.put("items", List.of());
+            return result;
+        }
+        result.put("status", "AVAILABLE");
+        result.put("source", cached.get("source"));
+        result.put("computedAt", cached.get("computedAt"));
+        result.put("items", cached.getOrDefault("items", List.of()));
+        return result;
+    }
+
+    /** 树模型读不纯度重要性、线性模型读系数绝对值；其余算子没有可解释的特征权重。 */
+    private boolean supportsFeatureImportance(String componentCode) {
+        return List.of("ml.decision_tree", "ml.xgboost", "ml.lightgbm",
+                "ml.linear_regression", "ml.logistic_regression").contains(componentCode);
+    }
+
+    /**
+     * 按需计算特征重要性：在执行侧加载训练产物 joblib，读取 {@code feature_importances_} 或 {@code coef_}，
+     * 结果写入 {@code ds_compute_node_run.feature_importance} 供报告复用（已计算则直接返回缓存）。
+     */
+    public Map<String, Object> computeFeatureImportance(String canvasModelId) {
+        Map<String, Object> canvasModel = requireCanvasModel(canvasModelId);
+        Map<String, Object> canvas = requireCanvas(string(canvasModel.get("canvas_id")));
+        String sandboxId = string(canvas.get("sandbox_id"));
+        requireUsableSandbox(sandboxId, false);
+        String sourceRunId = string(canvasModel.get("source_run_id"));
+        String modelId = string(canvasModel.get("model_id"));
+        if (!notBlank(sourceRunId) || !notBlank(modelId)) {
+            throw new IllegalArgumentException("当前模型没有绑定训练运行批次，无法计算特征重要性");
+        }
+        List<Map<String, Object>> runs = jdbc.queryForList(
+                "select * from ds_compute_node_run where run_id=? and model_id=? and status='SUCCEEDED' and deleted=0 "
+                        + "order by finished_at desc limit 1",
+                sourceRunId, modelId);
+        if (runs.isEmpty()) {
+            throw new IllegalArgumentException("未找到该模型对应的训练运行记录");
+        }
+        Map<String, Object> trainRun = runs.get(0);
+        GraphModel graph = parseGraph(string(canvasModel.get("graph_json")));
+        Node trainNode = graph.nodeById(string(trainRun.get("node_id")));
+        if (trainNode == null) {
+            throw new IllegalArgumentException("工作流快照中没有找到对应的训练节点");
+        }
+        if (!supportsFeatureImportance(trainNode.componentCode)) {
+            return cachedFeatureImportance(trainRun, trainNode);
+        }
+        Map<String, Object> cached = parseMapOrEmpty(string(trainRun.get("feature_importance")));
+        if (!cached.isEmpty()) {
+            return cachedFeatureImportance(trainRun, trainNode);
+        }
+
+        String modelB64 = string(trainRun.get("model_b64"));
+        if (!notBlank(modelB64)) {
+            throw new IllegalArgumentException("训练运行记录中没有保存模型产物，无法计算特征重要性");
+        }
+        String inputTable = string(trainRun.get("input_table"));
+        List<String> features = stringList(trainNode.params.get("features"));
+        if (features.isEmpty()) {
+            for (Map<String, Object> column : tableSchema(sandboxId, inputTable)) {
+                String name = string(column.get("name"));
+                if (notBlank(name) && !name.equals(string(trainNode.params.get("label")))) {
+                    features.add(name);
+                }
+            }
+        }
+        Map<String, Object> execution = runModelInspection(sandboxId, string(canvasModel.get("canvas_id")),
+                trainNode.id, inputTable, "report.feature_importance", "op_fi_",
+                CanvasFeatureImportanceScript.generate(modelB64, features), "特征重要性计算");
+        @SuppressWarnings("unchecked")
+        List<String> header = (List<String>) execution.get("header");
+        @SuppressWarnings("unchecked")
+        List<List<String>> rows = (List<List<String>>) execution.get("rows");
+        Map<String, Object> payload = featureImportancePayload(header, rows);
+        jdbc.update("update ds_compute_node_run set feature_importance=?,updated_at=? where id=?",
+                json(payload), now(), trainRun.get("id"));
+        audit("CANVAS_FEATURE_IMPORTANCE_COMPUTED", "COMPUTE_NODE_RUN", string(trainRun.get("id")),
+                "canvasModel=" + canvasModelId + " node=" + trainNode.id, true);
+        trainRun.put("feature_importance", json(payload));
+        return cachedFeatureImportance(trainRun, trainNode);
+    }
+
+    /**
+     * 模型产物解析任务：训练产物为 joblib 二进制，服务端无法读取，统一提交到执行侧运行解析脚本。
+     * 与画布节点同通道（{@code channel='canvas'}），不进入数据开发任务列表。
+     */
+    private Map<String, Object> runModelInspection(String sandboxId, String canvasId, String nodeId,
+            String inputTable, String operatorCode, String outputPrefix, String script, String failureLabel) {
+        String outputTable = outputPrefix + shortId();
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("op", operatorCode);
+        String taskId = dataDevService.createCanvasTask(sandboxId, canvasId, nodeId, operatorCode,
+                script, params, List.of(), outputTable);
+        dataDevService.claimCanvasTask(taskId);
+        byte[] inputCsv = sandboxDb.readTableCsv(sandboxId, inputTable);
+        String nodeDomain = string(jdbc.queryForMap(
+                "select owner_id from ds_sandbox where id=? and deleted=0", sandboxId).get("owner_id"));
+        devJobExecutor.submitSandboxChannel(taskId, nodeDomain,
+                Base64.getEncoder().encodeToString(inputCsv), "PYTHON", script, params, List.of(),
+                sandboxId, inputTable, outputTable, new LinkedHashSet<>(Set.of(inputTable)), "canvas");
+        Map<String, Object> execution = devJobExecutor.runAndAwait(taskId);
+        if (!"SUCCEEDED".equals(string(execution.get("status")))) {
+            throw new IllegalStateException(failureLabel + "失败: " + string(execution.get("errorMessage")));
+        }
+        return execution;
+    }
+
+    /** 树结构缓存：与特征重要性同样只读已落库结果，未计算时返回 NOT_COMPUTED。 */
+    private Map<String, Object> cachedTreeStructure(Map<String, Object> trainRun, Node trainNode) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("componentCode", trainNode.componentCode);
+        result.put("supported", supportsTreeStructure(trainNode.componentCode));
+        Map<String, Object> cached = parseMapOrEmpty(string(trainRun.get("tree_structure")));
+        if (cached.isEmpty()) {
+            result.put("status", Boolean.TRUE.equals(result.get("supported")) ? "NOT_COMPUTED" : "UNSUPPORTED");
+            result.put("nodes", List.of());
+            return result;
+        }
+        result.put("status", "AVAILABLE");
+        result.putAll(cached);
+        result.put("status", "AVAILABLE");
+        return result;
+    }
+
+    /** 仅树模型具备可导出的树结构。 */
+    private boolean supportsTreeStructure(String componentCode) {
+        return List.of("ml.decision_tree", "ml.xgboost", "ml.lightgbm").contains(componentCode);
+    }
+
+    /**
+     * 按需导出树结构：在执行侧加载训练产物 joblib，导出指定序号的单棵树（节点数上限 800，超出截断），
+     * 结果写入 {@code ds_compute_node_run.tree_structure} 供报告复用。重复导出同一棵树直接返回缓存。
+     */
+    public Map<String, Object> computeTreeStructure(String canvasModelId, int treeIndex) {
+        Map<String, Object> context = requireTrainingContext(canvasModelId);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> trainRun = (Map<String, Object>) context.get("trainRun");
+        Node trainNode = (Node) context.get("trainNode");
+        String sandboxId = string(context.get("sandboxId"));
+        String canvasId = string(context.get("canvasId"));
+        if (!supportsTreeStructure(trainNode.componentCode)) {
+            return cachedTreeStructure(trainRun, trainNode);
+        }
+        Map<String, Object> cached = parseMapOrEmpty(string(trainRun.get("tree_structure")));
+        if (!cached.isEmpty() && intValue(cached.get("treeIndex"), -1) == treeIndex) {
+            return cachedTreeStructure(trainRun, trainNode);
+        }
+        String modelB64 = string(trainRun.get("model_b64"));
+        if (!notBlank(modelB64)) {
+            throw new IllegalArgumentException("训练运行记录中没有保存模型产物，无法导出树结构");
+        }
+        String inputTable = string(trainRun.get("input_table"));
+        List<String> features = trainingFeatures(sandboxId, trainNode, inputTable);
+        Map<String, Object> execution = runModelInspection(sandboxId, canvasId, trainNode.id, inputTable,
+                "report.tree_structure", "op_ts_",
+                CanvasTreeStructureScript.generate(modelB64, features, treeIndex), "树结构导出");
+        @SuppressWarnings("unchecked")
+        List<String> header = (List<String>) execution.get("header");
+        @SuppressWarnings("unchecked")
+        List<List<String>> rows = (List<List<String>>) execution.get("rows");
+        Map<String, Object> payload = parseMapOrEmpty(joinChunks(header, rows));
+        if (payload.isEmpty()) {
+            throw new IllegalStateException("树结构导出结果无法解析");
+        }
+        payload.put("computedAt", now());
+        jdbc.update("update ds_compute_node_run set tree_structure=?,updated_at=? where id=?",
+                json(payload), now(), trainRun.get("id"));
+        audit("CANVAS_TREE_STRUCTURE_EXPORTED", "COMPUTE_NODE_RUN", string(trainRun.get("id")),
+                "canvasModel=" + canvasModelId + " tree=" + treeIndex, true);
+        trainRun.put("tree_structure", json(payload));
+        return cachedTreeStructure(trainRun, trainNode);
+    }
+
+    /** 分片输出（part/payload 两列）按 part 升序拼回完整 JSON 文本。 */
+    private String joinChunks(List<String> header, List<List<String>> rows) {
+        int partIndex = header == null ? -1 : header.indexOf("part");
+        int payloadIndex = header == null ? -1 : header.indexOf("payload");
+        if (payloadIndex < 0 || rows == null) {
+            return "";
+        }
+        List<List<String>> ordered = new ArrayList<>(rows);
+        if (partIndex >= 0) {
+            ordered.sort(Comparator.comparingInt(row -> partIndex < row.size()
+                    ? intValue(row.get(partIndex), 0) : 0));
+        }
+        StringBuilder text = new StringBuilder();
+        for (List<String> row : ordered) {
+            if (payloadIndex < row.size() && row.get(payloadIndex) != null) {
+                text.append(row.get(payloadIndex));
+            }
+        }
+        return text.toString();
+    }
+
+    /** 训练节点显式选择的特征；未选择时以训练输入表除标签外的全部列为准。 */
+    private List<String> trainingFeatures(String sandboxId, Node trainNode, String inputTable) {
+        List<String> features = stringList(trainNode.params.get("features"));
+        if (!features.isEmpty()) {
+            return features;
+        }
+        String label = string(trainNode.params.get("label"));
+        List<String> resolved = new ArrayList<>();
+        for (Map<String, Object> column : tableSchema(sandboxId, inputTable)) {
+            String name = string(column.get("name"));
+            if (notBlank(name) && !name.equals(label)) {
+                resolved.add(name);
+            }
+        }
+        return resolved;
+    }
+
+    /** 模型报告类接口的公共校验：定位画布模型绑定的训练运行记录与训练节点。 */
+    private Map<String, Object> requireTrainingContext(String canvasModelId) {
+        Map<String, Object> canvasModel = requireCanvasModel(canvasModelId);
+        Map<String, Object> canvas = requireCanvas(string(canvasModel.get("canvas_id")));
+        String sandboxId = string(canvas.get("sandbox_id"));
+        requireUsableSandbox(sandboxId, false);
+        String sourceRunId = string(canvasModel.get("source_run_id"));
+        String modelId = string(canvasModel.get("model_id"));
+        if (!notBlank(sourceRunId) || !notBlank(modelId)) {
+            throw new IllegalArgumentException("当前模型没有绑定训练运行批次，无法解析模型产物");
+        }
+        List<Map<String, Object>> runs = jdbc.queryForList(
+                "select * from ds_compute_node_run where run_id=? and model_id=? and status='SUCCEEDED' and deleted=0 "
+                        + "order by finished_at desc limit 1",
+                sourceRunId, modelId);
+        if (runs.isEmpty()) {
+            throw new IllegalArgumentException("未找到该模型对应的训练运行记录");
+        }
+        Map<String, Object> trainRun = runs.get(0);
+        GraphModel graph = parseGraph(string(canvasModel.get("graph_json")));
+        Node trainNode = graph.nodeById(string(trainRun.get("node_id")));
+        if (trainNode == null) {
+            throw new IllegalArgumentException("工作流快照中没有找到对应的训练节点");
+        }
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("canvasModel", canvasModel);
+        context.put("canvasId", string(canvasModel.get("canvas_id")));
+        context.put("sandboxId", sandboxId);
+        context.put("trainRun", trainRun);
+        context.put("trainNode", trainNode);
+        return context;
+    }
+
+    private Map<String, Object> featureImportancePayload(List<String> header, List<List<String>> rows) {
+        int featureIndex = header == null ? -1 : header.indexOf("feature");
+        int importanceIndex = header == null ? -1 : header.indexOf("importance");
+        int sourceIndex = header == null ? -1 : header.indexOf("source");
+        List<Map<String, Object>> items = new ArrayList<>();
+        String source = "UNSUPPORTED";
+        if (featureIndex >= 0 && importanceIndex >= 0 && rows != null) {
+            for (List<String> row : rows) {
+                if (featureIndex >= row.size() || importanceIndex >= row.size()) {
+                    continue;
+                }
+                if (sourceIndex >= 0 && sourceIndex < row.size() && notBlank(row.get(sourceIndex))) {
+                    source = row.get(sourceIndex);
+                }
+                String name = row.get(featureIndex);
+                if (!notBlank(name)) {
+                    continue;
+                }
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("feature", name);
+                item.put("importance", numberOrText(row.get(importanceIndex)));
+                items.add(item);
+            }
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("source", source);
+        payload.put("computedAt", now());
+        payload.put("items", items);
+        return payload;
     }
 
     private Map<String, Object> modelReportSummary(Map<String, Object> model) {
@@ -722,8 +1018,12 @@ public class SandboxCanvasService {
         return summary;
     }
 
+    /**
+     * 评估结果来源优先级：指定测试批次 &gt; 成功的模型测试记录 &gt; 画布内配置的评估节点 &gt; 训练输出自动评估。
+     * 画布未配置评估节点时按模型任务类型自动计算全部适用指标，配置了则以评估节点产出的指标为准。
+     */
     private Map<String, Object> modelEvaluation(String modelId, String testId, String sandboxId,
-            Map<String, Object> trainRun, Node trainNode) {
+            Map<String, Object> trainRun, Node trainNode, GraphModel graph, String sourceRunId) {
         List<Map<String, Object>> rows;
         if (notBlank(testId)) {
             rows = jdbc.queryForList(
@@ -737,6 +1037,10 @@ public class SandboxCanvasService {
         }
         if (rows.isEmpty()) {
             if (!notBlank(testId)) {
+                Map<String, Object> configured = canvasEvaluation(sandboxId, sourceRunId, graph, trainNode);
+                if (!configured.isEmpty()) {
+                    return configured;
+                }
                 Map<String, Object> recovered = historicalTrainingEvaluation(sandboxId, trainRun, trainNode);
                 if (!recovered.isEmpty()) {
                     return recovered;
@@ -748,6 +1052,7 @@ public class SandboxCanvasService {
         Map<String, Object> evaluation = new LinkedHashMap<>();
         evaluation.put("status", "AVAILABLE");
         evaluation.put("source", "MODEL_TEST");
+        evaluation.put("metricsScope", "CONFIGURED");
         evaluation.put("testId", test.get("id"));
         evaluation.put("runMode", test.get("run_mode"));
         evaluation.put("metricType", test.get("metric_type"));
@@ -758,6 +1063,98 @@ public class SandboxCanvasService {
         evaluation.put("createdAt", test.get("created_at"));
         evaluation.put("finishedAt", test.get("finished_at"));
         return evaluation;
+    }
+
+    /**
+     * 画布内显式配置的评估节点结果：取训练节点下游、同一运行批次内成功执行的评估算子，
+     * 其输出表为 {@code metric/value} 两列，报告按该节点配置的指标展示。
+     */
+    private Map<String, Object> canvasEvaluation(String sandboxId, String runId, GraphModel graph, Node trainNode) {
+        if (graph == null || !notBlank(runId)) {
+            return Map.of();
+        }
+        Set<String> downstream = downstream(graph, trainNode.id);
+        for (Node node : topoSort(graph)) {
+            if (!downstream.contains(node.id) || !CanvasOperatorRegistry.isEvaluation(node.componentCode)) {
+                continue;
+            }
+            List<Map<String, Object>> runs = jdbc.queryForList(
+                    "select * from ds_compute_node_run where run_id=? and node_id=? and status='SUCCEEDED' and deleted=0 "
+                            + "order by finished_at desc limit 1",
+                    runId, node.id);
+            if (runs.isEmpty()) {
+                continue;
+            }
+            Map<String, Object> run = runs.get(0);
+            Map<String, Object> metrics = evaluationNodeMetrics(sandboxId, string(run.get("output_table")));
+            if (metrics.isEmpty()) {
+                continue;
+            }
+            metrics.put("metricType", CanvasOperatorRegistry.metricType(
+                    trainNode.componentCode, trainNode.params.get("task")));
+
+            Map<String, Object> evaluation = new LinkedHashMap<>();
+            evaluation.put("status", "AVAILABLE");
+            evaluation.put("source", "CANVAS_EVALUATION_NODE");
+            evaluation.put("metricsScope", "CONFIGURED");
+            evaluation.put("testId", string(run.get("task_id")));
+            evaluation.put("runMode", "CANVAS_EVALUATION");
+            evaluation.put("metricType", metrics.get("metricType"));
+            evaluation.put("metrics", metrics);
+            evaluation.put("evaluationNode", Map.of(
+                    "nodeId", node.id,
+                    "componentCode", node.componentCode,
+                    "componentName", node.name,
+                    "configuredParams", node.params));
+            evaluation.put("inputSummary", tableSummary(sandboxId, string(run.get("input_table"))));
+            evaluation.put("outputSummary", tableSummary(sandboxId, string(run.get("output_table"))));
+            evaluation.put("resultPreview", Map.of());
+            evaluation.put("createdAt", run.get("created_at"));
+            evaluation.put("finishedAt", run.get("finished_at"));
+            return evaluation;
+        }
+        return Map.of();
+    }
+
+    /** 评估节点输出表（metric/value 两列）→ 指标键值对。 */
+    private Map<String, Object> evaluationNodeMetrics(String sandboxId, String table) {
+        if (!notBlank(table)) {
+            return new LinkedHashMap<>();
+        }
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        try {
+            Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, 200);
+            List<String> columns = schemaNames(preview.get("schema"));
+            int metricIndex = columns.indexOf("metric");
+            int valueIndex = columns.indexOf("value");
+            if (metricIndex < 0 || valueIndex < 0) {
+                return metrics;
+            }
+            for (List<String> row : tableRows(preview.get("rows"))) {
+                if (metricIndex >= row.size() || valueIndex >= row.size()) {
+                    continue;
+                }
+                String name = row.get(metricIndex);
+                if (notBlank(name)) {
+                    metrics.put(name, numberOrText(row.get(valueIndex)));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("评估节点结果读取失败 sandboxId={} table={}: {}", sandboxId, table, e.getMessage());
+            return new LinkedHashMap<>();
+        }
+        return metrics;
+    }
+
+    private Object numberOrText(String value) {
+        if (value == null) {
+            return "";
+        }
+        try {
+            return Double.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
     }
 
     /**
@@ -782,7 +1179,8 @@ public class SandboxCanvasService {
 
             Map<String, Object> evaluation = new LinkedHashMap<>();
             evaluation.put("status", "AVAILABLE");
-            evaluation.put("source", "TRAINING_RESULT_BACKFILL");
+            evaluation.put("source", "AUTO_EVALUATION");
+            evaluation.put("metricsScope", "AUTO");
             evaluation.put("testId", trainRun.get("task_id"));
             evaluation.put("runMode", "TRAINING");
             evaluation.put("metricType", metrics.get("metricType"));
@@ -800,29 +1198,17 @@ public class SandboxCanvasService {
         }
     }
 
+    /**
+     * 画布未配置评估节点时的自动评估：按训练算子的任务类型计算全部适用指标。
+     * 分类含准确率/精确率/召回率/F1/混淆矩阵，具备概率列时补 AUC；回归含 MAE/RMSE/R²；
+     * 聚类含簇数、各簇样本分布与占比。
+     */
     private Map<String, Object> recoveredMetrics(Node trainNode, List<String> columns,
             List<List<String>> rows, int totalRows) {
-        String componentCode = trainNode.componentCode;
-        if ("ml.kmeans".equals(componentCode)) {
-            int clusterIndex = columns.indexOf("cluster");
-            if (clusterIndex < 0) {
-                return Map.of();
-            }
-            Map<String, Integer> distribution = new LinkedHashMap<>();
-            for (List<String> row : rows) {
-                if (clusterIndex < row.size()) {
-                    distribution.merge(row.get(clusterIndex), 1, Integer::sum);
-                }
-            }
-            Map<String, Object> metrics = new LinkedHashMap<>();
-            metrics.put("metricType", "clustering");
-            metrics.put("samples", totalRows);
-            metrics.put("clusterCount", distribution.size());
-            metrics.put("clusterDistribution", distribution);
-            if (rows.size() < totalRows) {
-                metrics.put("distributionSampleRows", rows.size());
-            }
-            return metrics;
+        String metricType = CanvasOperatorRegistry.metricType(
+                trainNode.componentCode, trainNode.params.get("task"));
+        if ("clustering".equals(metricType)) {
+            return clusteringMetrics(columns, rows, totalRows);
         }
 
         String label = string(trainNode.params.get("label"));
@@ -836,19 +1222,117 @@ public class SandboxCanvasService {
         }
         List<String> labels = new ArrayList<>();
         List<String> predictions = new ArrayList<>();
+        List<String> probabilities = new ArrayList<>();
+        int probabilityIndex = columns.indexOf("pred_prob");
         for (List<String> row : rows) {
             if (labelIndex < row.size() && predictionIndex < row.size()) {
                 labels.add(row.get(labelIndex));
                 predictions.add(row.get(predictionIndex));
+                probabilities.add(probabilityIndex >= 0 && probabilityIndex < row.size()
+                        ? row.get(probabilityIndex) : "");
             }
         }
-        String metricType = componentCode.contains("linear_regression") ? "regression" : "classification";
+        if (labels.isEmpty()) {
+            return Map.of();
+        }
         Map<String, Object> metrics = new LinkedHashMap<>(
                 ModelMetricsEvaluator.evaluate(labels, predictions, metricType));
+        metrics.put("samples", labels.size());
+        if ("classification".equals(metricType)) {
+            Double auc = rocAuc(labels, probabilities);
+            if (auc != null) {
+                metrics.put("auc", auc);
+            }
+        }
         if (rows.size() < totalRows) {
             metrics.put("totalRows", totalRows);
         }
         return metrics;
+    }
+
+    private Map<String, Object> clusteringMetrics(List<String> columns, List<List<String>> rows, int totalRows) {
+        int clusterIndex = columns.indexOf("cluster");
+        if (clusterIndex < 0) {
+            return Map.of();
+        }
+        Map<String, Integer> distribution = new LinkedHashMap<>();
+        for (List<String> row : rows) {
+            if (clusterIndex < row.size()) {
+                distribution.merge(row.get(clusterIndex), 1, Integer::sum);
+            }
+        }
+        if (distribution.isEmpty()) {
+            return Map.of();
+        }
+        int counted = distribution.values().stream().mapToInt(Integer::intValue).sum();
+        Map<String, Object> ratios = new LinkedHashMap<>();
+        distribution.forEach((cluster, count) ->
+                ratios.put(cluster, round6(count / (double) counted)));
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("metricType", "clustering");
+        metrics.put("samples", totalRows);
+        metrics.put("clusterCount", distribution.size());
+        metrics.put("clusterDistribution", distribution);
+        metrics.put("clusterRatio", ratios);
+        if (rows.size() < totalRows) {
+            metrics.put("distributionSampleRows", rows.size());
+        }
+        return metrics;
+    }
+
+    /**
+     * 二分类 ROC AUC（按正类概率排序的秩和公式，并列取平均秩）。
+     * 标签非二分类、概率列缺失或存在非数值时返回 {@code null}，由调用方省略该指标。
+     */
+    private Double rocAuc(List<String> labels, List<String> probabilities) {
+        Set<String> classes = new LinkedHashSet<>(labels);
+        if (classes.size() != 2 || probabilities.size() != labels.size()) {
+            return null;
+        }
+        List<String> ordered = new ArrayList<>(classes);
+        Collections.sort(ordered);
+        String positive = ordered.get(1);
+        List<double[]> scored = new ArrayList<>();
+        for (int i = 0; i < labels.size(); i++) {
+            String raw = probabilities.get(i);
+            if (raw == null || raw.isBlank()) {
+                return null;
+            }
+            try {
+                scored.add(new double[]{Double.parseDouble(raw.trim()), positive.equals(labels.get(i)) ? 1 : 0});
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        scored.sort(Comparator.comparingDouble(item -> item[0]));
+        double positives = 0;
+        double negatives = 0;
+        double rankSum = 0;
+        int index = 0;
+        while (index < scored.size()) {
+            int tieEnd = index;
+            while (tieEnd + 1 < scored.size() && scored.get(tieEnd + 1)[0] == scored.get(index)[0]) {
+                tieEnd++;
+            }
+            double averageRank = (index + tieEnd + 2) / 2.0;
+            for (int i = index; i <= tieEnd; i++) {
+                if (scored.get(i)[1] == 1) {
+                    positives++;
+                    rankSum += averageRank;
+                } else {
+                    negatives++;
+                }
+            }
+            index = tieEnd + 1;
+        }
+        if (positives == 0 || negatives == 0) {
+            return null;
+        }
+        return round6((rankSum - positives * (positives + 1) / 2) / (positives * negatives));
+    }
+
+    private static double round6(double value) {
+        return Math.round(value * 1_000_000d) / 1_000_000d;
     }
 
     private Map<String, Object> tableSummary(String sandboxId, String table) {
@@ -1381,9 +1865,14 @@ public class SandboxCanvasService {
             jdbc.update("update ds_compute_node_run set status='SUCCEEDED',task_id=?,input_table=?,output_table=?,"
                             + "result_summary=?,model_b64=?,fit_params=?,finished_at=?,updated_at=? where id=?",
                     taskId, inputTable, outputTable, json(summary), modelB64, fitParams, now(), now(), nodeRunId);
+            boolean modelRegistered = false;
+            if (CanvasOperatorRegistry.isTrain(node.componentCode) && notBlank(modelB64)) {
+                modelRegistered = registerModelFromTrainNode(canvas, node, modelB64, sandboxId, graph, runId);
+            }
             audit("CANVAS_NODE_SUCCEEDED", "COMPUTE_NODE_RUN", nodeRunId,
                     "node=" + node.id + " op=" + node.componentCode + " rows=" + rows.size()
-                            + (notBlank(modelB64) ? " modelCaptured=true" : ""), true);
+                            + (notBlank(modelB64) ? " modelCaptured=true" : "")
+                            + (modelRegistered ? " modelRegistered=true" : ""), true);
         } catch (Exception e) {
             String message = truncate(e.getMessage(), 1900);
             log.error("画布节点执行异常 nodeId={} op={}", node.id, node.componentCode, e);
@@ -1421,6 +1910,63 @@ public class SandboxCanvasService {
     private static final class NodeMarkers {
         String modelB64 = "";
         String preprocJson = "";
+    }
+
+    /**
+     * 训练节点产物注册：{@code ds_dev_artifact(PYTHON) + 版本(predict 脚本) + ds_model(APPROVED)}，按制品名幂等。
+     *
+     * <p>制品与模型均标记 {@code source='CANVAS'}，开发制品列表与任务列表据此过滤，
+     * 画布产物不会出现在数据开发中；模型侧保持可见，否则无法保存工作流模型与发布 API。
+     * 注册失败不影响节点本身的成功状态，仅记录审计与告警——此时工作流模型退化为快照。</p>
+     *
+     * @return 是否成功回填 {@code ds_compute_node_run.model_id}
+     */
+    private boolean registerModelFromTrainNode(Map<String, Object> canvas, Node node, String modelB64, String sandboxId,
+            GraphModel graph, String runId) {
+        try {
+            String projectId = string(canvas.get("project_id"));
+            String artifactName = "画布模型-" + string(canvas.get("name")) + "-" + string(node.name);
+            List<String> features = stringList(node.params.get("features"));
+            String task = string(node.params.get("task"));
+            String kind = node.componentCode.startsWith("ml.") ? node.componentCode.substring(3) : node.componentCode;
+            String preprocess = buildPreprocessScript(node, graph, runId);
+            String script = CanvasPredictScript.generate(modelB64, kind, features, task, preprocess);
+            List<Map<String, Object>> existing = jdbc.queryForList(
+                    "select * from ds_dev_artifact where name=? and sandbox_id=? and deleted=0", artifactName, sandboxId);
+            String artifactId;
+            if (existing.isEmpty()) {
+                Map<String, Object> req = new LinkedHashMap<>();
+                req.put("name", artifactName);
+                req.put("type", "PYTHON");
+                req.put("projectId", projectId);
+                req.put("sandboxId", sandboxId);
+                req.put("source", ARTIFACT_SOURCE_CANVAS);
+                req.put("description", "画布节点 " + node.id + " 训练产物（" + kind + "），推理脚本自动生成");
+                artifactId = string(dataDevService.createArtifact(req).get("id"));
+            } else {
+                artifactId = string(existing.get(0).get("id"));
+            }
+            Map<String, Object> vreq = new LinkedHashMap<>();
+            vreq.put("artifactId", artifactId);
+            vreq.put("contentText", script);
+            vreq.put("description", "训练时间 " + now());
+            String versionId = string(dataDevService.createVersion(vreq).get("id"));
+            Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
+                    artifactName, projectId, artifactId, versionId, sandboxId,
+                    "画布训练产物自动注册（" + kind + "）");
+            String modelId = string(model.get("id"));
+            jdbc.update("update ds_compute_node_run set model_id=?,updated_at=? "
+                            + "where run_id=? and node_id=? and deleted=0",
+                    modelId, now(), runId, node.id);
+            audit("CANVAS_MODEL_AUTO_REGISTERED", "MODEL", modelId, "canvas=" + string(canvas.get("id"))
+                    + " artifact=" + artifactId + " v=" + versionId, true);
+            return true;
+        } catch (Exception e) {
+            log.warn("画布训练产物注册失败 node={} op={}: {}", node.id, node.componentCode, e.getMessage(), e);
+            audit("CANVAS_MODEL_AUTO_REGISTER_FAILED", "COMPUTE_NODE_RUN", node.id,
+                    "canvas=" + string(canvas.get("id")) + " error=" + truncate(e.getMessage(), 400), false);
+            return false;
+        }
     }
 
     /* ====================== predict 脚本预处理链复刻 ====================== */

@@ -89,6 +89,27 @@ public final class CanvasOperatorRegistry {
         return "ml.kmeans".equals(code);
     }
 
+    /** 是否模型评估算子（画布内显式配置的评估节点）。 */
+    public static boolean isEvaluation(String code) {
+        return CATEGORY_EVAL.equals(string(byCode(code).map(op -> op.get("category")).orElse("")));
+    }
+
+    /**
+     * 训练算子的评估类型：{@code classification / regression / clustering}。
+     * 树模型等同时支持两类任务的算子以节点 {@code task} 参数为准。
+     */
+    public static String metricType(String code, Object taskParam) {
+        if (outputsCluster(code)) {
+            return "clustering";
+        }
+        String task = string(taskParam).trim().toLowerCase(Locale.ROOT);
+        if ("regression".equals(task) || "classification".equals(task)) {
+            return task;
+        }
+        return "ml.linear_regression".equals(code) ? "regression" : "classification";
+    }
+
+
     /** 组件目录条目（与 DataComputeService.components() 既有形状一致）。 */
     public static List<Map<String, Object>> builtInComponents() {
         List<Map<String, Object>> rows = new ArrayList<>();

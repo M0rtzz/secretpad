@@ -188,9 +188,11 @@ public class DataDevService {
         String id = "da-" + shortId();
         String createdBy = actor();
         String now = now();
-        jdbc.update("insert into ds_dev_artifact(id,name,type,description,latest_version,created_by,created_at,updated_at,deleted,project_id,sandbox_id)"
-                        + " values(?,?,?,?,0,?,?,?,0,?,?)",
-                id, name, type, string(request.get("description")), createdBy, now, now, projectId, sandboxId);
+        String source = notBlank(string(request.get("source")))
+                ? string(request.get("source")).trim().toUpperCase(Locale.ROOT) : "DEV";
+        jdbc.update("insert into ds_dev_artifact(id,name,type,description,latest_version,created_by,created_at,updated_at,deleted,project_id,sandbox_id,source)"
+                        + " values(?,?,?,?,0,?,?,?,0,?,?,?)",
+                id, name, type, string(request.get("description")), createdBy, now, now, projectId, sandboxId, source);
         audit("DEV_ARTIFACT_CREATE", "DEV_ARTIFACT", id, "type=" + type, true);
         dispatch("dev.artifact.created", Map.of("id", id, "name", name, "type", type));
         return artifactDetail(id);
@@ -222,7 +224,9 @@ public class DataDevService {
     }
 
     public List<Map<String, Object>> listArtifacts(String type, String keyword, String sandboxId) {
+        // 画布训练产物按来源标记隔离；名称匹配用于兜底 V39 之前落库、来源未回填的历史数据
         StringBuilder sql = new StringBuilder("select * from ds_dev_artifact where deleted=0 "
+                + "and coalesce(source,'DEV')<>'CANVAS' "
                 + "and not (name like '画布模型-%' and description like '画布节点 %训练产物%')");
         List<Object> args = new ArrayList<>();
         if (notBlank(sandboxId)) {

@@ -110,6 +110,22 @@ public class SandboxCanvasController {
         return SecretPadResponse.success(service.modelReport(canvasModelId, testId));
     }
 
+    /** 按需计算特征重要性：树模型读不纯度重要性、线性模型读系数绝对值，结果落库后由报告接口复用。 */
+    @PostMapping("/models/feature-importance")
+    public SecretPadResponse<Map<String, Object>> featureImportance(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(
+                service.computeFeatureImportance(String.valueOf(request.get("canvasModelId"))));
+    }
+
+    /** 按需导出树结构：树模型加载 joblib 后导出指定序号的单棵树，结果落库后由报告接口复用。 */
+    @PostMapping("/models/tree-structure")
+    public SecretPadResponse<Map<String, Object>> treeStructure(@RequestBody Map<String, Object> request) {
+        Object treeIndex = request.get("treeIndex");
+        return SecretPadResponse.success(service.computeTreeStructure(
+                String.valueOf(request.get("canvasModelId")),
+                treeIndex instanceof Number number ? number.intValue() : 0));
+    }
+
     @GetMapping("/models/candidates")
     public SecretPadResponse<List<Map<String, Object>>> modelCandidates(@RequestParam String canvasId) {
         return SecretPadResponse.success(service.modelCandidates(canvasId));
