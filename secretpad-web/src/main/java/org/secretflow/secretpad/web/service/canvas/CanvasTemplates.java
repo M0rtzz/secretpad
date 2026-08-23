@@ -33,18 +33,18 @@ public final class CanvasTemplates {
 
     /** 银行信用风控二分类：高额交易风险标签 → 清洗 → 标准化 → 逻辑回归 → 二分类评估。 */
     private static Map<String, Object> creditRisk() {
-        Graph g = new Graph();
-        String n1 = g.node("n1", "data.table", "数据资源", Map.of("table", ""));
-        String n2 = g.node("n2", "preprocessing.derive", "特征派生-风险标签",
+        Graph g = new Graph("credit-risk");
+        String n1 = g.node("data.table", "数据资源", Map.of("table", ""));
+        String n2 = g.node("preprocessing.derive", "特征派生-风险标签",
                 Map.of("expression", "trans_amount > 30000", "new_column", "risk_label", "cast", "int"));
-        String n3 = g.node("n3", "preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
-        String n4 = g.node("n4", "preprocessing.outlier", "异常值处理",
+        String n3 = g.node("preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
+        String n4 = g.node("preprocessing.outlier", "异常值处理",
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "iqr", "action", "clip", "threshold", 1.5));
-        String n5 = g.node("n5", "preprocessing.standardize", "标准化",
+        String n5 = g.node("preprocessing.standardize", "标准化",
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "zscore"));
-        String n6 = g.node("n6", "ml.logistic_regression", "逻辑回归",
+        String n6 = g.node("ml.logistic_regression", "逻辑回归",
                 Map.of("features", List.of("balance", "trans_amount"), "label", "risk_label", "C", 1.0, "max_iter", 1000));
-        String n7 = g.node("n7", "ml.binary_classification", "二分类评估",
+        String n7 = g.node("ml.binary_classification", "二分类评估",
                 Map.of("label", "risk_label", "pred", "pred", "pred_prob", "pred_prob", "threshold", 0.5));
         g.edge(n1, n2);
         g.edge(n2, n3);
@@ -58,14 +58,14 @@ public final class CanvasTemplates {
 
     /** 客户流失预警 K-Means：标准化 → 无监督聚类（balance/trans_amount）→ 相关系数洞察。 */
     private static Map<String, Object> churnKMeans() {
-        Graph g = new Graph();
-        String n1 = g.node("n1", "data.table", "数据资源", Map.of("table", ""));
-        String n2 = g.node("n2", "preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
-        String n3 = g.node("n3", "preprocessing.standardize", "标准化",
+        Graph g = new Graph("churn-kmeans");
+        String n1 = g.node("data.table", "数据资源", Map.of("table", ""));
+        String n2 = g.node("preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
+        String n3 = g.node("preprocessing.standardize", "标准化",
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "zscore"));
-        String n4 = g.node("n4", "ml.kmeans", "KMeans 聚类",
+        String n4 = g.node("ml.kmeans", "KMeans 聚类",
                 Map.of("features", List.of("balance", "trans_amount"), "n_clusters", 3, "max_iter", 300));
-        String n5 = g.node("n5", "stats.correlation", "相关系数", Map.of("method", "pearson"));
+        String n5 = g.node("stats.correlation", "相关系数", Map.of("method", "pearson"));
         g.edge(n1, n2);
         g.edge(n2, n3);
         g.edge(n3, n4);
@@ -76,16 +76,16 @@ public final class CanvasTemplates {
 
     /** 收入预测线性回归：派生收入指标 → 标准化 → 线性回归 → 回归评估。 */
     private static Map<String, Object> incomeRegression() {
-        Graph g = new Graph();
-        String n1 = g.node("n1", "data.table", "数据资源", Map.of("table", ""));
-        String n2 = g.node("n2", "preprocessing.derive", "特征派生-收入指标",
+        Graph g = new Graph("income-regression");
+        String n1 = g.node("data.table", "数据资源", Map.of("table", ""));
+        String n2 = g.node("preprocessing.derive", "特征派生-收入指标",
                 Map.of("expression", "balance * 0.5 + trans_amount", "new_column", "income", "cast", "float"));
-        String n3 = g.node("n3", "preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
-        String n4 = g.node("n4", "preprocessing.standardize", "标准化",
+        String n3 = g.node("preprocessing.fillna", "缺失值处理", Map.of("columns", List.of(), "method", "mean"));
+        String n4 = g.node("preprocessing.standardize", "标准化",
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "zscore"));
-        String n5 = g.node("n5", "ml.linear_regression", "线性回归",
+        String n5 = g.node("ml.linear_regression", "线性回归",
                 Map.of("features", List.of("balance", "trans_amount"), "label", "income", "fit_intercept", true));
-        String n6 = g.node("n6", "ml.regression_evaluation", "回归评估",
+        String n6 = g.node("ml.regression_evaluation", "回归评估",
                 Map.of("label", "income", "pred", "pred"));
         g.edge(n1, n2);
         g.edge(n2, n3);
@@ -110,9 +110,19 @@ public final class CanvasTemplates {
     private static final class Graph {
         private final List<Map<String, Object>> nodes = new ArrayList<>();
         private final List<Map<String, Object>> edges = new ArrayList<>();
+        private final String idPrefix;
         private int index;
 
-        private String node(String id, String componentCode, String name, Map<String, Object> params) {
+        private Graph(String idPrefix) {
+            this.idPrefix = idPrefix;
+        }
+
+        /**
+         * 节点 ID 必须满足前端契约 {@code <dagId>-node-<序号>}，前端解析节点编号时依赖该格式，
+         * 不合规的 ID 会导致画布节点详情渲染失败。
+         */
+        private String node(String componentCode, String name, Map<String, Object> params) {
+            String id = idPrefix + "-node-" + (index + 1);
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("componentCode", componentCode);
             data.put("name", name);
