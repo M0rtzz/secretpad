@@ -604,6 +604,9 @@ public class ProjectServiceImpl implements ProjectService {
     @Override
     public String createP2PProject(CreateProjectRequest request) {
         String ownerId = UserContext.getUser().getOwnerId();
+        if (projectRepository.existsByOwnerIdAndName(ownerId, request.getName())) {
+            throw SecretpadException.of(ProjectErrorCode.PROJECT_NAME_ALREADY_EXISTS);
+        }
         ProjectDO projectDO =
                 ProjectDO.Factory.newP2PProject(request.getName(), request.getDescription(), request.getComputeMode(), request.getComputeFunc(), ProjectInfoDO.builder().teeDomainId(request.getTeeNodeId()).build(), ownerId);
         if (request.getDevelopmentModes() != null) {

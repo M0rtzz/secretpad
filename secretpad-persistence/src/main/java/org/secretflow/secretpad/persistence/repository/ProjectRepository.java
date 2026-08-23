@@ -35,6 +35,8 @@ import java.util.List;
 @Repository
 public interface ProjectRepository extends BaseRepository<ProjectDO, String> {
 
+    boolean existsByOwnerIdAndName(String ownerId, String name);
+
     /**
      * Query project list by status for p2p mode
      *

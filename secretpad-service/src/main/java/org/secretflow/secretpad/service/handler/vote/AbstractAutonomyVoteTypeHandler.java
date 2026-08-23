@@ -101,11 +101,7 @@ public abstract class AbstractAutonomyVoteTypeHandler extends AbstractVoteTypeHa
             }
         }
         String projectId = projectApprovalConfigDO.getProjectId();
-        Optional<ProjectDO> projectDOOptional = projectRepository.findById(projectId);
-        if (projectDOOptional.isEmpty()) {
-            throw SecretpadException.of(ProjectErrorCode.PROJECT_NOT_EXISTS);
-        }
-        ProjectDO projectDO = projectDOOptional.get();
+        ProjectDO projectDO = projectForMessage(projectId, voteRequestDO);
         String projectName = projectDO.getName();
         ProjectCreateMessageDetail projectCreateMessageDetail = ProjectCreateMessageDetail.builder()
                 .projectName(projectName)
@@ -145,13 +141,37 @@ public abstract class AbstractAutonomyVoteTypeHandler extends AbstractVoteTypeHa
             throw SecretpadException.of(VoteErrorCode.PROJECT_VOTE_NOT_EXISTS);
         }
         ProjectApprovalConfigDO projectApprovalConfigDO = projectApprovalConfigDOOptional.get();
-        Optional<ProjectDO> projectDOOptional = projectRepository.findById(projectApprovalConfigDO.getProjectId());
-        ProjectDO projectDO = projectDOOptional.get();
+        VoteRequestDO voteRequestDO = voteRequestRepository.findById(voteID)
+                .orElseThrow(() -> SecretpadException.of(VoteErrorCode.VOTE_NOT_EXISTS));
+        ProjectDO projectDO = projectForMessage(projectApprovalConfigDO.getProjectId(), voteRequestDO);
         return ProjectApprovalCustomizedMessage.builder()
                 .computeFunc(projectDO.getComputeFunc())
                 .projectId(projectDO.getProjectId())
                 .computeMode(projectDO.getComputeMode())
                 .build();
+    }
+
+    private ProjectDO projectForMessage(String projectId, VoteRequestDO voteRequestDO) {
+        return projectRepository.findById(projectId).orElseGet(() -> projectSnapshot(voteRequestDO));
+    }
+
+    /** 拒绝后项目已删除，消息中心从审批请求内保存的项目快照读取信息。 */
+    private ProjectDO projectSnapshot(VoteRequestDO voteRequestDO) {
+        VoteRequestMessage requestMessage = JsonUtils.toJavaObject(
+                voteRequestDO.getRequestMsg(), VoteRequestMessage.class);
+        VoteRequestBody requestBody = JsonUtils.toJavaObject(
+                new String(Base64Utils.decode(requestMessage.getBody())), VoteRequestBody.class);
+        String action = requestBody.getRejectedAction();
+        int separator = action == null ? -1 : action.indexOf(',');
+        if (separator < 0 || separator == action.length() - 1) {
+            throw SecretpadException.of(ProjectErrorCode.PROJECT_NOT_EXISTS);
+        }
+        ProjectCallBackAction callbackAction = JsonUtils.toJavaObject(
+                action.substring(separator + 1), ProjectCallBackAction.class);
+        if (callbackAction == null || callbackAction.getProjectDO() == null) {
+            throw SecretpadException.of(ProjectErrorCode.PROJECT_NOT_EXISTS);
+        }
+        return callbackAction.getProjectDO();
     }
 
     @Override

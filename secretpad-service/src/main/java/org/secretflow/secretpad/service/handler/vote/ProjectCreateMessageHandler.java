@@ -185,9 +185,8 @@ public class ProjectCreateMessageHandler extends AbstractAutonomyVoteTypeHandler
 
     @Override
     protected String getRejectAction(String initiatorId, AbstractVoteConfig voteConfig) {
-        ProjectCallBackAction projectRejectedCallbackAction = getApprovedCallBackAction(voteConfig);
-        projectRejectedCallbackAction.getProjectDO().setStatus(ProjectStatusEnum.ARCHIVED.getCode());
-        return VoteTypeEnum.PROJECT_ARCHIVE.name() + "," + JsonUtils.toJSONString(projectRejectedCallbackAction);
+        ProjectCallBackAction rejectedCallbackAction = getApprovedCallBackAction(voteConfig);
+        return VoteTypeEnum.PROJECT_CREATE.name() + "," + JsonUtils.toJSONString(rejectedCallbackAction);
     }
 
     @Override
@@ -290,27 +289,22 @@ public class ProjectCreateMessageHandler extends AbstractAutonomyVoteTypeHandler
     @Override
     @Transactional
     public void doCallBackRejected(VoteRequestDO voteRequestDO) {
-        if (!envService.isCurrentInstEnvironment(voteRequestDO.getInitiator())) {
-            LOGGER.info("not initiator return");
-            return;
-        }
         VoteRequestBody voteRequestBody = getVoteRequestBody(voteRequestDO);
         String rejectedActionStr = voteRequestBody.getRejectedAction();
-        String rejectedAction = rejectedActionStr.substring(VoteTypeEnum.PROJECT_ARCHIVE.name().length() + 1);
+        String rejectedAction = rejectedActionStr.substring(VoteTypeEnum.PROJECT_CREATE.name().length() + 1);
         LOGGER.info("rejectedAction = {}", rejectedAction);
         ProjectCallBackAction projectCallBackAction = JsonUtils.toJavaObject(rejectedAction, ProjectCallBackAction.class);
         ProjectDO projectDO = projectCallBackAction.getProjectDO();
         List<ProjectInstDO> projectInstDOS = projectCallBackAction.getProjectInstDOS();
         Map<String, String> projectInstMap = projectInstDOS.stream().collect(Collectors.toMap(ProjectInstDO::getNodeId, ProjectInstDO::getProjectId));
-        List<ProjectNodeDO> projectNodeDOS = projectCallBackAction.getProjectNodeDOS();
         String inst_id = InstServiceImpl.INST_ID;
         if (projectInstMap.containsKey(inst_id)) {
-            projectRepository.save(projectDO);
-            projectDO.setStatus(ProjectStatusEnum.ARCHIVED.getCode());
-            projectInstRepository.deleteAll(projectInstDOS);
-            projectNodeRepository.deleteAll(projectNodeDOS);
+            String projectId = projectDO.getProjectId();
+            projectInstRepository.deleteByUpkProjectId(projectId);
+            projectNodeRepository.deleteByUpkProjectId(projectId);
+            projectRepository.findById(projectId).ifPresent(projectRepository::delete);
             success(voteRequestDO);
-            LOGGER.info("doCallBackRejected success, project {} ARCHIVED", projectDO.getName());
+            LOGGER.info("doCallBackRejected success, project {} deleted", projectDO.getName());
         } else {
             String err = String.format("doCallBackRejected error,voters does not has party : %s", inst_id);
             LOGGER.error("doCallBackRejected error,voters does not has party : {}", inst_id);

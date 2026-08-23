@@ -67,6 +67,8 @@ public enum ProjectErrorCode implements ErrorCode {
     NON_OUR_CREATION_CAN_VIEWED(202011517),
 
     PROJECT_CREATE_FAILED(202011518),
+
+    PROJECT_NAME_ALREADY_EXISTS(202011519),
     ;
 
 
