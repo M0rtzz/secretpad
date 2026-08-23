@@ -19,8 +19,8 @@ import java.util.List;
  * Z-06 受控模型 API 调用守卫（纯类）。
  *
  * <p>调用统一守卫顺序（在 {@code ModelApiService.invoke} 内对凭证调用与 User-Token 调用一致执行）：
- * 记录存在 → 启用 → 有效时间窗口 → 调用方 IP 白名单 → 授权用户名单。空白名单/空授权列表表示
- * 「不限制」，时间窗口解析失败按失败关闭处理。</p>
+ * 记录存在 → 启用 → 有效时间窗口 → 调用方 IP 白名单 → 授权用户名单。空 IP 白名单表示
+ * 「不限制」，空授权列表表示仅允许凭据调用；时间窗口解析失败按失败关闭处理。</p>
  */
 public final class ModelApiGuard {
 
@@ -90,14 +90,14 @@ public final class ModelApiGuard {
     }
 
     /**
-     * 调用方用户名是否在授权名单内（空授权列表 → 放行；通常为空表示「仅凭证调用」）。
+     * 调用方用户名是否在授权名单内（空授权列表 → 拒绝 User-Token 调用）。
      */
     public static boolean userAllowed(String name, List<String> authorizedUsers) {
         if (authorizedUsers == null || authorizedUsers.isEmpty() || isBlank(name)) {
-            return true;
+            return false;
         }
         for (String u : authorizedUsers) {
-            if (u != null && u.trim().equals(name)) {
+            if (u != null && u.trim().equalsIgnoreCase(name.trim())) {
                 return true;
             }
         }

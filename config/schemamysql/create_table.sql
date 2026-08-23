@@ -312,9 +312,13 @@ create table if not exists `user_accounts`
     `password_hash`                varchar(128) not null, -- password_hash
     `owner_type`                   varchar(16) default 'CENTER' not null,
     `owner_id`                     varchar(64) default 'kuscia-system' not null,
+    `display_name`                 varchar(64) default '' not null,
+    `account_status`               varchar(16) default 'ENABLED' not null,
+    `last_login_at`                datetime default null,
     `passwd_reset_failed_attempts` int default null,
     `gmt_passwd_reset_release`     datetime default null,
     `is_deleted`                   tinyint(1) default '0' not null, -- delete flag
+    `active_name`                  varchar(128) generated always as (case when `is_deleted` = 0 then lower(`name`) else null end) stored,
     `gmt_create`                   datetime default current_timestamp not null, -- create time
     `gmt_modified`                 datetime default current_timestamp not null, -- modified time
     `failed_attempts`              int default null,
@@ -322,6 +326,7 @@ create table if not exists `user_accounts`
     INDEX `idx_name` (`name`)
 );
 
+create unique index `uniq_active_user_accounts_name` on `user_accounts` (`active_name`);
 create table if not exists `user_tokens`
 (
     `id`           int auto_increment primary key,

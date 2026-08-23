@@ -96,6 +96,9 @@ public class ModelApiService {
     @Value("${secretpad.deploy-mode:}")
     private String deployMode;
 
+    @Value("${secretpad.auth.pad_name:admin}")
+    private String adminName;
+
     @Value("${secretpad.data-sandbox.model.api.max-rows:1000}")
     private int maxRows;
 
@@ -200,6 +203,7 @@ public class ModelApiService {
         String appId = "ai-" + shortId();
         String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
         String now = now();
+        authorizedUsers = validateAuthorizedUsers(authorizedUsers, List.of());
         jdbc.update("insert into ds_model_api(id,model_id,name,description,status,app_id,secret_hash,authorized_users,"
                         + "ip_whitelist,valid_from,valid_to,call_count,last_called_at,created_by,created_at,updated_at,deleted)"
                         + " values(?,?,?,?,'ENABLED',?,?,?,?,?,?,0,'',?,?,?,0)",
@@ -211,7 +215,7 @@ public class ModelApiService {
                 now, now, modelId);
         audit("MODEL_API_CREATE", "MODEL_API", id, "model=" + modelId + " appId=" + appId, true);
         dispatch("model.api.created", Map.of("id", id, "modelId", modelId, "appId", appId));
-        Map<String, Object> result = new LinkedHashMap<>(requireApi(id));
+        Map<String, Object> result = new LinkedHashMap<>(enrichApi(requireApi(id)));
         result.put("secret", secret);
         result.put("notice", "调用密钥只显示一次，请立即保存");
         return result;
@@ -246,8 +250,13 @@ public class ModelApiService {
         String now = now();
         String name = value(request, "name", string(api.get("name")));
         String description = value(request, "description", string(api.get("description")));
-        List<String> authorizedUsers = parseStringList(jsonArrayString(request.get("authorizedUsers"),
-                string(api.get("authorized_users"))));
+        List<String> existingAuthorizedUsers = parseStringList(
+                string(api.get("authorized_users")));
+        List<String> authorizedUsers = request.containsKey("authorizedUsers")
+                ? validateAuthorizedUsers(
+                        parseStringList(jsonArrayString(request.get("authorizedUsers"), "[]")),
+                        existingAuthorizedUsers)
+                : existingAuthorizedUsers;
         List<String> ipWhitelist = parseStringList(jsonArrayString(request.get("ipWhitelist"),
                 string(api.get("ip_whitelist"))));
         String validFrom = value(request, "validFrom", string(api.get("valid_from")));
@@ -293,6 +302,34 @@ public class ModelApiService {
         jdbc.update("update ds_model_api set deleted=1,updated_at=? where id=? and deleted=0", now(), id);
         audit("MODEL_API_DELETE", "MODEL_API", id, "", true);
         dispatch("model.api.deleted", Map.of("id", id));
+    }
+
+    /**
+     * Remove a deleted account from every model API authorization list.
+     */
+    public void removeAuthorizedUser(String account) {
+        if (!notBlank(account)) {
+            return;
+        }
+        List<Map<String, Object>> apis = jdbc.queryForList(
+                "select id, authorized_users from ds_model_api where deleted=0");
+        for (Map<String, Object> api : apis) {
+            String id = string(api.get("id"));
+            try {
+                List<String> users = parseStringList(string(api.get("authorized_users")));
+                boolean removed = users.removeIf(
+                        user -> user != null
+                                && user.trim().equalsIgnoreCase(account.trim()));
+                if (removed) {
+                    jdbc.update(
+                            "update ds_model_api set authorized_users=?,updated_at=? "
+                                    + "where id=? and deleted=0",
+                            json(users), now(), id);
+                }
+            } catch (IllegalArgumentException e) {
+                log.warn("Skip malformed authorized_users for model api {}", id, e);
+            }
+        }
     }
 
     /* ============================== 凭证校验（LoginInterceptor） ============================== */
@@ -631,6 +668,8 @@ public class ModelApiService {
     private Map<String, Object> enrichApi(Map<String, Object> api) {
         Map<String, Object> result = new LinkedHashMap<>(api);
         result.remove("secret_hash");
+        result.put("authorized_users", parseStringList(string(api.get("authorized_users"))));
+        result.put("ip_whitelist", parseStringList(string(api.get("ip_whitelist"))));
         String modelId = string(api.get("model_id"));
         if (notBlank(modelId)) {
             try {
@@ -732,6 +771,54 @@ public class ModelApiService {
             throw new IllegalArgumentException(ModelErrors.MODEL_NOT_FOUND + ": 模型 API 不存在: " + appId);
         }
         return new LinkedHashMap<>(rows.get(0));
+    }
+
+    private List<String> validateAuthorizedUsers(
+            List<String> requestedUsers, List<String> retainedAuthorizedUsers) {
+        if (requestedUsers == null || requestedUsers.isEmpty()) {
+            return new ArrayList<>();
+        }
+        String ownerId = UserContext.getUser().getOwnerId();
+        Set<String> normalizedUsers = new LinkedHashSet<>();
+        Set<String> retainedUsers = new LinkedHashSet<>();
+        if (retainedAuthorizedUsers != null) {
+            for (String user : retainedAuthorizedUsers) {
+                if (notBlank(user)) {
+                    retainedUsers.add(user.trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        List<String> result = new ArrayList<>();
+        for (String requestedUser : requestedUsers) {
+            String normalized = requestedUser == null
+                    ? ""
+                    : requestedUser.trim().toLowerCase(Locale.ROOT);
+            if (!notBlank(normalized) || !normalizedUsers.add(normalized)) {
+                continue;
+            }
+            List<Map<String, Object>> matches = jdbc.queryForList(
+                    "select name, account_status from user_accounts "
+                            + "where (owner_id=? or lower(name)=lower(?)) "
+                            + "and lower(name)=? and is_deleted=0 limit 1",
+                    ownerId,
+                    adminName,
+                    normalized);
+            if (matches.isEmpty()) {
+                throw new IllegalArgumentException(
+                        ModelErrors.MODEL_PARAM_INVALID
+                                + ": 授权用户不存在或已删除: " + requestedUser);
+            }
+            Map<String, Object> match = matches.get(0);
+            boolean enabled = "ENABLED".equalsIgnoreCase(
+                    string(match.get("account_status")));
+            if (!enabled && !retainedUsers.contains(normalized)) {
+                throw new IllegalArgumentException(
+                        ModelErrors.MODEL_PARAM_INVALID
+                                + ": 已停用用户不能新增授权: " + requestedUser);
+            }
+            result.add(string(match.get("name")));
+        }
+        return result;
     }
 
     private List<String> parseStringList(String json) {

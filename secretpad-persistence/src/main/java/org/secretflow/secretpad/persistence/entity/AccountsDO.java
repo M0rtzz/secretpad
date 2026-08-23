@@ -41,7 +41,7 @@ import java.time.LocalDateTime;
 @ToString
 @Getter
 @Setter
-@SQLDelete(sql = "update user_accounts set is_deleted = 1 where inst_id = ?")
+@SQLDelete(sql = "update user_accounts set is_deleted = 1 where name = ? and is_deleted = 0")
 @Where(clause = "is_deleted = 0")
 public class AccountsDO extends BaseAggregationRoot<AccountsDO> {
     /**
@@ -69,6 +69,28 @@ public class AccountsDO extends BaseAggregationRoot<AccountsDO> {
      */
     @Column(name = "owner_id", nullable = false)
     private String ownerId;
+
+    /**
+     * User display name
+     */
+    @Column(name = "display_name", nullable = false)
+    @Builder.Default
+    private String displayName = "";
+
+    /**
+     * ENABLED or DISABLED
+     */
+    @Column(name = "account_status", nullable = false)
+    @Builder.Default
+    private String accountStatus = "ENABLED";
+
+    /**
+     * Last successful login time
+     */
+    @Column(name = "last_login_at")
+    @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    @Convert(converter = SqliteLocalDateTimeConverter.class)
+    private LocalDateTime lastLoginAt;
 
     /**
      * login failed attempts
