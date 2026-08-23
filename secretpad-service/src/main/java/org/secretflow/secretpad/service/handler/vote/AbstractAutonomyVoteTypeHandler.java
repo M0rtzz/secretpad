@@ -17,7 +17,6 @@
 package org.secretflow.secretpad.service.handler.vote;
 
 import org.secretflow.secretpad.common.errorcode.InstErrorCode;
-import org.secretflow.secretpad.common.errorcode.ProjectErrorCode;
 import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.errorcode.VoteErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
@@ -152,26 +151,37 @@ public abstract class AbstractAutonomyVoteTypeHandler extends AbstractVoteTypeHa
     }
 
     private ProjectDO projectForMessage(String projectId, VoteRequestDO voteRequestDO) {
-        return projectRepository.findById(projectId).orElseGet(() -> projectSnapshot(voteRequestDO));
+        return projectRepository.findById(projectId)
+                .orElseGet(() -> projectSnapshot(projectId, voteRequestDO));
     }
 
-    /** 拒绝后项目已删除，消息中心从审批请求内保存的项目快照读取信息。 */
-    private ProjectDO projectSnapshot(VoteRequestDO voteRequestDO) {
-        VoteRequestMessage requestMessage = JsonUtils.toJavaObject(
-                voteRequestDO.getRequestMsg(), VoteRequestMessage.class);
-        VoteRequestBody requestBody = JsonUtils.toJavaObject(
-                new String(Base64Utils.decode(requestMessage.getBody())), VoteRequestBody.class);
-        String action = requestBody.getRejectedAction();
-        int separator = action == null ? -1 : action.indexOf(',');
-        if (separator < 0 || separator == action.length() - 1) {
-            throw SecretpadException.of(ProjectErrorCode.PROJECT_NOT_EXISTS);
+    /**
+     * 拒绝后项目已删除，消息中心从审批请求内保存的项目快照读取信息；
+     * 快照缺失时退化为仅保留项目标识的占位对象，避免单条历史消息导致整个列表查询失败。
+     */
+    private ProjectDO projectSnapshot(String projectId, VoteRequestDO voteRequestDO) {
+        ProjectDO snapshot = parseProjectSnapshot(voteRequestDO);
+        return snapshot != null ? snapshot : ProjectDO.builder().projectId(projectId).build();
+    }
+
+    private ProjectDO parseProjectSnapshot(VoteRequestDO voteRequestDO) {
+        try {
+            VoteRequestMessage requestMessage = JsonUtils.toJavaObject(
+                    voteRequestDO.getRequestMsg(), VoteRequestMessage.class);
+            VoteRequestBody requestBody = JsonUtils.toJavaObject(
+                    new String(Base64Utils.decode(requestMessage.getBody())), VoteRequestBody.class);
+            String action = requestBody.getRejectedAction();
+            int separator = action == null ? -1 : action.indexOf(',');
+            if (separator < 0 || separator == action.length() - 1) {
+                return null;
+            }
+            ProjectCallBackAction callbackAction = JsonUtils.toJavaObject(
+                    action.substring(separator + 1), ProjectCallBackAction.class);
+            return callbackAction == null ? null : callbackAction.getProjectDO();
+        } catch (Exception e) {
+            LOGGER.warn("parse project snapshot failed, voteID = {}", voteRequestDO.getVoteID(), e);
+            return null;
         }
-        ProjectCallBackAction callbackAction = JsonUtils.toJavaObject(
-                action.substring(separator + 1), ProjectCallBackAction.class);
-        if (callbackAction == null || callbackAction.getProjectDO() == null) {
-            throw SecretpadException.of(ProjectErrorCode.PROJECT_NOT_EXISTS);
-        }
-        return callbackAction.getProjectDO();
     }
 
     @Override

@@ -235,6 +235,25 @@ public class DataComputeService {
         return row("select * from ds_compute_canvas where id=? and sandbox_id=?", id, sandboxId);
     }
 
+    @Transactional
+    public Map<String, Object> deleteCanvas(Map<String, Object> request) {
+        String id = required(request, "id");
+        String sandboxId = required(request, "sandboxId");
+        requireUsableSandbox(sandboxId, true);
+        Map<String, Object> canvas = row(
+                "select * from ds_compute_canvas where id=? and sandbox_id=? and deleted=0", id, sandboxId);
+        if (!Objects.equals(actor(), string(canvas.get("created_by")))) {
+            throw new SecurityException("仅画布创建人可删除");
+        }
+        String now = now();
+        jdbc.update("update ds_compute_canvas set deleted=1,updated_at=? where id=? and sandbox_id=? and deleted=0",
+                now, id, sandboxId);
+        jdbc.update("update ds_compute_canvas_version set deleted=1 where canvas_id=? and deleted=0", id);
+        canvas.put("deleted", 1);
+        canvas.put("updated_at", now);
+        return canvas;
+    }
+
     public List<Map<String, Object>> reports(String sandboxId, String type) {
         requireUsableSandbox(sandboxId, false);
         List<Map<String, Object>> result = new ArrayList<>(jdbc.queryForList(
