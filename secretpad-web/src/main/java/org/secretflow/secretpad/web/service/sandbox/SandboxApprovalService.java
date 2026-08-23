@@ -270,7 +270,7 @@ public class SandboxApprovalService {
         Map<String, Object> payload = new LinkedHashMap<>(request);
         if (Set.of("CREATE", "DATA_CHANGE").contains(type)) {
             payload.put("datasetNames",
-                    datasetAssetNames(projectId, request.get("datasetAssetIds")));
+                    datasetAssetNames(projectId, request.get("datasetAssetIds"), request.get("datasetNames")));
         }
         if ("RECYCLE".equals(type)) {
             payload.put("sandboxName", string(requireSandbox(sandboxId).get("name")));
@@ -990,11 +990,16 @@ public class SandboxApprovalService {
     }
 
     /** 申请详情保存可读名称，执行仍使用 datasetAssetIds 作为稳定标识。 */
-    private List<String> datasetAssetNames(String projectId, Object selected) {
+    private List<String> datasetAssetNames(String projectId, Object selected, Object submittedNames) {
+        List<String> assetIds = stringList(selected);
+        List<String> fallbackNames = stringList(submittedNames);
         List<String> names = new ArrayList<>();
-        for (String assetId : stringList(selected)) {
+        for (int index = 0; index < assetIds.size(); index++) {
+            String assetId = assetIds.get(index);
             String name = string(projectAsset(projectId, assetId).get("name"));
-            names.add(notBlank(name) ? name : assetId);
+            String submittedName = index < fallbackNames.size() ? fallbackNames.get(index) : "";
+            names.add(notBlank(name) && !assetId.equals(name)
+                    ? name : notBlank(submittedName) ? submittedName : assetId);
         }
         return names;
     }
