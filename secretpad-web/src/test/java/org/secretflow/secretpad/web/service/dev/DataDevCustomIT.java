@@ -294,7 +294,7 @@ public class DataDevCustomIT {
     private Map<String, Object> submitJar(String runMode) throws IOException {
         Map<String, Object> art = createArtifact("it-jar", "JAR");
         String artId = String.valueOf(art.get("id"));
-        dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "");
+        dataDev.uploadJarVersion(artId, validJar(), "[]", "{}", "", null);
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("name", "it-jar-run");
         request.put("runMode", runMode);

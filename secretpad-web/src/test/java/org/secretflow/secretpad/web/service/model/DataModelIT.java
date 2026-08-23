@@ -321,7 +321,7 @@ public class DataModelIT {
     /** 注册 JAR 制品 + v1 版本，返回 {artifactId, artifactVersionId}。 */
     private Map<String, Object> jarArtifact(String name) throws IOException {
         Map<String, Object> art = createArtifact(name, "JAR");
-        Map<String, Object> v = dataDev.uploadJarVersion(String.valueOf(art.get("id")), validJar(), "[]", "{}", "");
+        Map<String, Object> v = dataDev.uploadJarVersion(String.valueOf(art.get("id")), validJar(), "[]", "{}", "", null);
         return Map.of("artifactId", String.valueOf(art.get("id")), "artifactVersionId", String.valueOf(v.get("id")));
     }
 
