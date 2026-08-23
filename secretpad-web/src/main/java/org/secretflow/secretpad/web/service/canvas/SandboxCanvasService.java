@@ -16,6 +16,7 @@ import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.dev.DataDevService;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
+import org.secretflow.secretpad.web.service.dev.ModelMetricsEvaluator;
 import org.secretflow.secretpad.web.service.model.ModelApprovalService;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
@@ -623,6 +624,17 @@ public class SandboxCanvasService {
         Map<String, Object> trainRun = trainRuns.get(0);
         GraphModel graph = parseGraph(string(canvasModel.get("graph_json")));
         Node trainNode = graph.nodeById(string(trainRun.get("node_id")));
+        boolean recoveredGraph = false;
+        if (trainNode == null || !CanvasOperatorRegistry.isTrain(trainNode.componentCode)) {
+            GraphModel legacyGraph = legacyTrainingGraph(canvasModel, string(trainRun.get("node_id")));
+            Node legacyTrainNode = legacyGraph == null ? null
+                    : legacyGraph.nodeById(string(trainRun.get("node_id")));
+            if (legacyTrainNode != null && CanvasOperatorRegistry.isTrain(legacyTrainNode.componentCode)) {
+                graph = legacyGraph;
+                trainNode = legacyTrainNode;
+                recoveredGraph = true;
+            }
+        }
         if (trainNode == null || !CanvasOperatorRegistry.isTrain(trainNode.componentCode)) {
             result.put("reportStatus", "INCOMPLETE");
             result.put("message", "工作流快照中没有找到对应的训练节点");
@@ -689,6 +701,7 @@ public class SandboxCanvasService {
         result.put("sourceRunId", sourceRunId);
         result.put("sourceTaskId", string(trainRun.get("task_id")));
         result.put("runBinding", inferredRun ? "LEGACY_INFERRED" : "EXACT");
+        result.put("graphBinding", recoveredGraph ? "LEGACY_VERSION_RECOVERED" : "SAVED_SNAPSHOT");
         result.put("algorithm", Map.of(
                 "componentCode", trainNode.componentCode,
                 "componentName", trainNode.name,
@@ -697,7 +710,8 @@ public class SandboxCanvasService {
         result.put("features", features);
         result.put("excludedFields", excluded);
         result.put("preprocessingSteps", preprocessing);
-        result.put("evaluation", modelEvaluation(string(canvasModel.get("model_id")), testId));
+        result.put("evaluation", modelEvaluation(string(canvasModel.get("model_id")), testId,
+                sandboxId, trainRun, trainNode));
         result.put("testHistory", modelTestHistory(string(canvasModel.get("model_id"))));
         return result;
     }
@@ -712,7 +726,8 @@ public class SandboxCanvasService {
         return summary;
     }
 
-    private Map<String, Object> modelEvaluation(String modelId, String testId) {
+    private Map<String, Object> modelEvaluation(String modelId, String testId, String sandboxId,
+            Map<String, Object> trainRun, Node trainNode) {
         List<Map<String, Object>> rows;
         if (notBlank(testId)) {
             rows = jdbc.queryForList(
@@ -725,11 +740,18 @@ public class SandboxCanvasService {
                     modelId);
         }
         if (rows.isEmpty()) {
+            if (!notBlank(testId)) {
+                Map<String, Object> recovered = historicalTrainingEvaluation(sandboxId, trainRun, trainNode);
+                if (!recovered.isEmpty()) {
+                    return recovered;
+                }
+            }
             return Map.of("status", "NOT_TESTED", "message", "当前模型尚无成功的模型测试报告");
         }
         Map<String, Object> test = rows.get(0);
         Map<String, Object> evaluation = new LinkedHashMap<>();
         evaluation.put("status", "AVAILABLE");
+        evaluation.put("source", "MODEL_TEST");
         evaluation.put("testId", test.get("id"));
         evaluation.put("runMode", test.get("run_mode"));
         evaluation.put("metricType", test.get("metric_type"));
@@ -740,6 +762,126 @@ public class SandboxCanvasService {
         evaluation.put("createdAt", test.get("created_at"));
         evaluation.put("finishedAt", test.get("finished_at"));
         return evaluation;
+    }
+
+    /**
+     * 存量模型没有独立测试记录时，从其训练输出回溯可验证的结果摘要。
+     * 仅返回聚合指标，不回传训练明细行；接口内部保留来源字段用于审计。
+     */
+    private Map<String, Object> historicalTrainingEvaluation(String sandboxId,
+            Map<String, Object> trainRun, Node trainNode) {
+        String outputTable = string(trainRun.get("output_table"));
+        if (!notBlank(outputTable)) {
+            return Map.of();
+        }
+        try {
+            Map<String, Object> output = sandboxDb.previewTable(sandboxId, outputTable, 500);
+            List<String> columns = schemaNames(output.get("schema"));
+            List<List<String>> rows = tableRows(output.get("rows"));
+            int totalRows = intValue(output.get("totalRows"), rows.size());
+            Map<String, Object> metrics = recoveredMetrics(trainNode, columns, rows, totalRows);
+            if (metrics.isEmpty()) {
+                return Map.of();
+            }
+
+            Map<String, Object> evaluation = new LinkedHashMap<>();
+            evaluation.put("status", "AVAILABLE");
+            evaluation.put("source", "TRAINING_RESULT_BACKFILL");
+            evaluation.put("testId", trainRun.get("task_id"));
+            evaluation.put("runMode", "TRAINING");
+            evaluation.put("metricType", metrics.get("metricType"));
+            evaluation.put("metrics", metrics);
+            evaluation.put("inputSummary", tableSummary(sandboxId, string(trainRun.get("input_table"))));
+            evaluation.put("outputSummary", Map.of("rowCount", totalRows, "columnCount", columns.size()));
+            evaluation.put("resultPreview", Map.of());
+            evaluation.put("createdAt", trainRun.get("created_at"));
+            evaluation.put("finishedAt", trainRun.get("finished_at"));
+            return evaluation;
+        } catch (Exception e) {
+            log.warn("历史模型评估结果回溯失败 sandboxId={} table={}: {}",
+                    sandboxId, outputTable, e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private Map<String, Object> recoveredMetrics(Node trainNode, List<String> columns,
+            List<List<String>> rows, int totalRows) {
+        String componentCode = trainNode.componentCode;
+        if ("ml.kmeans".equals(componentCode)) {
+            int clusterIndex = columns.indexOf("cluster");
+            if (clusterIndex < 0) {
+                return Map.of();
+            }
+            Map<String, Integer> distribution = new LinkedHashMap<>();
+            for (List<String> row : rows) {
+                if (clusterIndex < row.size()) {
+                    distribution.merge(row.get(clusterIndex), 1, Integer::sum);
+                }
+            }
+            Map<String, Object> metrics = new LinkedHashMap<>();
+            metrics.put("metricType", "clustering");
+            metrics.put("samples", totalRows);
+            metrics.put("clusterCount", distribution.size());
+            metrics.put("clusterDistribution", distribution);
+            if (rows.size() < totalRows) {
+                metrics.put("distributionSampleRows", rows.size());
+            }
+            return metrics;
+        }
+
+        String label = string(trainNode.params.get("label"));
+        int labelIndex = columns.indexOf(label);
+        int predictionIndex = columns.indexOf("pred");
+        if (predictionIndex < 0) {
+            predictionIndex = columns.indexOf("prediction");
+        }
+        if (labelIndex < 0 || predictionIndex < 0 || rows.isEmpty()) {
+            return Map.of();
+        }
+        List<String> labels = new ArrayList<>();
+        List<String> predictions = new ArrayList<>();
+        for (List<String> row : rows) {
+            if (labelIndex < row.size() && predictionIndex < row.size()) {
+                labels.add(row.get(labelIndex));
+                predictions.add(row.get(predictionIndex));
+            }
+        }
+        String metricType = componentCode.contains("linear_regression") ? "regression" : "classification";
+        Map<String, Object> metrics = new LinkedHashMap<>(
+                ModelMetricsEvaluator.evaluate(labels, predictions, metricType));
+        if (rows.size() < totalRows) {
+            metrics.put("totalRows", totalRows);
+        }
+        return metrics;
+    }
+
+    private Map<String, Object> tableSummary(String sandboxId, String table) {
+        if (!notBlank(table)) {
+            return Map.of();
+        }
+        try {
+            Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, 1);
+            return Map.of(
+                    "rowCount", intValue(preview.get("totalRows"), 0),
+                    "columnCount", schemaNames(preview.get("schema")).size());
+        } catch (Exception e) {
+            return Map.of();
+        }
+    }
+
+    private GraphModel legacyTrainingGraph(Map<String, Object> canvasModel, String nodeId) {
+        int version = intValue(canvasModel.get("canvas_version"), Integer.MAX_VALUE);
+        for (Map<String, Object> row : jdbc.queryForList(
+                "select graph_json from ds_compute_canvas_version where canvas_id=? and version<=? "
+                        + "and deleted=0 order by version desc",
+                canvasModel.get("canvas_id"), version)) {
+            GraphModel candidate = parseGraph(string(row.get("graph_json")));
+            Node node = candidate.nodeById(nodeId);
+            if (node != null && CanvasOperatorRegistry.isTrain(node.componentCode)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     private List<Map<String, Object>> modelTestHistory(String modelId) {
@@ -1926,6 +2068,36 @@ public class SandboxCanvasService {
         Map<String, Object> result = new LinkedHashMap<>();
         map.forEach((k, v) -> result.put(String.valueOf(k), v));
         return result;
+    }
+
+    private static List<String> schemaNames(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> map) {
+                names.add(string(map.get("name")));
+            }
+        }
+        return names;
+    }
+
+    private static List<List<String>> tableRows(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return List.of();
+        }
+        List<List<String>> rows = new ArrayList<>();
+        for (Object item : list) {
+            if (item instanceof List<?> row) {
+                List<String> values = new ArrayList<>();
+                for (Object cell : row) {
+                    values.add(string(cell));
+                }
+                rows.add(values);
+            }
+        }
+        return rows;
     }
 
     private static List<String> stringList(Object value) {
