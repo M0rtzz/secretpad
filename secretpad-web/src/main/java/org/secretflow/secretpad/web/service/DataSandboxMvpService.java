@@ -247,9 +247,21 @@ public class DataSandboxMvpService {
                 }
             }
             case "RENEW" -> {
-                int days = Math.max(1, Math.min(nonNegativeInt(request, "days", 7), 365));
+                LocalDateTime expiresAt;
+                try {
+                    expiresAt = LocalDateTime.parse(required(request, "expiresAt"));
+                } catch (java.time.format.DateTimeParseException e) {
+                    throw new IllegalArgumentException("expiresAt 必须是有效的日期时间");
+                }
+                if (!expiresAt.isAfter(LocalDateTime.now())) {
+                    throw new IllegalArgumentException("新的到期时间必须晚于当前时间");
+                }
+                LocalDateTime currentExpiresAt = LocalDateTime.parse(string(sandbox.get("expires_at")));
+                if (!expiresAt.isAfter(currentExpiresAt)) {
+                    throw new IllegalArgumentException("新的到期时间必须晚于原到期时间");
+                }
                 jdbc.update("update ds_sandbox set expires_at=?,status=case when status='EXPIRED' then 'STOPPED' else status end,updated_at=? where id=?",
-                        LocalDateTime.now().plusDays(days).toString(), now(), id);
+                        expiresAt.truncatedTo(ChronoUnit.SECONDS).toString(), now(), id);
             }
             case "SNAPSHOT" -> {
                 if (!SandboxStatusMachine.canAction(status, SandboxStatusMachine.Action.SNAPSHOT)) {

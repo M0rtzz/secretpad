@@ -419,10 +419,10 @@ public class DataSandboxApprovalIT {
         // 变更类幂等：同一沙箱存在进行中 RENEW 时重复提交被拒
         String sandboxId = createSandbox();
         Map<String, Object> renew = createPayload("RENEW", sandboxId);
-        renew.put("days", 7);
+        renew.put("expiresAt", LocalDateTime.now().plusDays(7).toString());
         approvalService.submit(renew);
         Map<String, Object> renewDup = createPayload("RENEW", sandboxId);
-        renewDup.put("days", 14);
+        renewDup.put("expiresAt", LocalDateTime.now().plusDays(14).toString());
         IllegalStateException e2 = assertThrows(IllegalStateException.class, () -> approvalService.submit(renewDup));
         assertTrue(e2.getMessage().contains("已有同类型申请单处理中"), e2.getMessage());
     }
@@ -434,7 +434,8 @@ public class DataSandboxApprovalIT {
         String before = String.valueOf(jdbc.queryForMap("select expires_at from ds_sandbox where id=?", sandboxId).get("expires_at"));
 
         Map<String, Object> payload = createPayload("RENEW", sandboxId);
-        payload.put("days", 15);
+        String requestedExpiresAt = LocalDateTime.now().plusDays(15).withNano(0).toString();
+        payload.put("expiresAt", requestedExpiresAt);
         String id = String.valueOf(approvalService.submit(payload).get("id"));
         approveStage1(id);
         approveStage2(id);
@@ -444,6 +445,7 @@ public class DataSandboxApprovalIT {
         String after = String.valueOf(jdbc.queryForMap("select expires_at from ds_sandbox where id=?", sandboxId).get("expires_at"));
         assertNotEquals(before, after, "续期应前移 expires_at");
         assertTrue(LocalDateTime.parse(after).isAfter(LocalDateTime.parse(before)));
+        assertEquals(requestedExpiresAt, after);
         // 已回收沙箱无可续 → 视为完成
         Map<String, Object> recyclePayload = createPayload("RECYCLE", sandboxId);
         recyclePayload.put("days", 7);
@@ -533,7 +535,7 @@ public class DataSandboxApprovalIT {
         String otherSandboxId = createSandbox();
         jdbc.update("update ds_sandbox set project_id='' where id=?", otherSandboxId);
         Map<String, Object> renew = createPayload("RENEW", otherSandboxId);
-        renew.put("days", 7);
+        renew.put("expiresAt", LocalDateTime.now().plusDays(7).toString());
         assertThrows(IllegalArgumentException.class, () -> approvalService.submit(renew));
     }
 

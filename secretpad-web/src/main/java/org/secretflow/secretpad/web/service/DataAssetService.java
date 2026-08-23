@@ -291,6 +291,9 @@ public class DataAssetService {
                 }
             }
             if (asset.isEmpty()) continue;
+            // P2P 同步的历史 asset_json 快照可能不包含 id，以项目附件关系中的
+            // asset_id 为准，保证前端可正确展示并选中已挂载数据。
+            asset.put("id", attachment.get("asset_id"));
             asset.put("attached_at", attachment.get("attached_at"));
             asset.put("attached_expires_at", attachment.get("expires_at"));
             asset.put("provider_node_id", attachment.get("provider_node_id"));
@@ -317,8 +320,10 @@ public class DataAssetService {
     }
 
     public List<Map<String, Object>> sandboxMounts(String sandboxId) {
-        Map<String, Object> sandbox = jdbc.queryForMap("select project_id from ds_sandbox where id=? and deleted=0", sandboxId);
-        requireProjectMember(String.valueOf(sandbox.get("project_id")));
+        Map<String, Object> sandbox = jdbc.queryForMap("select project_id,owner_id from ds_sandbox where id=? and deleted=0", sandboxId);
+        if (!matchesOwner(String.valueOf(sandbox.get("owner_id")))) {
+            requireProjectParticipant(String.valueOf(sandbox.get("project_id")));
+        }
         return jdbc.queryForList("select m.*,a.name asset_name,a.data_stage,a.metadata_json from ds_sandbox_dataset_mount m join ds_data_asset a on a.id=m.asset_id where m.sandbox_id=? and m.deleted=0 order by m.created_at", sandboxId);
     }
 

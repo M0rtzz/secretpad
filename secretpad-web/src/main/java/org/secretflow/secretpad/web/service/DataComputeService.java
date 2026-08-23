@@ -64,8 +64,9 @@ public class DataComputeService {
                             + "where s.project_id=? and s.deleted=0 order by s.created_at desc", projectId);
             sandboxes.forEach(s -> {
                 boolean creator = matchesNode(string(s.get("owner_id"))) && Objects.equals(actor(), string(s.get("created_by")));
+                boolean expired = "EXPIRED".equals(string(s.get("status")));
                 s.put("usable", creator && !Set.of("DESTROYED", "EXPIRED").contains(string(s.get("status"))));
-                s.put("readOnlyReason", creator ? "" : "沙箱仅创建人可使用");
+                s.put("readOnlyReason", expired ? "沙箱已过期，请先续期" : creator ? "" : "沙箱仅创建人可使用");
             });
             project.put("sandboxes", sandboxes);
         }
@@ -90,7 +91,9 @@ public class DataComputeService {
                 .filter(asset -> string(asset.get("valid_until")).isBlank()
                         || string(asset.get("valid_until")).compareTo(now()) >= 0)
                 .toList());
-        result.put("canUse", matchesNode(string(sandbox.get("owner_id"))) && Objects.equals(actor(), string(sandbox.get("created_by"))));
+        result.put("canUse", !"EXPIRED".equals(string(sandbox.get("status")))
+                && matchesNode(string(sandbox.get("owner_id")))
+                && Objects.equals(actor(), string(sandbox.get("created_by"))));
         return result;
     }
 

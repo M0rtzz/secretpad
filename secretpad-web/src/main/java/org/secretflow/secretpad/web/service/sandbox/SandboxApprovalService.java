@@ -567,8 +567,8 @@ public class SandboxApprovalService {
             return; // 已回收，无可续，视为完成
         }
         Map<String, Object> payload = parsePayload(approval);
-        int days = intValue(payload.get("days"), 7);
-        service.sandboxAction(Map.of("id", sandboxId, "action", "RENEW", "days", days));
+        String expiresAt = required(payload, "expiresAt");
+        service.sandboxAction(Map.of("id", sandboxId, "action", "RENEW", "expiresAt", expiresAt));
     }
 
     private void execSpecChange(Map<String, Object> approval) {
