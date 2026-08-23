@@ -21,6 +21,7 @@ import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.Sha256Utils;
 import org.secretflow.secretpad.common.util.UserContext;
+import org.secretflow.secretpad.web.service.model.ModelApiService;
 
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -51,13 +52,16 @@ public class SystemUserManagementService {
             Pattern.compile("^[a-z][a-z0-9._-]{2,15}$");
 
     private final JdbcTemplate jdbc;
+    private final ModelApiService modelApiService;
 
     @Value("${secretpad.auth.pad_name:admin}")
     private String adminName;
 
     public SystemUserManagementService(
-            @Qualifier("jdbcTemplate") JdbcTemplate jdbc) {
+            @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
+            ModelApiService modelApiService) {
         this.jdbc = jdbc;
+        this.modelApiService = modelApiService;
     }
 
     public List<Map<String, Object>> list() {
@@ -69,6 +73,29 @@ public class SystemUserManagementService {
                         + "where owner_id = ? and is_deleted = 0 and lower(name) <> lower(?) "
                         + "order by gmt_create desc",
                 (rs, rowNum) -> toUser(rs),
+                ownerId,
+                adminName);
+    }
+
+    /**
+     * Enabled accounts available for username-based authorization.
+     *
+     * <p>This endpoint deliberately includes the configured administrator and
+     * is separate from the administrator-only management list.</p>
+     */
+    public List<Map<String, Object>> authorizationOptions() {
+        String ownerId = UserContext.getUser().getOwnerId();
+        return jdbc.query(
+                "select name, display_name from user_accounts "
+                        + "where (owner_id = ? or lower(name) = lower(?)) and is_deleted = 0 "
+                        + "and account_status = 'ENABLED' order by name",
+                (rs, rowNum) -> {
+                    Map<String, Object> option = new LinkedHashMap<>();
+                    option.put("account", rs.getString("name"));
+                    option.put("displayName", StringUtils.defaultIfBlank(
+                            rs.getString("display_name"), rs.getString("name")));
+                    return option;
+                },
                 ownerId,
                 adminName);
     }
@@ -179,6 +206,7 @@ public class SystemUserManagementService {
         revokeSessions(storedName);
         jdbc.update("delete from sys_user_permission_rel where lower(user_key) = ?", account);
         jdbc.update("delete from sys_user_node_rel where lower(user_id) = ?", account);
+        modelApiService.removeAuthorizedUser(storedName);
         jdbc.update(
                 "update user_accounts set is_deleted = 1, gmt_modified = CURRENT_TIMESTAMP "
                         + "where name = ? and owner_id = ? and is_deleted = 0",

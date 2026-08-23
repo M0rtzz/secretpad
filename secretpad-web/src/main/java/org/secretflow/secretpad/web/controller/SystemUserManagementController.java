@@ -47,6 +47,11 @@ public class SystemUserManagementController {
         return SecretPadResponse.success(userManagementService.list());
     }
 
+    @GetMapping("/authorization-options")
+    public SecretPadResponse<List<Map<String, Object>>> authorizationOptions() {
+        return SecretPadResponse.success(userManagementService.authorizationOptions());
+    }
+
     @PostMapping("/create")
     public SecretPadResponse<Map<String, Object>> create(
             @RequestBody Map<String, Object> request) {

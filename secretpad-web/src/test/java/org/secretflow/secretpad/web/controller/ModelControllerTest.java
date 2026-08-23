@@ -202,6 +202,13 @@ public class ModelControllerTest {
         jdbc.update("delete from ds_unified_log where action like 'MODEL_%' or resource_type like 'MODEL%'");
         jdbc.update("delete from user_tokens");
         ModelCtrlDomainDataService.created.clear();
+        jdbc.update("delete from user_accounts where name in ('alice','bob','carol')");
+        jdbc.update("insert into user_accounts "
+                + "(name,password_hash,owner_type,owner_id,display_name,account_status,is_deleted) "
+                + "values ('alice','test','CENTER','alice','Alice','ENABLED',0)");
+        jdbc.update("insert into user_accounts "
+                + "(name,password_hash,owner_type,owner_id,display_name,account_status,is_deleted) "
+                + "values ('bob','test','CENTER','alice','Bob','ENABLED',0)");
         ModelCtrlDomainDataService.createCode = KusciaAPIConstants.OK;
         ModelCtrlDomainDataService.relativeUri = LABELED_URI;
         ModelCtrlDomainDataService.datatableId = LABELED_DT;
@@ -562,7 +569,11 @@ public class ModelControllerTest {
         String apiId = publishAndCreateApi(modelId);
         String appId = appIdOf(apiId);
 
-        // 授权用户为空 → User-Token 调用者放行
+        JsonNode authorized = doPost("/api/v1alpha1/model-api/update", json(Map.of(
+                        "id", apiId, "authorizedUsers", List.of("alice"))), ALICE_TOKEN);
+        assertEquals(0, authorized.path("status").path("code").asInt(), authorized.toString());
+
+        // 授权 alice → User-Token 调用者放行
         JobService.State.jobState = "Succeeded";
         JobService.State.withEndpoints = true;
         JsonNode ok = doPost("/api/v1alpha1/model-api/invoke", json(Map.of(
@@ -574,6 +585,12 @@ public class ModelControllerTest {
                         "id", apiId, "authorizedUsers", List.of("bob"))),
                 ALICE_TOKEN);
         assertEquals(0, updated.path("status").path("code").asInt(), updated.toString());
+        jdbc.update("update user_accounts set account_status='DISABLED' where name='bob'");
+        JsonNode retained = doPost("/api/v1alpha1/model-api/update", json(Map.of(
+                        "id", apiId, "authorizedUsers", List.of("bob"),
+                        "description", "retain disabled grant")),
+                ALICE_TOKEN);
+        assertEquals(0, retained.path("status").path("code").asInt(), retained.toString());
         JsonNode denied = doPost("/api/v1alpha1/model-api/invoke", json(Map.of(
                         "appId", appId, "rows", List.of(Map.of("id", 1, "score", 60)))),
                 ALICE_TOKEN);

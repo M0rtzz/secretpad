@@ -155,16 +155,16 @@ public class ModelApiGuardTest {
     /* ------------------------------- authorized users ------------------------------- */
 
     @Test
-    public void emptyAuthorizedUsersAllowsAny() {
-        assertTrue(ModelApiGuard.userAllowed("alice", List.of()));
-        assertTrue(ModelApiGuard.userAllowed("alice", null));
+    public void emptyAuthorizedUsersDeniesTokenCaller() {
+        assertFalse(ModelApiGuard.userAllowed("alice", List.of()));
+        assertFalse(ModelApiGuard.userAllowed("alice", null));
     }
 
     @Test
     public void userInListIsAllowed() {
         assertTrue(ModelApiGuard.userAllowed("alice", List.of("bob", "alice")));
-        // 名单条目允许空白噪音，调用方用户名按精确匹配
-        assertTrue(ModelApiGuard.userAllowed("alice", List.of(" bob ", " alice ")));
+        // 名单条目允许空白噪音，调用方用户名按大小写不敏感匹配
+        assertTrue(ModelApiGuard.userAllowed("alice", List.of(" bob ", " ALICE ")));
     }
 
     @Test
