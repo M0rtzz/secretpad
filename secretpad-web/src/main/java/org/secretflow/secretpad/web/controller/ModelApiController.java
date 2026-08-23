@@ -66,8 +66,10 @@ public class ModelApiController {
 
     @Operation(summary = "API 列表（keyword 过滤，不回显 secret）")
     @GetMapping("/list")
-    public SecretPadResponse<List<Map<String, Object>>> list(@RequestParam(defaultValue = "") String keyword) {
-        return SecretPadResponse.success(service.list(keyword));
+    public SecretPadResponse<List<Map<String, Object>>> list(
+            @RequestParam(defaultValue = "") String keyword,
+            @RequestParam String sandboxId) {
+        return SecretPadResponse.success(service.list(keyword, sandboxId));
     }
 
     @Operation(summary = "API 详情（+ 模型摘要）")

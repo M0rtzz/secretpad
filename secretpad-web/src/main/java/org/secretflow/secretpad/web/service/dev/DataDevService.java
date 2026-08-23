@@ -222,7 +222,8 @@ public class DataDevService {
     }
 
     public List<Map<String, Object>> listArtifacts(String type, String keyword, String sandboxId) {
-        StringBuilder sql = new StringBuilder("select * from ds_dev_artifact where deleted=0");
+        StringBuilder sql = new StringBuilder("select * from ds_dev_artifact where deleted=0 "
+                + "and not (name like '画布模型-%' and description like '画布节点 %训练产物%')");
         List<Object> args = new ArrayList<>();
         if (notBlank(sandboxId)) {
             sql.append(" and sandbox_id=?");
@@ -926,7 +927,8 @@ public class DataDevService {
     /* ============================== 任务操作 ============================== */
 
     public List<Map<String, Object>> listTasks(String status, String runMode, String execType, String keyword, String sandboxId) {
-        StringBuilder sql = new StringBuilder("select * from ds_dev_task where deleted=0");
+        StringBuilder sql = new StringBuilder(
+                "select * from ds_dev_task where deleted=0 and coalesce(channel,'')<>'canvas'");
         List<Object> args = new ArrayList<>();
         if (notBlank(sandboxId)) {
             sql.append(" and sandbox_id=?");

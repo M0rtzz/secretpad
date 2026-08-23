@@ -17,7 +17,6 @@ import org.secretflow.secretpad.web.service.SandboxDataControlService;
 import org.secretflow.secretpad.web.service.dev.DataDevService;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
 import org.secretflow.secretpad.web.service.dev.ModelMetricsEvaluator;
-import org.secretflow.secretpad.web.service.model.ModelApprovalService;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -52,7 +51,7 @@ import java.util.concurrent.Executors;
  *   <li>解析 {@code ds_compute_canvas.graph_json} → 拓扑排序（检测环）；</li>
  *   <li>逐节点渲染 {@code import modeling_ops} 脚本（虚拟节点 data.table 不执行，直接映射挂载表）；</li>
  *   <li>上游输出表 {@code op_{runId}_{nodeId}} 落沙箱库（{@link SandboxDbService#backfillOperatorTable}）；</li>
- *   <li>ml.* 训练节点成功 → joblib(base64) 自动注册 {@code ds_dev_artifact + ds_dev_artifact_version + ds_model(APPROVED)}；</li>
+ *   <li>ml.* 训练节点成功 → joblib(base64) 保存在画布节点运行记录中，不进入开发制品体系；</li>
  *   <li>{@code ds_compute_run / ds_compute_node_run} 记录整图/节点状态，节点输出/日志对前端可见。</li>
  * </ol>
  *
@@ -68,7 +67,6 @@ public class SandboxCanvasService {
     private final DevJobExecutor devJobExecutor;
     private final SandboxDbService sandboxDb;
     private final DataSandboxMvpService mvp;
-    private final ModelApprovalService modelApprovalService;
     private final SandboxDataControlService dataControl;
 
     private final ExecutorService canvasExecutor = Executors.newSingleThreadExecutor();
@@ -80,7 +78,6 @@ public class SandboxCanvasService {
             DevJobExecutor devJobExecutor,
             SandboxDbService sandboxDb,
             DataSandboxMvpService mvp,
-            ModelApprovalService modelApprovalService,
             SandboxDataControlService dataControl) {
         this.jdbc = jdbc;
         this.mapper = mapper;
@@ -88,7 +85,6 @@ public class SandboxCanvasService {
         this.devJobExecutor = devJobExecutor;
         this.sandboxDb = sandboxDb;
         this.mvp = mvp;
-        this.modelApprovalService = modelApprovalService;
         this.dataControl = dataControl;
     }
 
@@ -1385,12 +1381,9 @@ public class SandboxCanvasService {
             jdbc.update("update ds_compute_node_run set status='SUCCEEDED',task_id=?,input_table=?,output_table=?,"
                             + "result_summary=?,model_b64=?,fit_params=?,finished_at=?,updated_at=? where id=?",
                     taskId, inputTable, outputTable, json(summary), modelB64, fitParams, now(), now(), nodeRunId);
-            if (CanvasOperatorRegistry.isTrain(node.componentCode) && notBlank(modelB64)) {
-                registerModelFromTrainNode(canvas, node, modelB64, sandboxId, graph, runId);
-            }
             audit("CANVAS_NODE_SUCCEEDED", "COMPUTE_NODE_RUN", nodeRunId,
                     "node=" + node.id + " op=" + node.componentCode + " rows=" + rows.size()
-                            + (notBlank(modelB64) ? " modelRegistered=true" : ""), true);
+                            + (notBlank(modelB64) ? " modelCaptured=true" : ""), true);
         } catch (Exception e) {
             String message = truncate(e.getMessage(), 1900);
             log.error("画布节点执行异常 nodeId={} op={}", node.id, node.componentCode, e);
@@ -1428,46 +1421,6 @@ public class SandboxCanvasService {
     private static final class NodeMarkers {
         String modelB64 = "";
         String preprocJson = "";
-    }
-
-    /** 训练节点产物自动注册：ds_dev_artifact(PYTHON) + 版本(predict 脚本) + ds_model(APPROVED，幂等)。 */
-    private void registerModelFromTrainNode(Map<String, Object> canvas, Node node, String modelB64, String sandboxId,
-            GraphModel graph, String runId) {
-        String projectId = string(canvas.get("project_id"));
-        String artifactName = "画布模型-" + string(canvas.get("name")) + "-" + string(node.name);
-        List<String> features = stringList(node.params.get("features"));
-        String task = string(node.params.get("task"));
-        String kind = node.componentCode.startsWith("ml.") ? node.componentCode.substring(3) : node.componentCode;
-        String preprocess = buildPreprocessScript(node, graph, runId);
-        String script = CanvasPredictScript.generate(modelB64, kind, features, task, preprocess);
-        List<Map<String, Object>> existing = jdbc.queryForList(
-                "select * from ds_dev_artifact where name=? and sandbox_id=? and deleted=0", artifactName, sandboxId);
-        String artifactId;
-        if (existing.isEmpty()) {
-            Map<String, Object> req = new LinkedHashMap<>();
-            req.put("name", artifactName);
-            req.put("type", "PYTHON");
-            req.put("projectId", projectId);
-            req.put("sandboxId", sandboxId);
-            req.put("description", "画布节点 " + node.id + " 训练产物（" + kind + "），推理脚本自动生成");
-            artifactId = string(dataDevService.createArtifact(req).get("id"));
-        } else {
-            artifactId = string(existing.get(0).get("id"));
-        }
-        Map<String, Object> vreq = new LinkedHashMap<>();
-        vreq.put("artifactId", artifactId);
-        vreq.put("contentText", script);
-        vreq.put("description", "训练时间 " + now());
-        String versionId = string(dataDevService.createVersion(vreq).get("id"));
-        Map<String, Object> model = modelApprovalService.registerModelAutoApproved(
-                artifactName, projectId, artifactId, versionId, sandboxId,
-                "画布训练产物自动注册（" + kind + "）");
-        String modelId = string(model.get("id"));
-        jdbc.update("update ds_compute_node_run set model_id=?,updated_at=? "
-                        + "where run_id=? and node_id=? and deleted=0",
-                modelId, now(), runId, node.id);
-        audit("CANVAS_MODEL_AUTO_REGISTERED", "MODEL", modelId, "canvas=" + string(canvas.get("id"))
-                + " artifact=" + artifactId + " v=" + versionId, true);
     }
 
     /* ====================== predict 脚本预处理链复刻 ====================== */

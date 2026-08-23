@@ -412,17 +412,24 @@ public class ModelApiService {
         return "";
     }
 
-    public List<Map<String, Object>> list(String keyword) {
-        StringBuilder sql = new StringBuilder("select * from ds_model_api where deleted=0");
+    public List<Map<String, Object>> list(String keyword, String sandboxId) {
+        if (!notBlank(sandboxId)) {
+            throw new IllegalArgumentException("sandboxId 不能为空");
+        }
+        StringBuilder sql = new StringBuilder("select api.* from ds_model_api api "
+                + "join ds_model model on model.id=api.model_id and model.deleted=0 "
+                + "where api.deleted=0");
         List<Object> args = new ArrayList<>();
+        sql.append(" and model.sandbox_id=?");
+        args.add(sandboxId);
         if (notBlank(keyword)) {
-            sql.append(" and (lower(name) like ? or lower(app_id) like ? or lower(model_id) like ?)");
+            sql.append(" and (lower(api.name) like ? or lower(api.app_id) like ? or lower(api.model_id) like ?)");
             String like = "%" + keyword.toLowerCase(Locale.ROOT) + "%";
             args.add(like);
             args.add(like);
             args.add(like);
         }
-        sql.append(" order by created_at desc limit 500");
+        sql.append(" order by api.created_at desc limit 500");
         List<Map<String, Object>> rows = jdbc.queryForList(sql.toString(), args.toArray());
         List<Map<String, Object>> result = new ArrayList<>();
         for (Map<String, Object> row : rows) {
