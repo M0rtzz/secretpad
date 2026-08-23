@@ -766,8 +766,11 @@ public class SandboxApprovalService {
      * The JDBC approval tables remain the workflow store; this synchronized envelope makes the
      * same request, votes and history visible and actionable on every project participant.
      */
+    /**
+     * 将 P2P 同步的申请单快照应用到本节点（ModelApiApprovalService 亦复用）。
+     */
     @SuppressWarnings("unchecked")
-    private void applySyncedApprovals() {
+    public void applySyncedApprovals() {
         for (SandboxApprovalSyncDO sync : approvalSyncRepository.findAll()) {
             try {
                 String approvalId = sync.getUpk() == null ? "" : sync.getUpk().getApprovalId();

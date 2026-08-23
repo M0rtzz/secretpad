@@ -11,6 +11,7 @@
 package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
+import org.secretflow.secretpad.web.service.model.ModelApiApprovalService;
 import org.secretflow.secretpad.web.service.model.ModelApiService;
 
 import io.swagger.v3.oas.annotations.Operation;
@@ -38,9 +39,11 @@ import java.util.Map;
 public class ModelApiController {
 
     private final ModelApiService service;
+    private final ModelApiApprovalService approvalService;
 
-    public ModelApiController(ModelApiService service) {
+    public ModelApiController(ModelApiService service, ModelApiApprovalService approvalService) {
         this.service = service;
+        this.approvalService = approvalService;
     }
 
     @Operation(summary = "发布模型为 API（模型需 APPROVED/PUBLISHED；一次性 app_id+secret 明文仅本次返回）")
@@ -110,5 +113,50 @@ public class ModelApiController {
             @RequestHeader(value = "X-APP-ID", required = false) String appIdHeader,
             @RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.invoke(appIdHeader, request));
+    }
+
+    /* ============================== 模型 API 供数方审批 ============================== */
+
+    @Operation(summary = "我的模型 API 审批申请单（approval_type=MODEL_API）")
+    @GetMapping("/approvals/mine")
+    public SecretPadResponse<List<Map<String, Object>>> approvalsMine(
+            @RequestParam(defaultValue = "") String status,
+            @RequestParam(defaultValue = "") String keyword) {
+        return SecretPadResponse.success(approvalService.listMine(status, keyword));
+    }
+
+    @Operation(summary = "待我审批的模型 API 申请单（当前节点为供数方投票人）")
+    @GetMapping("/approvals/pending")
+    public SecretPadResponse<List<Map<String, Object>>> approvalsPending(
+            @RequestParam(defaultValue = "") String keyword) {
+        return SecretPadResponse.success(approvalService.listPending(keyword));
+    }
+
+    @Operation(summary = "模型 API 审批申请单详情（模型/数据/拓扑/凭证，审批方可在线调试）")
+    @GetMapping("/approvals/detail")
+    public SecretPadResponse<Map<String, Object>> approvalDetail(@RequestParam String id) {
+        return SecretPadResponse.success(approvalService.detail(id));
+    }
+
+    @Operation(summary = "模型 API 审批动作：APPROVE/REJECT")
+    @PostMapping("/approvals/action")
+    public SecretPadResponse<Map<String, Object>> approvalAction(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(approvalService.action(
+                String.valueOf(request.get("id")),
+                String.valueOf(request.get("action")),
+                String.valueOf(request.get("comment"))));
+    }
+
+    @Operation(summary = "撤回模型 API 审批申请（仅申请方，PENDING 状态）")
+    @PostMapping("/approvals/cancel")
+    public SecretPadResponse<Map<String, Object>> approvalCancel(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(approvalService.cancel(String.valueOf(request.get("id"))));
+    }
+
+    @Operation(summary = "模型 API 审批在线调试：以临时 API 凭证调用模型，返回推理结果")
+    @PostMapping("/approvals/test")
+    public SecretPadResponse<Map<String, Object>> approvalTest(@RequestBody Map<String, Object> request) {
+        return SecretPadResponse.success(approvalService.test(
+                String.valueOf(request.get("id")), request));
     }
 }

@@ -22,6 +22,8 @@ import org.secretflow.secretpad.web.service.dev.DevDependencyChecker;
 import org.secretflow.secretpad.web.service.dev.DevFunctionWrapper;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
 import org.secretflow.secretpad.web.service.dev.DevSqlEngine;
+import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalGate;
+import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.secretflow.secretpad.web.service.storage.SqliteTableLoader;
 import org.secretflow.secretpad.web.util.RequestUtils;
 
@@ -50,6 +52,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -89,6 +92,15 @@ public class ModelApiService {
 
     @Resource
     private ModelApprovalService modelApprovalService;
+
+    @Resource
+    private ModelApiApprovalService modelApiApprovalService;
+
+    @Resource
+    private SandboxApprovalGate gate;
+
+    @Resource
+    private SandboxDbService sandboxDb;
 
     @Resource
     private EnvService envService;
@@ -162,6 +174,18 @@ public class ModelApiService {
                 throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
                         + ": 仅已通过审批的模型可发布 API（当前 " + modelStatus + "）");
             }
+            // 供数方审批门禁：可视化建模保存的模型使用了供数方（其他节点项目共享挂载）数据时，
+            // 发布 API 前必须向供数方节点提交审批；审批通过后 API 才真正发布。
+            if (count("select count(1) from ds_model_api where model_id=? and status='PENDING' and deleted=0",
+                    modelId) > 0) {
+                throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                        + ": 该模型已有进行中的供数方审批，请等待审批完成后再发布");
+            }
+            List<Map<String, Object>> providers = resolveProviderData(modelId);
+            if (!providers.isEmpty()) {
+                return publishPendingForApproval(modelId, name, description, authorizedUsers, ipWhitelist,
+                        validFrom, validTo, providers);
+            }
         } else if ("ARTIFACT".equalsIgnoreCase(sourceType)) {
             Map<String, Object> artifact = requireArtifact(sourceId);
             String versionId = resolveVersionId(sourceId, value(request, "version", ""));
@@ -219,6 +243,173 @@ public class ModelApiService {
         result.put("secret", secret);
         result.put("notice", "调用密钥只显示一次，请立即保存");
         return result;
+    }
+
+    /* ============================== 供数方审批发布 ============================== */
+
+    /**
+     * 供数方审批发布：创建 status=PENDING 的临时测试 API（模型保持 APPROVED），并向供数方节点提交审批单。
+     * 审批通过后由 {@link ModelApiApprovalService} 把 API 置 ENABLED + 模型 PUBLISHED；驳回则 API 置 REJECTED。
+     * 审批期内该 API 凭 app_id+secret 可被供数方节点调用（在线调试）。
+     */
+    private Map<String, Object> publishPendingForApproval(String modelId, String name, String description,
+            List<String> authorizedUsers, List<String> ipWhitelist, String validFrom, String validTo,
+            List<Map<String, Object>> providers) {
+        String id = "mapi-" + shortId();
+        String appId = "ai-" + shortId();
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
+        String now = now();
+        authorizedUsers = validateAuthorizedUsers(authorizedUsers, List.of());
+        jdbc.update("insert into ds_model_api(id,model_id,name,description,status,app_id,secret_hash,authorized_users,"
+                        + "ip_whitelist,valid_from,valid_to,call_count,last_called_at,created_by,created_at,updated_at,deleted,approval_id)"
+                        + " values(?,?,?,?,'PENDING',?,?,?,?,?,?,0,'',?,?,?,0,'')",
+                id, modelId, name, description,
+                appId, sha256(secret), json(authorizedUsers), json(ipWhitelist),
+                validFrom, validTo, actor(), now, now);
+        Map<String, Object> canvas = canvasModelContext(modelId);
+        List<String> providerNodeIds = providers.stream()
+                .map(p -> string(p.get("providerNodeId")))
+                .filter(this::notBlank)
+                .distinct()
+                .toList();
+        Map<String, Object> approval = modelApiApprovalService.submit(
+                id, modelId, name, notBlank(string(canvas.get("modelName"))) ? string(canvas.get("modelName")) : name,
+                string(canvas.get("projectId")), string(canvas.get("sandboxId")),
+                string(canvas.get("graphJson")), providers, providerNodeIds, appId, secret);
+        jdbc.update("update ds_model_api set approval_id=? where id=? and deleted=0",
+                string(approval.get("id")), id);
+        audit("MODEL_API_SUBMIT_APPROVAL", "MODEL_API", id,
+                "model=" + modelId + " approval=" + string(approval.get("id"))
+                        + " providers=" + String.join(",", providerNodeIds), true);
+        dispatch("model.api.approval.submitted",
+                Map.of("id", id, "modelId", modelId, "approvalId", approval.get("id")));
+        Map<String, Object> result = new LinkedHashMap<>(enrichApi(requireApi(id)));
+        result.put("secret", secret);
+        result.put("approval", approval);
+        result.put("approvalRequired", true);
+        result.put("notice", "模型使用供数方数据，已提交供数方节点审批，审批通过后自动发布");
+        return result;
+    }
+
+    /**
+     * 解析模型使用的供数方数据：画布数据资源节点（data.table）引用的挂载表溯源到数据资产归属节点，
+     * 归属节点 ≠ 当前节点即为供数方数据。返回数据清单（含预览快照，供审批方浏览）；为空表示无需审批。
+     */
+    private List<Map<String, Object>> resolveProviderData(String modelId) {
+        Map<String, Object> canvas = canvasModelContext(modelId);
+        String sandboxId = string(canvas.get("sandboxId"));
+        String graphJson = string(canvas.get("graphJson"));
+        if (!notBlank(sandboxId)) {
+            return new ArrayList<>();
+        }
+        LinkedHashSet<String> tables = new LinkedHashSet<>();
+        if (notBlank(string(canvas.get("inputTable")))) {
+            tables.add(string(canvas.get("inputTable")));
+        }
+        collectDataTableNames(graphJson, tables);
+        String currentOwner = gate.effectiveOwner();
+        List<Map<String, Object>> providers = new ArrayList<>();
+        for (String table : tables) {
+            List<Map<String, Object>> dirRows = jdbc.queryForList(
+                    "select asset_id from ds_sandbox_data_dir where sandbox_id=? and table_name=? and kind='MOUNT' and deleted=0 limit 1",
+                    sandboxId, table);
+            String assetId = dirRows.isEmpty() ? "" : string(dirRows.get(0).get("asset_id"));
+            if (!notBlank(assetId)) {
+                continue;
+            }
+            List<Map<String, Object>> assetRows = jdbc.queryForList(
+                    "select id,name,provider_node_id from ds_data_asset where id=? and deleted=0", assetId);
+            if (assetRows.isEmpty()) {
+                continue;
+            }
+            Map<String, Object> asset = assetRows.get(0);
+            String providerNodeId = string(asset.get("provider_node_id"));
+            if (!notBlank(providerNodeId) || Objects.equals(providerNodeId, currentOwner)) {
+                continue;
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("tableName", table);
+            entry.put("assetId", assetId);
+            entry.put("name", string(asset.get("name")));
+            entry.put("providerNodeId", providerNodeId);
+            try {
+                entry.put("preview", sandboxDb.previewTable(sandboxId, table, 10));
+            } catch (Exception e) {
+                entry.put("preview", null);
+            }
+            providers.add(entry);
+        }
+        return providers;
+    }
+
+    /** 画布模型上下文：project/sandbox/拓扑/输入表（供数方审批载荷来源）。 */
+    private Map<String, Object> canvasModelContext(String modelId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select cm.model_id,cm.name model_name,cm.graph_json,cm.input_table,cm.input_columns,cm.status,"
+                        + "c.sandbox_id,c.project_id from ds_compute_canvas_model cm "
+                        + "join ds_compute_canvas c on c.id=cm.canvas_id and c.deleted=0 "
+                        + "where cm.model_id=? and cm.status='READY' and cm.deleted=0 order by cm.created_at desc limit 1",
+                modelId);
+        if (rows.isEmpty()) {
+            return Map.of();
+        }
+        return new LinkedHashMap<>(rows.get(0));
+    }
+
+    /** 收集画布 data.table（数据资源）节点的 params.table 引用（供数方溯源）。 */
+    @SuppressWarnings("unchecked")
+    private void collectDataTableNames(String graphJson, Set<String> tables) {
+        if (!notBlank(graphJson)) {
+            return;
+        }
+        try {
+            Object parsed = objectMapper.readValue(graphJson, Object.class);
+            if (!(parsed instanceof Map<?, ?> graph)) {
+                return;
+            }
+            Object nodesObj = graph.get("nodes");
+            if (!(nodesObj instanceof List<?> nodes)) {
+                return;
+            }
+            for (Object raw : nodes) {
+                if (!(raw instanceof Map<?, ?> map)) {
+                    continue;
+                }
+                Map<String, Object> node = new LinkedHashMap<>();
+                map.forEach((k, v) -> node.put(String.valueOf(k), v));
+                Map<String, Object> data = mapOf(node.get("data"));
+                String code = firstNotBlank(string(data.get("componentCode")), string(data.get("code")), string(node.get("componentCode")));
+                if (!"data.table".equals(code)) {
+                    continue;
+                }
+                Object paramsObj = data.get("params") != null ? data.get("params") : data.get("param");
+                Map<String, Object> params = mapOf(paramsObj);
+                String table = string(params.get("table"));
+                if (notBlank(table)) {
+                    tables.add(table);
+                }
+            }
+        } catch (Exception ignored) {
+            // 解析失败按无数据表处理，交由发布门禁兜底
+        }
+    }
+
+    private static Map<String, Object> mapOf(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            map.forEach((k, v) -> result.put(String.valueOf(k), v));
+            return result;
+        }
+        return new LinkedHashMap<>();
+    }
+
+    private static String firstNotBlank(String... values) {
+        for (String value : values) {
+            if (notBlank(value)) {
+                return value;
+            }
+        }
+        return "";
     }
 
     public List<Map<String, Object>> list(String keyword) {
@@ -389,9 +580,10 @@ public class ModelApiService {
         Map<String, Object> api = requireApiByAppId(effectiveAppId);
         String apiId = string(api.get("id"));
         String ip = remoteIp();
-        // ① 启用状态
-        if (!ModelApiGuard.enabled(string(api.get("status")))) {
-            deny("MODEL_API_DISABLED", "API 已停用: " + effectiveAppId, apiId, ip);
+        // ① 状态守卫：ENABLED 正常调用；PENDING 供数方审批期内临时测试；REJECTED/DISABLED 拒绝
+        String apiStatus = string(api.get("status"));
+        if (!Set.of("ENABLED", "PENDING").contains(apiStatus)) {
+            deny("MODEL_API_DISABLED", "API 当前不可调用: " + effectiveAppId + " (" + apiStatus + ")", apiId, ip);
         }
         // ② 有效时间窗口（fail-closed）
         if (!ModelApiGuard.inValidityWindow(string(api.get("valid_from")), string(api.get("valid_to")), now())) {
@@ -900,6 +1092,11 @@ public class ModelApiService {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    private long count(String sql, Object... args) {
+        Long value = jdbc.queryForObject(sql, Long.class, args);
+        return value == null ? 0 : value;
     }
 
     private static String string(Object value) {
