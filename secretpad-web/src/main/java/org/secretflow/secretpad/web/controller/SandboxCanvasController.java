@@ -103,6 +103,13 @@ public class SandboxCanvasController {
         return SecretPadResponse.success(service.models(canvasId));
     }
 
+    @GetMapping("/models/report")
+    public SecretPadResponse<Map<String, Object>> modelReport(
+            @RequestParam String canvasModelId,
+            @RequestParam(defaultValue = "") String testId) {
+        return SecretPadResponse.success(service.modelReport(canvasModelId, testId));
+    }
+
     @GetMapping("/models/candidates")
     public SecretPadResponse<List<Map<String, Object>>> modelCandidates(@RequestParam String canvasId) {
         return SecretPadResponse.success(service.modelCandidates(canvasId));

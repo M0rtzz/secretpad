@@ -567,6 +567,250 @@ public class SandboxCanvasService {
     }
 
     /**
+     * 工作流模型报告：以保存模型时绑定的运行批次为依据，汇总评估指标、最终入模特征和前处理链路。
+     * 历史模型没有 source_run_id 时，仅可通过唯一的 model_id 运行记录回溯，并显式标记为兼容推断。
+     */
+    public Map<String, Object> modelReport(String canvasModelId, String testId) {
+        Map<String, Object> canvasModel = requireCanvasModel(canvasModelId);
+        Map<String, Object> canvas = requireCanvas(string(canvasModel.get("canvas_id")));
+        String sandboxId = string(canvas.get("sandbox_id"));
+        requireUsableSandbox(sandboxId, false);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("model", modelReportSummary(canvasModel));
+        if (!"READY".equals(string(canvasModel.get("status")))
+                || !notBlank(string(canvasModel.get("model_id")))) {
+            result.put("reportStatus", "UNAVAILABLE");
+            result.put("message", "当前模型仅保存工作流拓扑，尚未关联成功训练结果");
+            return result;
+        }
+
+        String sourceRunId = string(canvasModel.get("source_run_id"));
+        boolean inferredRun = false;
+        if (!notBlank(sourceRunId)) {
+            List<Map<String, Object>> legacyRuns = jdbc.queryForList(
+                    "select run_id,task_id,node_id,input_table,output_table from ds_compute_node_run "
+                            + "where canvas_id=? and model_id=? and status='SUCCEEDED' and deleted=0 "
+                            + "order by finished_at desc,created_at desc limit 1",
+                    canvasModel.get("canvas_id"), canvasModel.get("model_id"));
+            if (!legacyRuns.isEmpty()) {
+                sourceRunId = string(legacyRuns.get(0).get("run_id"));
+                inferredRun = true;
+            }
+        }
+        if (!notBlank(sourceRunId)) {
+            result.put("reportStatus", "INCOMPLETE");
+            result.put("message", "未找到该模型对应的训练运行批次，无法准确生成报告");
+            return result;
+        }
+        List<Map<String, Object>> sourceRuns = jdbc.queryForList(
+                "select id from ds_compute_run where id=? and canvas_id=? and deleted=0",
+                sourceRunId, canvasModel.get("canvas_id"));
+        if (sourceRuns.isEmpty()) {
+            throw new SecurityException("模型训练运行批次不属于当前画布");
+        }
+
+        List<Map<String, Object>> trainRuns = jdbc.queryForList(
+                "select * from ds_compute_node_run where run_id=? and model_id=? "
+                        + "and status='SUCCEEDED' and deleted=0 order by finished_at desc limit 1",
+                sourceRunId, canvasModel.get("model_id"));
+        if (trainRuns.isEmpty()) {
+            result.put("reportStatus", "INCOMPLETE");
+            result.put("message", "训练运行记录不完整，无法确认实际入模特征");
+            return result;
+        }
+
+        Map<String, Object> trainRun = trainRuns.get(0);
+        GraphModel graph = parseGraph(string(canvasModel.get("graph_json")));
+        Node trainNode = graph.nodeById(string(trainRun.get("node_id")));
+        if (trainNode == null || !CanvasOperatorRegistry.isTrain(trainNode.componentCode)) {
+            result.put("reportStatus", "INCOMPLETE");
+            result.put("message", "工作流快照中没有找到对应的训练节点");
+            return result;
+        }
+
+        String inputTable = string(trainRun.get("input_table"));
+        List<Map<String, Object>> trainingSchema = tableSchema(sandboxId, inputTable);
+        Map<String, Object> workflowInput = workflowInput(graph, sandboxId);
+        List<Map<String, Object>> sourceSchema = tableSchema(sandboxId, string(workflowInput.get("table")));
+        String label = string(trainNode.params.get("label"));
+        List<String> selectedFeatures = stringList(trainNode.params.get("features"));
+        String selectionMethod = "MANUAL";
+        if (selectedFeatures.isEmpty()) {
+            selectionMethod = "AUTO";
+            for (Map<String, Object> column : trainingSchema) {
+                String name = string(column.get("name"));
+                if (notBlank(name) && !name.equals(label)) {
+                    selectedFeatures.add(name);
+                }
+            }
+        }
+
+        List<Map<String, Object>> preprocessing = preprocessingReport(graph, sourceRunId, trainNode);
+        Map<String, Map<String, Object>> sourceByName = schemaByName(sourceSchema);
+        Map<String, Map<String, Object>> trainingByName = schemaByName(trainingSchema);
+        List<Map<String, Object>> features = new ArrayList<>();
+        for (String name : selectedFeatures) {
+            Map<String, Object> feature = new LinkedHashMap<>();
+            feature.put("name", name);
+            feature.put("sourceType", schemaType(sourceByName.get(name)));
+            feature.put("modelType", schemaType(trainingByName.get(name)));
+            feature.put("role", "FEATURE");
+            feature.put("selectionMethod", selectionMethod);
+            feature.put("preprocessing", featurePreprocessing(name, preprocessing));
+            feature.put("usedInModel", true);
+            features.add(feature);
+        }
+
+        List<Map<String, Object>> excluded = new ArrayList<>();
+        Set<String> selected = new LinkedHashSet<>(selectedFeatures);
+        for (Map<String, Object> column : sourceSchema) {
+            String name = string(column.get("name"));
+            if (!notBlank(name) || selected.contains(name) || name.equals(label)) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("name", name);
+            item.put("type", schemaType(column));
+            item.put("reason", trainingByName.containsKey(name)
+                    ? "训练节点未选择" : "上游前处理后未进入训练输入");
+            excluded.add(item);
+        }
+
+        Map<String, Object> featureSummary = new LinkedHashMap<>();
+        featureSummary.put("sourceFieldCount", sourceSchema.size());
+        featureSummary.put("modelFeatureCount", features.size());
+        featureSummary.put("excludedFieldCount", excluded.size());
+        featureSummary.put("preprocessingCount", preprocessing.size());
+        featureSummary.put("label", label);
+        featureSummary.put("inputTable", inputTable);
+
+        result.put("reportStatus", "AVAILABLE");
+        result.put("sourceRunId", sourceRunId);
+        result.put("sourceTaskId", string(trainRun.get("task_id")));
+        result.put("runBinding", inferredRun ? "LEGACY_INFERRED" : "EXACT");
+        result.put("algorithm", Map.of(
+                "componentCode", trainNode.componentCode,
+                "componentName", trainNode.name,
+                "parameters", trainNode.params));
+        result.put("featureSummary", featureSummary);
+        result.put("features", features);
+        result.put("excludedFields", excluded);
+        result.put("preprocessingSteps", preprocessing);
+        result.put("evaluation", modelEvaluation(string(canvasModel.get("model_id")), testId));
+        result.put("testHistory", modelTestHistory(string(canvasModel.get("model_id"))));
+        return result;
+    }
+
+    private Map<String, Object> modelReportSummary(Map<String, Object> model) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        for (String key : List.of("id", "canvas_id", "canvas_version", "model_id", "source_node_id",
+                "source_run_id", "source_task_id", "name", "description", "status", "model_status",
+                "model_version", "created_by", "created_at")) {
+            summary.put(key, model.get(key));
+        }
+        return summary;
+    }
+
+    private Map<String, Object> modelEvaluation(String modelId, String testId) {
+        List<Map<String, Object>> rows;
+        if (notBlank(testId)) {
+            rows = jdbc.queryForList(
+                    "select * from ds_model_test where id=? and model_id=? and status='SUCCEEDED' and deleted=0",
+                    testId, modelId);
+        } else {
+            rows = jdbc.queryForList(
+                    "select * from ds_model_test where model_id=? and status='SUCCEEDED' and deleted=0 "
+                            + "order by finished_at desc,created_at desc limit 1",
+                    modelId);
+        }
+        if (rows.isEmpty()) {
+            return Map.of("status", "NOT_TESTED", "message", "当前模型尚无成功的模型测试报告");
+        }
+        Map<String, Object> test = rows.get(0);
+        Map<String, Object> evaluation = new LinkedHashMap<>();
+        evaluation.put("status", "AVAILABLE");
+        evaluation.put("testId", test.get("id"));
+        evaluation.put("runMode", test.get("run_mode"));
+        evaluation.put("metricType", test.get("metric_type"));
+        evaluation.put("metrics", parseMapOrEmpty(string(test.get("metrics"))));
+        evaluation.put("inputSummary", parseMapOrEmpty(string(test.get("input_summary"))));
+        evaluation.put("outputSummary", parseMapOrEmpty(string(test.get("output_summary"))));
+        evaluation.put("resultPreview", parseMapOrEmpty(string(test.get("result_preview"))));
+        evaluation.put("createdAt", test.get("created_at"));
+        evaluation.put("finishedAt", test.get("finished_at"));
+        return evaluation;
+    }
+
+    private List<Map<String, Object>> modelTestHistory(String modelId) {
+        return jdbc.queryForList(
+                "select id,status,metric_type,run_mode,created_at,finished_at from ds_model_test "
+                        + "where model_id=? and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc",
+                modelId);
+    }
+
+    private List<Map<String, Object>> preprocessingReport(GraphModel graph, String runId, Node trainNode) {
+        Set<String> upstream = upstream(graph, trainNode.id);
+        Map<String, Map<String, Object>> runByNode = new LinkedHashMap<>();
+        for (Map<String, Object> row : jdbc.queryForList(
+                "select * from ds_compute_node_run where run_id=? and deleted=0 order by created_at asc", runId)) {
+            runByNode.put(string(row.get("node_id")), row);
+        }
+        List<Map<String, Object>> steps = new ArrayList<>();
+        int order = 0;
+        for (Node node : topoSort(graph)) {
+            if (!upstream.contains(node.id) || node.id.equals(trainNode.id)
+                    || !node.componentCode.startsWith("preprocessing.")) {
+                continue;
+            }
+            Map<String, Object> run = runByNode.getOrDefault(node.id, Map.of());
+            Map<String, Object> step = new LinkedHashMap<>();
+            step.put("order", ++order);
+            step.put("nodeId", node.id);
+            step.put("componentCode", node.componentCode);
+            step.put("componentName", node.name);
+            step.put("columns", stringList(node.params.get("columns")));
+            step.put("appliesToAll", stringList(node.params.get("columns")).isEmpty());
+            step.put("configuredParams", node.params);
+            step.put("fittedParams", parseMapOrEmpty(string(run.get("fit_params"))));
+            step.put("inputTable", string(run.get("input_table")));
+            step.put("outputTable", string(run.get("output_table")));
+            step.put("status", string(run.get("status")));
+            steps.add(step);
+        }
+        return steps;
+    }
+
+    private List<String> featurePreprocessing(String feature, List<Map<String, Object>> steps) {
+        List<String> names = new ArrayList<>();
+        for (Map<String, Object> step : steps) {
+            List<String> columns = stringList(step.get("columns"));
+            Map<String, Object> params = step.get("configuredParams") instanceof Map<?, ?> raw
+                    ? mapOf(raw) : Map.of();
+            boolean derived = feature.equals(string(params.get("new_column")));
+            if (Boolean.TRUE.equals(step.get("appliesToAll")) || columns.contains(feature) || derived) {
+                names.add(string(step.get("componentName")));
+            }
+        }
+        return names;
+    }
+
+    private Map<String, Map<String, Object>> schemaByName(List<Map<String, Object>> schema) {
+        Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        for (Map<String, Object> column : schema) {
+            result.put(string(column.get("name")), column);
+        }
+        return result;
+    }
+
+    private String schemaType(Map<String, Object> column) {
+        if (column == null) {
+            return "UNKNOWN";
+        }
+        return firstNotBlank(string(column.get("type")), string(column.get("dataType")), "UNKNOWN");
+    }
+
+    /**
      * 查询「可执行的工作流结果」候选：工作流中最近一次成功运行的最终输出节点（终态节点）。
      * 每个候选携带输出表与整个工作流的输入数据（数据资源挂载表 + 列），供保存模型时确定 API 输入/输出。
      */
@@ -623,6 +867,8 @@ public class SandboxCanvasService {
         item.put("node_name", node.name);
         item.put("name", node.name);
         item.put("component_code", node.componentCode);
+        item.put("run_id", string(nr.get("run_id")));
+        item.put("task_id", string(nr.get("task_id")));
         item.put("output_table", string(nr.get("output_table")));
         item.put("model_id", string(nr.get("model_id")));
         item.put("status", string(nr.get("status")));
@@ -688,6 +934,31 @@ public class SandboxCanvasService {
         }
     }
 
+    /** 沙箱表字段快照（字段名 + 类型）；报告读取失败时返回空，禁止用其他批次结果替代。 */
+    private List<Map<String, Object>> tableSchema(String sandboxId, String table) {
+        if (!notBlank(table)) {
+            return List.of();
+        }
+        try {
+            Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, 1);
+            Object raw = preview.get("schema");
+            if (!(raw instanceof List<?> list)) {
+                return List.of();
+            }
+            List<Map<String, Object>> schema = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> map) {
+                    schema.add(mapOf(map));
+                }
+            }
+            return schema;
+        } catch (Exception e) {
+            log.warn("工作流模型报告读取表结构失败 sandboxId={} table={}: {}",
+                    sandboxId, table, e.getMessage());
+            return List.of();
+        }
+    }
+
     /** 画布节点输出友好名：<节点名>输出数据<同名序号>，如「标准化输出数据1」。 */
     private String operatorOutputName(Node node, GraphModel graph) {
         int idx = 0;
@@ -725,6 +996,8 @@ public class SandboxCanvasService {
         String modelId = string(request.get("modelId"));
         String nodeId = string(request.get("nodeId"));
         String sourceNodeId = "";
+        String sourceRunId = "";
+        String sourceTaskId = "";
         String status = "DRAFT";
         String outputTable = "";
         String outputColumns = "[]";
@@ -732,7 +1005,7 @@ public class SandboxCanvasService {
         if (notBlank(nodeId)) {
             // 前端选择「可执行工作流结果」节点：取其最近一次成功运行的输出表与模型
             List<Map<String, Object>> nrs = jdbc.queryForList(
-                    "select model_id,output_table from ds_compute_node_run where canvas_id=? and node_id=? "
+                    "select model_id,output_table,run_id,task_id from ds_compute_node_run where canvas_id=? and node_id=? "
                             + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
                     canvasId, nodeId);
             if (nrs.isEmpty()) {
@@ -740,6 +1013,8 @@ public class SandboxCanvasService {
             }
             modelId = string(nrs.get(0).get("model_id"));
             sourceNodeId = nodeId;
+            sourceRunId = string(nrs.get(0).get("run_id"));
+            sourceTaskId = string(nrs.get(0).get("task_id"));
             outputTable = string(nrs.get(0).get("output_table"));
             if (notBlank(modelId)) {
                 status = "READY";
@@ -750,7 +1025,8 @@ public class SandboxCanvasService {
         } else if (notBlank(modelId)) {
             // 兼容旧调用：仅传 modelId（训练节点产物）
             List<Map<String, Object>> candidates = jdbc.queryForList(
-                    "select nr.node_id,nr.output_table from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
+                    "select nr.node_id,nr.output_table,nr.run_id,nr.task_id from ds_compute_node_run nr "
+                            + "join ds_model m on m.id=nr.model_id and m.deleted=0 "
                             + "where nr.canvas_id=? and nr.model_id=? and nr.status='SUCCEEDED' and nr.deleted=0 "
                             + "order by nr.finished_at desc limit 1",
                     canvasId, modelId);
@@ -758,6 +1034,8 @@ public class SandboxCanvasService {
                 throw new IllegalArgumentException("所选模型不是该画布成功训练产生的模型");
             }
             sourceNodeId = string(candidates.get(0).get("node_id"));
+            sourceRunId = string(candidates.get(0).get("run_id"));
+            sourceTaskId = string(candidates.get(0).get("task_id"));
             outputTable = string(candidates.get(0).get("output_table"));
             status = "READY";
             if (notBlank(outputTable) && sandboxDb.hasTable(sandboxId, outputTable)) {
@@ -775,11 +1053,13 @@ public class SandboxCanvasService {
         }
         String id = "cm-" + shortId();
         String now = now();
-        jdbc.update("insert into ds_compute_canvas_model(id,canvas_id,canvas_version,model_id,source_node_id,name,"
+        jdbc.update("insert into ds_compute_canvas_model(id,canvas_id,canvas_version,model_id,source_node_id,"
+                        + "source_run_id,source_task_id,name,"
                         + "description,graph_json,status,input_table,input_columns,output_table,output_columns,"
                         + "created_by,created_at,updated_at,deleted) "
-                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                id, canvasId, intValue(canvas.get("version"), 1), modelId, sourceNodeId, name,
+                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                id, canvasId, intValue(canvas.get("version"), 1), modelId, sourceNodeId,
+                sourceRunId, sourceTaskId, name,
                 string(request.get("description")), graphJson, status,
                 inputTable, inputColumns, outputTable, outputColumns, actor(), now, now);
         audit("CANVAS_MODEL_SAVED", "CANVAS_MODEL", id,
