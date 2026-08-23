@@ -22,6 +22,7 @@ import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -91,6 +92,7 @@ public class ModelApiApprovalService {
 
     /** 供数方审批在线调试：代理到申请方节点的模型 API 执行。 */
     @Resource
+    @Lazy
     private ModelApiService modelApiService;
 
     public ModelApiApprovalService(
