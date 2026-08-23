@@ -70,11 +70,10 @@ public class SystemUserManagementService {
         return jdbc.query(
                 "select name, display_name, account_status, last_login_at, gmt_create "
                         + "from user_accounts "
-                        + "where owner_id = ? and is_deleted = 0 and lower(name) <> lower(?) "
+                        + "where owner_id = ? and is_deleted = 0 "
                         + "order by gmt_create desc",
                 (rs, rowNum) -> toUser(rs),
-                ownerId,
-                adminName);
+                ownerId);
     }
 
     /**
@@ -248,6 +247,7 @@ public class SystemUserManagementService {
         user.put("status", rs.getString("account_status"));
         user.put("lastLoginAt", rs.getString("last_login_at"));
         user.put("createdAt", rs.getString("gmt_create"));
+        user.put("systemAccount", StringUtils.equalsIgnoreCase(adminName, account));
         return user;
     }
 
