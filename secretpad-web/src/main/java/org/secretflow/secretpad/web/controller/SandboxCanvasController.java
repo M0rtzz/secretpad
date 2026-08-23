@@ -57,8 +57,9 @@ public class SandboxCanvasController {
     @GetMapping("/node/output")
     public SecretPadResponse<Map<String, Object>> nodeOutput(
             @RequestParam String canvasId, @RequestParam String nodeId,
+            @RequestParam(defaultValue = "") String runId,
             @RequestParam(defaultValue = "50") int limit) {
-        return SecretPadResponse.success(service.nodeOutput(canvasId, nodeId, limit));
+        return SecretPadResponse.success(service.nodeOutput(canvasId, nodeId, runId, limit));
     }
 
     @GetMapping("/node/logs")

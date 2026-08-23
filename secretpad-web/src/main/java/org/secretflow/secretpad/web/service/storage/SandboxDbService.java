@@ -345,15 +345,15 @@ public class SandboxDbService {
     }
 
     /**
-     * 画布节点输出回填：写入沙箱库 {@code op_{canvasId}_{nodeId}}（kind=OPERATOR）。
+     * 画布节点输出回填：写入沙箱库 {@code op_{runId}_{nodeId}}（kind=OPERATOR）。
      *
      * <p>op_* 表仅画布内部消费（下游节点输入 + 节点输出查看/导出），遵循「结果不能被沙箱消费」边界：
      * 不允许作为 data-dev 任务源表（{@link #isOperatorTable}），不允许挂载项目。重建/挂载变更时保留。</p>
      */
     @Transactional
-    public Map<String, Object> backfillOperatorTable(String sandboxId, String canvasId, String nodeId,
+    public Map<String, Object> backfillOperatorTable(String sandboxId, String runId, String nodeId,
             String name, List<String> header, List<List<String>> data) {
-        String table = "op_" + SqliteTableLoader.sanitizeTableName(canvasId)
+        String table = "op_" + SqliteTableLoader.sanitizeTableName(runId)
                 + "_" + SqliteTableLoader.sanitizeTableName(nodeId);
         return backfillTable(sandboxId, table, "OPERATOR", name, header, data);
     }

@@ -234,8 +234,11 @@ public class DataComputeService {
         requireUsableSandbox(sandboxId, false);
         List<Map<String, Object>> result = new ArrayList<>(jdbc.queryForList(
                 "select * from ds_compute_report where sandbox_id=? and deleted=0 order by created_at desc", sandboxId));
-        for (Map<String, Object> task : jdbc.queryForList(
-                "select * from ds_dev_task where sandbox_id=? and status='SUCCEEDED' and deleted=0 order by finished_at desc", sandboxId)) {
+        for (Map<String, Object> task : jdbc.queryForList("select t.*,nr.run_id canvas_run_id,nr.canvas_id compute_canvas_id,"
+                        + "nr.node_id component_id,nr.component_code,nr.result_summary node_result_summary "
+                        + "from ds_dev_task t left join ds_compute_node_run nr on nr.task_id=t.id and nr.deleted=0 "
+                        + "where t.sandbox_id=? and t.status='SUCCEEDED' and t.deleted=0 order by t.finished_at desc",
+                sandboxId)) {
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("execType", task.get("exec_type"));
             payload.put("runMode", task.get("run_mode"));
@@ -243,8 +246,14 @@ public class DataComputeService {
             payload.put("resultRows", task.get("result_rows"));
             payload.put("resultNodeId", task.get("result_node_id"));
             payload.put("resultDatatableId", task.get("result_datatable_id"));
+            payload.put("channel", task.get("channel"));
+            payload.put("componentCode", task.get("component_code"));
+            payload.put("preview", taskPreview(task));
+            String canvasId = string(task.get("compute_canvas_id"));
+            String runId = value(task, "canvas_run_id", string(task.get("id")));
             result.add(reportRow("task-report-" + task.get("id"), task.get("project_id"), sandboxId,
-                    task.get("id"), "PROGRAM_RESULT", string(task.get("name")) + " - 运行结果",
+                    canvasId, runId, string(task.get("component_id")), "PROGRAM_RESULT",
+                    string(task.get("name")) + " - 运行结果",
                     json(payload), json(List.of(task.get("source_asset_id"), task.get("source_mount_id"))),
                     string(task.get("artifact_id")) + ":" + string(task.get("version")), task.get("created_by"), task.get("finished_at")));
         }
@@ -256,8 +265,10 @@ public class DataComputeService {
             payload.put("metrics", parse(string(test.get("metrics"))));
             payload.put("inputSummary", parse(string(test.get("input_summary"))));
             payload.put("outputSummary", parse(string(test.get("output_summary"))));
+            payload.put("resultPreview", parse(string(test.get("result_preview"))));
             result.add(reportRow("model-report-" + test.get("id"), test.get("project_id"), sandboxId,
-                    test.get("id"), "MODEL_EVALUATION", string(test.get("model_name")) + " - 模型评估",
+                    "", test.get("id"), string(test.get("model_id")), "MODEL_EVALUATION",
+                    string(test.get("model_name")) + " - 模型评估",
                     json(payload), "[]", "v" + test.get("model_version"), test.get("created_by"), test.get("finished_at")));
         }
         if (!type.isBlank()) result.removeIf(row -> !type.equals(string(row.get("report_type"))));
@@ -265,16 +276,39 @@ public class DataComputeService {
         return result;
     }
 
-    private Map<String, Object> reportRow(String id, Object projectId, String sandboxId, Object runId,
+    private Map<String, Object> taskPreview(Map<String, Object> task) {
+        Object value = parse(string(task.get("result_preview")));
+        if (!(value instanceof Map<?, ?> raw)) return Map.of();
+        Map<String, Object> preview = new LinkedHashMap<>();
+        raw.forEach((key, item) -> preview.put(String.valueOf(key), item));
+        if ("canvas".equals(string(task.get("channel"))) && preview.get("rows") instanceof List<?> rawRows) {
+            List<Object> rows = new ArrayList<>(rawRows);
+            while (!rows.isEmpty() && isCanvasMarker(rows.get(rows.size() - 1))) {
+                rows.remove(rows.size() - 1);
+            }
+            preview.put("rows", rows);
+            Map<String, Object> summary = parseMap(string(task.get("node_result_summary")));
+            preview.put("resultRows", summary.getOrDefault("rowCount", rows.size()));
+        }
+        return preview;
+    }
+
+    private boolean isCanvasMarker(Object row) {
+        return row instanceof List<?> cells && !cells.isEmpty()
+                && Set.of("MODELB64:", "PREPROC:").contains(string(cells.get(0)));
+    }
+
+    private Map<String, Object> reportRow(String id, Object projectId, String sandboxId,
+                                           Object canvasId, Object runId, Object componentId,
                                            String type, String name, String payload, String inputs,
                                            String algorithmVersion, Object createdBy, Object createdAt) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", id);
         row.put("project_id", projectId);
         row.put("sandbox_id", sandboxId);
-        row.put("canvas_id", "");
+        row.put("canvas_id", canvasId);
         row.put("run_id", runId);
-        row.put("component_id", "");
+        row.put("component_id", componentId);
         row.put("report_type", type);
         row.put("name", name);
         row.put("payload_json", payload);
@@ -322,6 +356,13 @@ public class DataComputeService {
     private String shortId(){return UUID.randomUUID().toString().replace("-","").substring(0,12);}
     private String json(Object value){try{return mapper.writeValueAsString(value);}catch(Exception e){throw new IllegalArgumentException("JSON 格式错误",e);}}
     @SuppressWarnings("unchecked") private Object parse(String value){try{return mapper.readValue(value,Map.class);}catch(Exception e){return Map.of();}}
+    private Map<String, Object> parseMap(String value){
+        Object parsed = parse(value);
+        if (!(parsed instanceof Map<?, ?> raw)) return Map.of();
+        Map<String, Object> result = new LinkedHashMap<>();
+        raw.forEach((key, item) -> result.put(String.valueOf(key), item));
+        return result;
+    }
     private static int intValue(Object v, int d){if(v instanceof Number n){return n.intValue();}if(v==null||String.valueOf(v).isBlank()){return d;}try{return Integer.parseInt(String.valueOf(v).trim());}catch(NumberFormatException e){return d;}}
 
     /** 画布保存版本快照：ds_compute_canvas_version（供回滚/对比）。 */

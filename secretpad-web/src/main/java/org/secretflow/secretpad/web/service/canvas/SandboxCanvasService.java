@@ -50,7 +50,7 @@ import java.util.concurrent.Executors;
  * <ol>
  *   <li>解析 {@code ds_compute_canvas.graph_json} → 拓扑排序（检测环）；</li>
  *   <li>逐节点渲染 {@code import modeling_ops} 脚本（虚拟节点 data.table 不执行，直接映射挂载表）；</li>
- *   <li>上游输出表 {@code op_{canvasId}_{nodeId}} 落沙箱库（{@link SandboxDbService#backfillOperatorTable}）；</li>
+ *   <li>上游输出表 {@code op_{runId}_{nodeId}} 落沙箱库（{@link SandboxDbService#backfillOperatorTable}）；</li>
  *   <li>ml.* 训练节点成功 → joblib(base64) 自动注册 {@code ds_dev_artifact + ds_dev_artifact_version + ds_model(APPROVED)}；</li>
  *   <li>{@code ds_compute_run / ds_compute_node_run} 记录整图/节点状态，节点输出/日志对前端可见。</li>
  * </ol>
@@ -212,34 +212,107 @@ public class SandboxCanvasService {
         return result;
     }
 
-    /** 节点输出数据预览：非虚拟节点读 op_{canvasId}_{nodeId}，虚拟节点读挂载表。 */
-    public Map<String, Object> nodeOutput(String canvasId, String nodeId, int limit) {
+    /** 节点输出数据预览：按 runId 读取对应节点结果；未传 runId 时读取该节点最近一次成功运行。 */
+    public Map<String, Object> nodeOutput(String canvasId, String nodeId, String runId, int limit) {
         Map<String, Object> canvas = requireCanvas(canvasId);
         String sandboxId = string(canvas.get("sandbox_id"));
         requireUsableSandbox(sandboxId, false);
-        GraphModel graph = parseGraph(string(canvas.get("graph_json")));
-        Node node = graph.nodeById(nodeId);
-        if (node == null) {
-            throw new IllegalArgumentException("画布节点不存在: " + nodeId);
+        Map<String, Object> nodeRun = resolveNodeRunForOutput(canvasId, nodeId, runId);
+        if (nodeRun == null) {
+            return unavailableOutput("", runId, nodeId, "该节点尚无成功输出");
         }
-        String table = CanvasOperatorRegistry.isVirtual(node.componentCode)
-                ? string(node.params.get("table"))
-                : opTableName(canvasId, nodeId);
-        if (!sandboxDb.hasTable(sandboxId, table)) {
-            Map<String, Object> empty = new LinkedHashMap<>();
-            empty.put("tableName", table);
-            empty.put("available", false);
-            empty.put("message", "该节点尚无输出（未运行成功或尚未执行）");
-            empty.put("schema", List.of());
-            empty.put("rows", List.of());
-            empty.put("totalRows", 0);
-            return empty;
+        String resolvedRunId = string(nodeRun.get("run_id"));
+        String table = string(nodeRun.get("output_table"));
+        boolean virtual = CanvasOperatorRegistry.isVirtual(string(nodeRun.get("component_code")));
+        boolean legacySharedTable = table.equals(legacyOpTableName(canvasId, nodeId));
+        boolean safeTableSnapshot = virtual || !legacySharedTable || isLatestSuccessfulNodeRun(canvasId, nodeId, nodeRun);
+        if (safeTableSnapshot && !table.isBlank() && sandboxDb.hasTable(sandboxId, table)) {
+            dataControl.requireMountTableUsable(sandboxId, table);
+            Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, Math.max(1, Math.min(limit, 500)));
+            preview.put("available", true);
+            preview.put("nodeId", nodeId);
+            preview.put("runId", resolvedRunId);
+            preview.put("taskId", nodeRun.get("task_id"));
+            preview.put("snapshotSource", virtual ? "MOUNT_TABLE" : "RUN_TABLE");
+            preview.put("previewOnly", false);
+            return preview;
         }
-        dataControl.requireMountTableUsable(sandboxId, table);
-        Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, Math.max(1, Math.min(limit, 500)));
-        preview.put("available", true);
-        preview.put("nodeId", nodeId);
-        return preview;
+        Map<String, Object> taskPreview = taskPreview(nodeRun, table, nodeId, resolvedRunId);
+        if (taskPreview != null) return taskPreview;
+        return unavailableOutput(table, resolvedRunId, nodeId,
+                legacySharedTable ? "该历史运行的完整结果已被后续运行覆盖，且没有可恢复的任务预览"
+                        : "该运行的结果表和任务预览均不可用");
+    }
+
+    private Map<String, Object> resolveNodeRunForOutput(String canvasId, String nodeId, String runId) {
+        List<Map<String, Object>> rows;
+        if (notBlank(runId)) {
+            Map<String, Object> run = requireRun(runId);
+            if (!canvasId.equals(string(run.get("canvas_id")))) {
+                throw new IllegalArgumentException("运行记录不属于当前画布: " + runId);
+            }
+            rows = jdbc.queryForList("select * from ds_compute_node_run where run_id=? and node_id=? and deleted=0 limit 1",
+                    runId, nodeId);
+        } else {
+            rows = jdbc.queryForList("select * from ds_compute_node_run where canvas_id=? and node_id=? "
+                            + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
+                    canvasId, nodeId);
+        }
+        return rows.isEmpty() ? null : new LinkedHashMap<>(rows.get(0));
+    }
+
+    private boolean isLatestSuccessfulNodeRun(String canvasId, String nodeId, Map<String, Object> selected) {
+        List<Map<String, Object>> rows = jdbc.queryForList("select id from ds_compute_node_run where canvas_id=? and node_id=? "
+                        + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
+                canvasId, nodeId);
+        return !rows.isEmpty() && Objects.equals(string(rows.get(0).get("id")), string(selected.get("id")));
+    }
+
+    private Map<String, Object> taskPreview(Map<String, Object> nodeRun, String table, String nodeId, String runId) {
+        String taskId = string(nodeRun.get("task_id"));
+        if (!notBlank(taskId)) return null;
+        List<Map<String, Object>> tasks = jdbc.queryForList(
+                "select result_preview,result_rows from ds_dev_task where id=? and status='SUCCEEDED' and deleted=0", taskId);
+        if (tasks.isEmpty()) return null;
+        Map<String, Object> stored = parseMapOrEmpty(string(tasks.get(0).get("result_preview")));
+        if (!(stored.get("header") instanceof List<?> header) || !(stored.get("rows") instanceof List<?> rawRows)) {
+            return null;
+        }
+        List<Object> rows = new ArrayList<>(rawRows);
+        while (!rows.isEmpty() && isMarkerRow(rows.get(rows.size() - 1))) rows.remove(rows.size() - 1);
+        List<Map<String, Object>> schema = new ArrayList<>();
+        for (Object name : header) schema.add(Map.of("name", string(name), "type", "string"));
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("tableName", table);
+        result.put("available", true);
+        result.put("schema", schema);
+        result.put("rows", rows);
+        Map<String, Object> summary = parseMapOrEmpty(string(nodeRun.get("result_summary")));
+        result.put("totalRows", summary.getOrDefault("rowCount", tasks.get(0).get("result_rows")));
+        result.put("nodeId", nodeId);
+        result.put("runId", runId);
+        result.put("taskId", taskId);
+        result.put("snapshotSource", "TASK_PREVIEW");
+        result.put("previewOnly", true);
+        return result;
+    }
+
+    private boolean isMarkerRow(Object row) {
+        return row instanceof List<?> cells && !cells.isEmpty()
+                && Set.of(MODEL_MARKER, PREPROC_MARKER).contains(string(cells.get(0)));
+    }
+
+    private Map<String, Object> unavailableOutput(String table, String runId, String nodeId, String message) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("tableName", table);
+        result.put("available", false);
+        result.put("message", message);
+        result.put("schema", List.of());
+        result.put("rows", List.of());
+        result.put("totalRows", 0);
+        result.put("nodeId", nodeId);
+        result.put("runId", runId);
+        return result;
     }
 
     /** 节点日志：该节点最近一次运行的 ds_dev_task（channel='canvas'）日志。 */
@@ -540,7 +613,7 @@ public class SandboxCanvasService {
                         table, table, now(), now(), nodeRunId);
                 return;
             }
-            String inputTable = resolveInputTable(node, graph, canvasId, sandboxId);
+            String inputTable = resolveInputTable(node, graph, runId, canvasId, sandboxId);
             dataControl.requireMountTableUsable(sandboxId, inputTable);
             Map<String, Object> params = new LinkedHashMap<>();
             params.put("op", node.componentCode);
@@ -561,7 +634,7 @@ public class SandboxCanvasService {
                 throw new IllegalArgumentException("输入数据超过 " + MAX_INPUT_BYTES + " 字节上限（当前 " + inputCsv.length + "），请先在数据开发中做行数裁剪");
             }
             String inputB64 = Base64.getEncoder().encodeToString(inputCsv);
-            String outputTable = opTableName(canvasId, node.id);
+            String outputTable = opTableName(runId, node.id);
             String taskId = dataDevService.createCanvasTask(sandboxId, canvasId, node.id, node.componentCode,
                     CanvasOperatorRegistry.RENDER_SCRIPT, params, List.of(), outputTable);
             dataDevService.claimCanvasTask(taskId);
@@ -586,7 +659,7 @@ public class SandboxCanvasService {
             if (rows.isEmpty()) {
                 throw new IllegalStateException("节点无有效输出行");
             }
-            sandboxDb.backfillOperatorTable(sandboxId, canvasId, node.id, "画布输出-" + node.componentCode, header, rows);
+            sandboxDb.backfillOperatorTable(sandboxId, runId, node.id, "画布输出-" + node.componentCode, header, rows);
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("header", header);
             summary.put("rowCount", rows.size());
@@ -982,7 +1055,7 @@ public class SandboxCanvasService {
         return result;
     }
 
-    private String resolveInputTable(Node node, GraphModel graph, String canvasId, String sandboxId) {
+    private String resolveInputTable(Node node, GraphModel graph, String runId, String canvasId, String sandboxId) {
         List<String> sources = new ArrayList<>();
         for (Edge edge : graph.edges) {
             if (edge.target.equals(node.id)) {
@@ -1003,7 +1076,20 @@ public class SandboxCanvasService {
                 throw new IllegalArgumentException("上游数据资源节点未配置挂载表，无法提供输入: " + sources.get(0));
             }
         } else {
-            table = opTableName(canvasId, source.id);
+            List<Map<String, Object>> current = jdbc.queryForList(
+                    "select output_table from ds_compute_node_run where run_id=? and node_id=? and status='SUCCEEDED' and deleted=0 limit 1",
+                    runId, source.id);
+            if (!current.isEmpty()) {
+                table = string(current.get(0).get("output_table"));
+            } else {
+                List<Map<String, Object>> previous = jdbc.queryForList(
+                        "select output_table from ds_compute_node_run where canvas_id=? and node_id=? "
+                                + "and run_id<>? and status='SUCCEEDED' and deleted=0 "
+                                + "order by finished_at desc,created_at desc limit 1",
+                        canvasId, source.id, runId);
+                table = previous.isEmpty() ? legacyOpTableName(canvasId, source.id)
+                        : string(previous.get(0).get("output_table"));
+            }
         }
         if (!sandboxDb.hasTable(sandboxId, table)) {
             throw new IllegalArgumentException("上游节点输出表不存在（请先执行上游节点）: " + table);
@@ -1201,7 +1287,11 @@ public class SandboxCanvasService {
         }
     }
 
-    private static String opTableName(String canvasId, String nodeId) {
+    private static String opTableName(String runId, String nodeId) {
+        return "op_" + sanitize(runId) + "_" + sanitize(nodeId);
+    }
+
+    private static String legacyOpTableName(String canvasId, String nodeId) {
         return "op_" + sanitize(canvasId) + "_" + sanitize(nodeId);
     }
 
