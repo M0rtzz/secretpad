@@ -74,19 +74,15 @@ public class NodeRouteManagerTest {
         verify(kusciaGrpcClientAdapter, times(1)).deleteDomainRoute(any(), any());
     }
 
+    /** 对端通告什么地址就用什么地址，不再按实例名改写。 */
     @Test
-    public void testBuildRouteEndpointUsesLegacyOverrides() {
-        DomainRoute.RouteEndpoint ghostEndpoint = buildRouteEndpoint(
+    public void testBuildRouteEndpointUsesAdvertisedAddressAsIs() {
+        DomainRoute.RouteEndpoint endpoint = buildRouteEndpoint(
                 "https://data-sandbox-dev-ghost-kuscia:1080");
-        Assertions.assertEquals("222.20.99.38", ghostEndpoint.getHost());
-        Assertions.assertEquals(59080, ghostEndpoint.getPorts(0).getPort());
-        Assertions.assertTrue(ghostEndpoint.getPorts(0).getIsTLS());
 
-        DomainRoute.RouteEndpoint zgznewEndpoint = buildRouteEndpoint(
-                "https://data-sandbox-dev-zgznew-kuscia:1080");
-        Assertions.assertEquals("222.20.99.38", zgznewEndpoint.getHost());
-        Assertions.assertEquals(29080, zgznewEndpoint.getPorts(0).getPort());
-        Assertions.assertTrue(zgznewEndpoint.getPorts(0).getIsTLS());
+        Assertions.assertEquals("data-sandbox-dev-ghost-kuscia", endpoint.getHost());
+        Assertions.assertEquals(1080, endpoint.getPorts(0).getPort());
+        Assertions.assertTrue(endpoint.getPorts(0).getIsTLS());
     }
 
     @Test
