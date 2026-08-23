@@ -84,6 +84,9 @@ public class AuthServiceImpl implements AuthService {
     @Value("${secretpad.account-error-lock-time-minutes:30}")
     private Integer lockTimeMinutes;
 
+    @Value("${secretpad.auth.pad_name:admin}")
+    private String adminName;
+
     @Resource
     private CacheManager cacheManager;
     @Resource
@@ -97,6 +100,9 @@ public class AuthServiceImpl implements AuthService {
         //check password and lock
         AccountsDO user = accountLockedCheck(name, passwordHash);
         String token = UUIDUtils.newUUID();
+        user.setLastLoginAt(LocalDateTime.now());
+        userAccountsRepository.save(user);
+
         UserContextDTO userContextDTO = new UserContextDTO();
         userContextDTO.setName(user.getName());
         userContextDTO.setOwnerId(user.getOwnerId());
@@ -165,6 +171,11 @@ public class AuthServiceImpl implements AuthService {
             cache.put(userName, lockInfo);
             throw SecretpadException.of(AuthErrorCode.USER_PASSWORD_ERROR, String.valueOf(maxAttempts - --failedAttempts));
         }
+        if (!adminName.equalsIgnoreCase(user.getName())
+                && !"ENABLED".equalsIgnoreCase(user.getAccountStatus())) {
+            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "account is disabled");
+        }
+
         //checkPassword success
         if (user.getPasswordHash().equals(passwordHash)) {
             //lock invalid
