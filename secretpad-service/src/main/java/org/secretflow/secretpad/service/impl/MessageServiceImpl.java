@@ -53,6 +53,7 @@ import org.springframework.util.CollectionUtils;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -190,14 +191,19 @@ public class MessageServiceImpl implements MessageService {
         if (!isInitiator) {
             List<VoteInviteDO> voteInviteDOS = voteInviteCustomRepository.pageQuery(ownerId, isProcessed, type, keyWord, page);
             Long total = voteInviteCustomRepository.queryCount(ownerId, isProcessed, type, keyWord);
-            List<MessageVO> messageVOS = PageUtils.convert(voteInviteDOS, this::convert2VO);
+            List<MessageVO> messageVOS = dropInvalid(PageUtils.convert(voteInviteDOS, this::convert2VO));
             return MessageListVO.newInstance(messageVOS, page.getPageNumber() + 1, page.getPageSize(), total);
         } else {
             List<VoteRequestDO> voteRequestDOS = voteRequestCustomRepository.pageQuery(ownerId, type, keyWord, isProcessed, page);
             Long total = voteRequestCustomRepository.queryCount(ownerId, type, keyWord);
-            List<MessageVO> messageVOS = PageUtils.convert(voteRequestDOS, this::convert2VO);
+            List<MessageVO> messageVOS = dropInvalid(PageUtils.convert(voteRequestDOS, this::convert2VO));
             return MessageListVO.newInstance(messageVOS, page.getPageNumber() + 1, page.getPageSize(), total);
         }
+    }
+
+    /** 关联记录缺失时单条消息会转换为 null，此处剔除以免整页列表无法渲染。 */
+    private List<MessageVO> dropInvalid(List<MessageVO> messageVOS) {
+        return messageVOS.stream().filter(Objects::nonNull).collect(Collectors.toList());
     }
 
     @Override
