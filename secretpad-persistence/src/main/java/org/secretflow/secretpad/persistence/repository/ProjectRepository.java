@@ -38,6 +38,16 @@ public interface ProjectRepository extends BaseRepository<ProjectDO, String> {
     boolean existsByOwnerIdAndName(String ownerId, String name);
 
     /**
+     * Check whether another project of the same owner already uses the name
+     *
+     * @param ownerId   target ownerId
+     * @param name      target project name
+     * @param projectId the project being renamed, excluded from the check
+     * @return whether the name is taken
+     */
+    boolean existsByOwnerIdAndNameAndProjectIdNot(String ownerId, String name, String projectId);
+
+    /**
      * Query project list by status for p2p mode
      *
      * @param status target status

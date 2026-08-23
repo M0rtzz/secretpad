@@ -390,6 +390,7 @@ public class DataAssetService {
     }
 
     public Map<String, Object> preview(String id, int requestedLimit) {
+        requireAssetAccess(id);
         Map<String, Object> asset = catalogAsset(id);
         int limit = Math.max(1, Math.min(requestedLimit, 100));
         Map<String, Object> result = new LinkedHashMap<>();
@@ -453,6 +454,17 @@ public class DataAssetService {
             throw new IllegalStateException("读取数据预览失败", e);
         }
         return result;
+    }
+
+    /** 数据目录设置的访问时间窗：超出窗口后不再返回任何样例数据。 */
+    private void requireAssetAccess(String id) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select access_start,access_end from ds_asset_usage_control where asset_id=?", id);
+        if (rows.isEmpty()) return;
+        Map<String, Object> control = rows.get(0);
+        if (!AssetTimeWindow.within(control.get("access_start"), control.get("access_end"))) {
+            throw new SecurityException("该数据已超过访问截止时间，不可预览");
+        }
     }
 
     /** Resolve both local catalog assets and metadata snapshots for project-shared assets. */

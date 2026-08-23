@@ -42,7 +42,10 @@ public class SandboxDataControlService {
                         + "left join ds_sandbox_mount_control c on c.sandbox_id=m.sandbox_id and c.asset_id=m.asset_id "
                         + "where m.deleted=0 and m.status='READY' and (s.owner_id=? or s.owner_id=?) and s.created_by=? "
                         + "order by s.created_at desc,a.name", node, ownerId(), actor());
-        rows.forEach(this::addMountState);
+        rows.forEach(row -> {
+            addMountState(row);
+            applyAssetTimeWindow(row, string(row.get("asset_id")));
+        });
         return rows;
     }
 
@@ -172,7 +175,7 @@ public class SandboxDataControlService {
             if ("MOUNT".equals(kind)) {
                 Map<String, Object> policy = mountPolicy(sandboxId, string(item.get("assetId")));
                 item.putAll(policy);
-                item.put("canPreview", policy.get("canUse"));
+                item.put("canPreview", policy.get("canPreview"));
                 item.put("canExport", false);
             } else if ("RESULT".equals(kind)) {
                 Map<String, Object> policy = resultPolicy(sandboxId, table);
@@ -190,8 +193,8 @@ public class SandboxDataControlService {
     public void requireTablePreview(String sandboxId, String tableName) {
         Map<String, Object> dir = dataDir(sandboxId, tableName);
         String kind = string(dir.get("kind"));
-        if ("MOUNT".equals(kind) && !mountAllowed(sandboxId, string(dir.get("asset_id")))) {
-            throw new SecurityException("该挂载数据已被禁止使用或已超过使用截止时间");
+        if ("MOUNT".equals(kind) && !mountPreviewAllowed(sandboxId, string(dir.get("asset_id")))) {
+            throw new SecurityException("该挂载数据不可预览：已被禁止使用，或已超过数据目录设置的访问 / 使用截止时间");
         }
         if ("RESULT".equals(kind) && !bool(resultPolicy(sandboxId, tableName).get("canPreview"), false)) {
             throw new SecurityException("开发结果已超过查看截止时间");
@@ -268,11 +271,37 @@ public class SandboxDataControlService {
         Map<String, Object> policy = rows.isEmpty() ? new LinkedHashMap<>() : new LinkedHashMap<>(rows.get(0));
         policy.putIfAbsent("allow_use", 1);
         addMountState(policy);
+        applyAssetTimeWindow(policy, assetId);
         return policy;
     }
 
     private boolean mountAllowed(String sandboxId, String assetId) {
         return bool(mountPolicy(sandboxId, assetId).get("canUse"), false);
+    }
+
+    private boolean mountPreviewAllowed(String sandboxId, String assetId) {
+        return bool(mountPolicy(sandboxId, assetId).get("canPreview"), false);
+    }
+
+    /**
+     * 叠加数据目录为该资产设置的时间窗：使用截止时间决定能否参与计算，访问截止时间决定能否预览。
+     * 数据目录的设置对所有沙箱统一生效，因此与沙箱内的挂载开关取交集。
+     */
+    private void applyAssetTimeWindow(Map<String, Object> policy, String assetId) {
+        List<Map<String, Object>> rows = jdbc.queryForList("select access_start,access_end,valid_from,valid_until "
+                + "from ds_asset_usage_control where asset_id=?", assetId);
+        Map<String, Object> control = rows.isEmpty() ? new LinkedHashMap<>() : rows.get(0);
+        boolean canUse = bool(policy.get("canUse"), false);
+        if (canUse && !AssetTimeWindow.within(control.get("valid_from"), control.get("valid_until"))) {
+            canUse = false;
+            policy.put("disabledReason", "已超过数据目录设置的使用截止时间");
+        }
+        boolean canPreview = canUse && AssetTimeWindow.within(control.get("access_start"), control.get("access_end"));
+        if (canUse && !canPreview) {
+            policy.put("disabledReason", "已超过数据目录设置的访问截止时间");
+        }
+        policy.put("canUse", canUse);
+        policy.put("canPreview", canPreview);
     }
 
     private Map<String, Object> dataDir(String sandboxId, String tableName) {

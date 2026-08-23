@@ -272,6 +272,11 @@ public class ProjectServiceImpl implements ProjectService {
             throw SecretpadException.of(ProjectErrorCode.PROJECT_UPDATE_FAIL);
         }
         if (!Strings.isNullOrEmpty(request.getName())) {
+            // 改名与新建同样受同一机构下项目名唯一约束，排除项目自身
+            if (projectRepository.existsByOwnerIdAndNameAndProjectIdNot(
+                    project.getOwnerId(), request.getName(), project.getProjectId())) {
+                throw SecretpadException.of(ProjectErrorCode.PROJECT_NAME_ALREADY_EXISTS);
+            }
             project.setName(request.getName());
         }
         if (!Strings.isNullOrEmpty(request.getDescription())) {
