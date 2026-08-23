@@ -69,6 +69,14 @@ public class SandboxCanvasController {
         return SecretPadResponse.success(service.nodeLogs(canvasId, nodeId, runId));
     }
 
+    /** 节点当前输入数据表（schema + 预览行）：处理列/预测列下拉候选与「查看输入数据表」预览。 */
+    @GetMapping("/node/input")
+    public SecretPadResponse<Map<String, Object>> nodeInput(
+            @RequestParam String canvasId, @RequestParam String nodeId,
+            @RequestParam(defaultValue = "20") int limit) {
+        return SecretPadResponse.success(service.nodeInput(canvasId, nodeId, limit));
+    }
+
     @GetMapping("/data-resources")
     public SecretPadResponse<Map<String, Object>> dataResources(@RequestParam String sandboxId) {
         return SecretPadResponse.success(service.dataResources(sandboxId));

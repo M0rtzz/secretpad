@@ -422,6 +422,17 @@ public class SandboxDbService {
                 .anyMatch(e -> safeTable.equals(string(e.get("table_name"))) && "OPERATOR".equals(string(e.get("kind"))));
     }
 
+    /** 沙箱清单中表的显示名（画布中间结果友好名）；清单无 name 时回退为表名本身。 */
+    public String tableDisplayName(String sandboxId, String tableName) {
+        String safeTable = SqliteTableLoader.sanitizeTableName(tableName);
+        return readManifest(sandboxDbPath(sanitizeSandboxId(sandboxId))).stream()
+                .filter(e -> safeTable.equals(string(e.get("table_name"))))
+                .map(e -> string(e.get("name")))
+                .filter(n -> !n.isBlank())
+                .findFirst()
+                .orElse(tableName);
+    }
+
     /* ------------------------------ 清单/系统表 ------------------------------ */
 
     private void requireKnownTable(Path db, String table) {

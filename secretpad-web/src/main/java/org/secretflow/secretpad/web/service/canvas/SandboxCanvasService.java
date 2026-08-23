@@ -233,6 +233,7 @@ public class SandboxCanvasService {
             preview.put("nodeId", nodeId);
             preview.put("runId", resolvedRunId);
             preview.put("taskId", nodeRun.get("task_id"));
+            preview.put("displayName", sandboxDb.tableDisplayName(sandboxId, table));
             preview.put("snapshotSource", virtual ? "MOUNT_TABLE" : "RUN_TABLE");
             preview.put("previewOnly", false);
             return preview;
@@ -292,6 +293,7 @@ public class SandboxCanvasService {
         result.put("nodeId", nodeId);
         result.put("runId", runId);
         result.put("taskId", taskId);
+        result.put("displayName", table);
         result.put("snapshotSource", "TASK_PREVIEW");
         result.put("previewOnly", true);
         return result;
@@ -305,6 +307,7 @@ public class SandboxCanvasService {
     private Map<String, Object> unavailableOutput(String table, String runId, String nodeId, String message) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("tableName", table);
+        result.put("displayName", table);
         result.put("available", false);
         result.put("message", message);
         result.put("schema", List.of());
@@ -350,26 +353,160 @@ public class SandboxCanvasService {
         return result;
     }
 
+    /**
+     * 节点当前输入数据表（节点配置抽屉用）：解析入边 → 上游 data.table 挂载表或上游组件最近一次成功输出
+     * 的 op_* 表，返回 schema + 预览行。用于处理列/预测列下拉候选与「查看输入数据表」预览。
+     */
+    public Map<String, Object> nodeInput(String canvasId, String nodeId, int limit) {
+        Map<String, Object> canvas = requireCanvas(canvasId);
+        String sandboxId = string(canvas.get("sandbox_id"));
+        requireUsableSandbox(sandboxId, false);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("nodeId", nodeId);
+        result.put("available", false);
+        result.put("tableName", "");
+        result.put("displayName", "");
+        result.put("schema", List.of());
+        result.put("rows", List.of());
+        result.put("totalRows", 0);
+        result.put("message", "");
+        GraphModel graph = parseGraph(string(canvas.get("graph_json")));
+        Node node = graph.nodeById(nodeId);
+        if (node == null) {
+            result.put("message", "画布节点不存在: " + nodeId);
+            return result;
+        }
+        List<String> sources = new ArrayList<>();
+        for (Edge edge : graph.edges) {
+            if (edge.target.equals(nodeId)) {
+                sources.add(edge.source);
+            }
+        }
+        if (sources.isEmpty()) {
+            result.put("message", "该节点暂无输入（请从数据资源节点连线）");
+            return result;
+        }
+        if (sources.size() > 1) {
+            result.put("message", "该节点存在多个输入，当前仅支持单输入算子");
+            return result;
+        }
+        Node source = graph.nodeById(sources.get(0));
+        String table;
+        if (CanvasOperatorRegistry.isVirtual(source.componentCode)) {
+            table = string(source.params.get("table"));
+            if (!sandboxDb.hasTable(sandboxId, table)) {
+                result.put("message", "上游数据资源节点未配置挂载表: " + sources.get(0));
+                return result;
+            }
+        } else {
+            table = latestOutputTable(sandboxId, canvasId, source.id);
+            if (!sandboxDb.hasTable(sandboxId, table)) {
+                result.put("message", "上游组件尚未成功运行，暂无输入数据（请先执行上游节点）");
+                return result;
+            }
+        }
+        try {
+            dataControl.requireMountTableUsable(sandboxId, table);
+        } catch (Exception e) {
+            result.put("message", e.getMessage());
+            return result;
+        }
+        Map<String, Object> preview = sandboxDb.previewTable(sandboxId, table, Math.max(1, Math.min(limit, 100)));
+        result.putAll(preview);
+        result.put("available", true);
+        result.put("message", "");
+        result.put("displayName", sandboxDb.tableDisplayName(sandboxId, table));
+        result.put("sourceNodeId", source.id);
+        result.put("sourceComponentCode", source.componentCode);
+        return result;
+    }
+
     /* ============================== 画布数据资源（节点配置用） ============================== */
 
-    /** 画布可用数据资源：沙箱挂载表 + op_* 画布输出表（不含 result_*），供 data.table/compare_table/列选择。 */
+    /**
+     * 画布可用数据资源：沙箱挂载表 + op_* 中间结果（不含 result_*），供 data.table/compare_table/列选择。
+     * 中间结果语义：每次执行组件节点产出结果数据都会记录一条，命名为「<组件/节点名>输出数据<N>」，
+     * 例如数据资源节点的输出、标准化节点的「标准化输出数据1」。op_* 名称友好化（兼容历史「画布输出-*」命名）。
+     */
     public Map<String, Object> dataResources(String sandboxId) {
         requireUsableSandbox(sandboxId, false);
         Map<String, Object> dir = dataControl.enrichDirectory(sandboxDb.directory(sandboxId));
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> items = (List<Map<String, Object>>) dir.get("items");
         List<Map<String, Object>> resources = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
         for (Map<String, Object> item : items) {
             String kind = string(item.get("kind"));
-            if (!Set.of("MOUNT", "OPERATOR").contains(kind)) {
+            String table = string(item.get("tableName"));
+            if (!Set.of("MOUNT", "OPERATOR").contains(kind) || !seen.add(table)) {
                 continue;
             }
+            if ("OPERATOR".equals(kind)) {
+                enrichOperatorDisplayName(item);
+            }
+            resources.add(item);
+        }
+        // 数据资源节点（data.table）每次成功执行也记录为中间结果，命名为「<节点名>输出数据<N>」
+        for (Map<String, Object> run : dataTableNodeRuns()) {
+            String table = string(run.get("output_table"));
+            if (!notBlank(table) || !seen.add(table)) {
+                continue;
+            }
+            String displayName = runNodeDisplayName(string(run.get("canvas_id")), string(run.get("node_id")));
+            if (displayName == null) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("tableName", table);
+            item.put("name", displayName);
+            item.put("kind", "OPERATOR");
+            item.put("columns", tableColumns(sandboxId, table));
+            item.put("canPreview", true);
             resources.add(item);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("sandboxId", sandboxId);
         result.put("resources", resources);
         return result;
+    }
+
+    /** 数据资源节点（data.table）的成功运行记录（每次执行一条）。 */
+    private List<Map<String, Object>> dataTableNodeRuns() {
+        return jdbc.queryForList(
+                "select canvas_id,node_id,output_table from ds_compute_node_run "
+                        + "where status='SUCCEEDED' and deleted=0 and component_code='data.table' "
+                        + "and output_table<>'' order by finished_at desc,created_at desc");
+    }
+
+    /** op_* 中间结果友好名：从所属画布节点名推导，兼容历史「画布输出-*」命名。 */
+    private void enrichOperatorDisplayName(Map<String, Object> item) {
+        String table = string(item.get("tableName"));
+        if (!notBlank(table) || !table.startsWith("op_")) {
+            return;
+        }
+        List<Map<String, Object>> nrs = jdbc.queryForList(
+                "select canvas_id,node_id from ds_compute_node_run where output_table=? "
+                        + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
+                table);
+        if (nrs.isEmpty()) {
+            return;
+        }
+        String displayName = runNodeDisplayName(string(nrs.get(0).get("canvas_id")), string(nrs.get(0).get("node_id")));
+        if (displayName != null) {
+            item.put("displayName", displayName);
+        }
+    }
+
+    /** 通过画布 graph_json 定位节点并推导输出友好名；画布已删/节点缺失返回 null。 */
+    private String runNodeDisplayName(String canvasId, String nodeId) {
+        try {
+            Map<String, Object> canvas = requireCanvas(canvasId);
+            GraphModel graph = parseGraph(string(canvas.get("graph_json")));
+            Node node = graph.nodeById(nodeId);
+            return node == null ? null : operatorOutputName(node, graph);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /* ============================== 模板 ============================== */
@@ -422,24 +559,142 @@ public class SandboxCanvasService {
                 canvasId);
     }
 
-    /** 查询画布训练节点最近生成的可执行模型，供“保存为模型”时选择输出节点。 */
+    /**
+     * 查询「可执行的工作流结果」候选：工作流中最近一次成功运行的最终输出节点（终态节点）。
+     * 每个候选携带输出表与整个工作流的输入数据（数据资源挂载表 + 列），供保存模型时确定 API 输入/输出。
+     */
     public List<Map<String, Object>> modelCandidates(String canvasId) {
         Map<String, Object> canvas = requireCanvas(canvasId);
-        requireUsableSandbox(string(canvas.get("sandbox_id")), false);
-        List<Map<String, Object>> rows = jdbc.queryForList(
-                "select nr.model_id,nr.node_id,nr.component_code,nr.finished_at,m.name,m.status,m.version "
-                        + "from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
-                        + "where nr.canvas_id=? and nr.deleted=0 and nr.status='SUCCEEDED' and nr.model_id<>'' "
-                        + "order by nr.finished_at desc",
-                canvasId);
+        String sandboxId = string(canvas.get("sandbox_id"));
+        requireUsableSandbox(sandboxId, false);
+        GraphModel graph = parseGraph(string(canvas.get("graph_json")));
+        Map<String, Object> input = workflowInput(graph, sandboxId);
+        String inputTable = string(input.get("table"));
+        List<String> inputColumns = new ArrayList<>();
+        Object ic = input.get("columns");
+        if (ic instanceof List<?> list) {
+            for (Object o : list) {
+                inputColumns.add(String.valueOf(o));
+            }
+        }
+        List<Map<String, Object>> rows = List.of();
+        List<Map<String, Object>> runs = jdbc.queryForList(
+                "select id from ds_compute_run where canvas_id=? and deleted=0 order by created_at desc limit 1", canvasId);
+        if (!runs.isEmpty()) {
+            rows = jdbc.queryForList("select * from ds_compute_node_run where run_id=? and status='SUCCEEDED' and deleted=0 "
+                    + "order by finished_at asc,created_at asc", string(runs.get(0).get("id")));
+        }
         List<Map<String, Object>> result = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
-        for (Map<String, Object> row : rows) {
-            if (seen.add(string(row.get("model_id")))) {
-                result.add(row);
+        for (Map<String, Object> nr : rows) {
+            String nodeId = string(nr.get("node_id"));
+            Node node = graph.nodeById(nodeId);
+            if (node == null || !isTerminal(graph, nodeId) || !seen.add(nodeId)) {
+                continue;
+            }
+            result.add(candidateRow(nr, node, inputTable, inputColumns));
+        }
+        if (result.isEmpty()) {
+            // 最近一次运行无成功终态节点：回退到任意一次成功运行的终态节点
+            for (Map<String, Object> nr : jdbc.queryForList(
+                    "select * from ds_compute_node_run where canvas_id=? and status='SUCCEEDED' and deleted=0 "
+                            + "order by finished_at desc,created_at desc limit 50", canvasId)) {
+                String nodeId = string(nr.get("node_id"));
+                Node node = graph.nodeById(nodeId);
+                if (node == null || !isTerminal(graph, nodeId) || !seen.add(nodeId)) {
+                    continue;
+                }
+                result.add(candidateRow(nr, node, inputTable, inputColumns));
             }
         }
         return result;
+    }
+
+    private Map<String, Object> candidateRow(Map<String, Object> nr, Node node, String inputTable, List<String> inputColumns) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("node_id", node.id);
+        item.put("node_name", node.name);
+        item.put("name", node.name);
+        item.put("component_code", node.componentCode);
+        item.put("output_table", string(nr.get("output_table")));
+        item.put("model_id", string(nr.get("model_id")));
+        item.put("status", string(nr.get("status")));
+        item.put("finished_at", string(nr.get("finished_at")));
+        item.put("input_table", inputTable);
+        item.put("input_columns", inputColumns);
+        return item;
+    }
+
+    /** 工作流输入数据：第一个已配置的数据资源节点（data.table 挂载表 + 列）。 */
+    private Map<String, Object> workflowInput(GraphModel graph, String sandboxId) {
+        for (Node n : graph.nodes) {
+            if (CanvasOperatorRegistry.isVirtual(n.componentCode)) {
+                String t = string(n.params.get("table"));
+                if (notBlank(t) && sandboxDb.hasTable(sandboxId, t)) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("table", t);
+                    m.put("columns", tableColumns(sandboxId, t));
+                    m.put("nodeName", n.name);
+                    return m;
+                }
+            }
+        }
+        return Map.of("table", "", "columns", List.of(), "nodeName", "");
+    }
+
+    /** 是否终态节点（无下游出边 = 工作流最终输出）。 */
+    private boolean isTerminal(GraphModel graph, String nodeId) {
+        for (Edge edge : graph.edges) {
+            if (edge.source.equals(nodeId)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 节点最近一次成功运行的输出表（op_*）；无记录时回退到 legacy 画布级输出表名。 */
+    private String latestOutputTable(String sandboxId, String canvasId, String nodeId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select output_table from ds_compute_node_run where canvas_id=? and node_id=? "
+                        + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
+                canvasId, nodeId);
+        String table = rows.isEmpty() ? "" : string(rows.get(0).get("output_table"));
+        if (notBlank(table) && sandboxDb.hasTable(sandboxId, table)) {
+            return table;
+        }
+        return legacyOpTableName(canvasId, nodeId);
+    }
+
+    /** 沙箱表列名（通过预览 schema 读取；不可读时返回空）。 */
+    private List<String> tableColumns(String sandboxId, String table) {
+        try {
+            Map<String, Object> p = sandboxDb.previewTable(sandboxId, table, 1);
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> schema = (List<Map<String, Object>>) p.get("schema");
+            List<String> cols = new ArrayList<>();
+            for (Map<String, Object> c : schema) {
+                cols.add(string(c.get("name")));
+            }
+            return cols;
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    /** 画布节点输出友好名：<节点名>输出数据<同名序号>，如「标准化输出数据1」。 */
+    private String operatorOutputName(Node node, GraphModel graph) {
+        int idx = 0;
+        String base = notBlank(node.name) ? node.name : node.componentCode;
+        for (Node n : graph.nodes) {
+            String nName = notBlank(n.name) ? n.name : n.componentCode;
+            if (Objects.equals(base, nName)) {
+                idx++;
+                if (n.id.equals(node.id)) {
+                    break;
+                }
+            }
+        }
+        return base + "输出数据" + idx;
     }
 
     /**
@@ -461,11 +716,34 @@ public class SandboxCanvasService {
         topoSort(graph);
 
         String modelId = string(request.get("modelId"));
+        String nodeId = string(request.get("nodeId"));
         String sourceNodeId = "";
         String status = "DRAFT";
-        if (notBlank(modelId)) {
+        String outputTable = "";
+        String outputColumns = "[]";
+        String sandboxId = string(canvas.get("sandbox_id"));
+        if (notBlank(nodeId)) {
+            // 前端选择「可执行工作流结果」节点：取其最近一次成功运行的输出表与模型
+            List<Map<String, Object>> nrs = jdbc.queryForList(
+                    "select model_id,output_table from ds_compute_node_run where canvas_id=? and node_id=? "
+                            + "and status='SUCCEEDED' and deleted=0 order by finished_at desc,created_at desc limit 1",
+                    canvasId, nodeId);
+            if (nrs.isEmpty()) {
+                throw new IllegalArgumentException("所选工作流结果节点尚未成功运行: " + nodeId);
+            }
+            modelId = string(nrs.get(0).get("model_id"));
+            sourceNodeId = nodeId;
+            outputTable = string(nrs.get(0).get("output_table"));
+            if (notBlank(modelId)) {
+                status = "READY";
+            }
+            if (notBlank(outputTable) && sandboxDb.hasTable(sandboxId, outputTable)) {
+                outputColumns = json(tableColumns(sandboxId, outputTable));
+            }
+        } else if (notBlank(modelId)) {
+            // 兼容旧调用：仅传 modelId（训练节点产物）
             List<Map<String, Object>> candidates = jdbc.queryForList(
-                    "select nr.node_id from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
+                    "select nr.node_id,nr.output_table from ds_compute_node_run nr join ds_model m on m.id=nr.model_id and m.deleted=0 "
                             + "where nr.canvas_id=? and nr.model_id=? and nr.status='SUCCEEDED' and nr.deleted=0 "
                             + "order by nr.finished_at desc limit 1",
                     canvasId, modelId);
@@ -473,8 +751,16 @@ public class SandboxCanvasService {
                 throw new IllegalArgumentException("所选模型不是该画布成功训练产生的模型");
             }
             sourceNodeId = string(candidates.get(0).get("node_id"));
+            outputTable = string(candidates.get(0).get("output_table"));
             status = "READY";
+            if (notBlank(outputTable) && sandboxDb.hasTable(sandboxId, outputTable)) {
+                outputColumns = json(tableColumns(sandboxId, outputTable));
+            }
         }
+        // 工作流输入数据（数据资源挂载表 + 列），供发布 API 时确定输入 schema
+        Map<String, Object> input = workflowInput(graph, sandboxId);
+        String inputTable = string(input.get("table"));
+        String inputColumns = json(input.get("columns"));
 
         String name = string(request.get("name"));
         if (!notBlank(name)) {
@@ -483,12 +769,15 @@ public class SandboxCanvasService {
         String id = "cm-" + shortId();
         String now = now();
         jdbc.update("insert into ds_compute_canvas_model(id,canvas_id,canvas_version,model_id,source_node_id,name,"
-                        + "description,graph_json,status,created_by,created_at,updated_at,deleted) "
-                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                        + "description,graph_json,status,input_table,input_columns,output_table,output_columns,"
+                        + "created_by,created_at,updated_at,deleted) "
+                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 id, canvasId, intValue(canvas.get("version"), 1), modelId, sourceNodeId, name,
-                string(request.get("description")), graphJson, status, actor(), now, now);
+                string(request.get("description")), graphJson, status,
+                inputTable, inputColumns, outputTable, outputColumns, actor(), now, now);
         audit("CANVAS_MODEL_SAVED", "CANVAS_MODEL", id,
-                "canvas=" + canvasId + " version=" + canvas.get("version") + " model=" + modelId, true);
+                "canvas=" + canvasId + " version=" + canvas.get("version") + " model=" + modelId
+                        + " input=" + inputTable + " output=" + outputTable, true);
         return requireCanvasModel(id);
     }
 
@@ -659,7 +948,7 @@ public class SandboxCanvasService {
             if (rows.isEmpty()) {
                 throw new IllegalStateException("节点无有效输出行");
             }
-            sandboxDb.backfillOperatorTable(sandboxId, runId, node.id, "画布输出-" + node.componentCode, header, rows);
+            sandboxDb.backfillOperatorTable(sandboxId, runId, node.id, operatorOutputName(node, graph), header, rows);
             Map<String, Object> summary = new LinkedHashMap<>();
             summary.put("header", header);
             summary.put("rowCount", rows.size());
