@@ -74,6 +74,49 @@ public class NodeRouteManagerTest {
         verify(kusciaGrpcClientAdapter, times(1)).deleteDomainRoute(any(), any());
     }
 
+    @Test
+    public void testBuildRouteEndpointUsesLegacyOverrides() {
+        DomainRoute.RouteEndpoint ghostEndpoint = buildRouteEndpoint(
+                "https://data-sandbox-dev-ghost-kuscia:1080");
+        Assertions.assertEquals("222.20.99.38", ghostEndpoint.getHost());
+        Assertions.assertEquals(59080, ghostEndpoint.getPorts(0).getPort());
+        Assertions.assertTrue(ghostEndpoint.getPorts(0).getIsTLS());
+
+        DomainRoute.RouteEndpoint zgznewEndpoint = buildRouteEndpoint(
+                "https://data-sandbox-dev-zgznew-kuscia:1080");
+        Assertions.assertEquals("222.20.99.38", zgznewEndpoint.getHost());
+        Assertions.assertEquals(29080, zgznewEndpoint.getPorts(0).getPort());
+        Assertions.assertTrue(zgznewEndpoint.getPorts(0).getIsTLS());
+    }
+
+    @Test
+    public void testBuildRouteEndpointPreservesDirectGatewayAddress() {
+        DomainRoute.RouteEndpoint endpoint = buildRouteEndpoint("https://222.20.99.38:59080");
+
+        Assertions.assertEquals("222.20.99.38", endpoint.getHost());
+        Assertions.assertEquals(59080, endpoint.getPorts(0).getPort());
+        Assertions.assertTrue(endpoint.getPorts(0).getIsTLS());
+    }
+
+    @Test
+    public void testBuildRouteEndpointPreservesOtherAddress() {
+        DomainRoute.RouteEndpoint endpoint = buildRouteEndpoint(
+                "https://data-sandbox-dev-ghost-kuscia.example:1080");
+
+        Assertions.assertEquals("data-sandbox-dev-ghost-kuscia.example", endpoint.getHost());
+        Assertions.assertEquals(1080, endpoint.getPorts(0).getPort());
+        Assertions.assertTrue(endpoint.getPorts(0).getIsTLS());
+    }
+
+    private DomainRoute.RouteEndpoint buildRouteEndpoint(String address) {
+        NodeDO dstNode = NodeDO.builder()
+                .nodeId("dst-node")
+                .name("Test dstNode")
+                .netAddress(address)
+                .build();
+        return ReflectionTestUtils.invokeMethod(nodeRouteManager, "buildRouteEndpoint", dstNode);
+    }
+
     /**
      * test deleteNodeRouteInKuscia FailureCase
      */

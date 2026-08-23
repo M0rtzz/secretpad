@@ -40,6 +40,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.net.URL;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.secretflow.secretpad.common.constant.Constants.PROTOCOL_HTTPS;
@@ -55,6 +56,11 @@ public class NodeRouteManager extends AbstractNodeRouteManager {
 
     private final NodeRouteRepository nodeRouteRepository;
     private final KusciaGrpcClientAdapter kusciaGrpcClientAdapter;
+
+    private static final Map<String, String> LEGACY_ROUTE_ENDPOINT_OVERRIDES = Map.of(
+            "https://data-sandbox-dev-ghost-kuscia:1080", "https://222.20.99.38:59080",
+            "https://data-sandbox-dev-zgznew-kuscia:1080", "https://222.20.99.38:29080"
+    );
 
     @Value("${secretpad.platform-type}")
     private String platformType;
@@ -184,7 +190,9 @@ public class NodeRouteManager extends AbstractNodeRouteManager {
     }
 
     private DomainRoute.RouteEndpoint buildRouteEndpoint(NodeDO dstNode) {
-        URL url = extractProtocolHostIP(dstNode.getNetAddress());
+        String originalAddress = dstNode.getNetAddress();
+        String routeAddress = LEGACY_ROUTE_ENDPOINT_OVERRIDES.getOrDefault(originalAddress, originalAddress);
+        URL url = extractProtocolHostIP(routeAddress);
         String host = url.getHost();
         int port = url.getPort();
         DomainRoute.EndpointPort.Builder builder = DomainRoute.EndpointPort.newBuilder();
