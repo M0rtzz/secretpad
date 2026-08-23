@@ -169,7 +169,14 @@ public class ModelApiApprovalService {
 
     /* ============================== 列表 ============================== */
 
-    /** 我的申请：本节点/本用户提交的 MODEL_API 申请单。 */
+    /**
+     * 我的申请：本节点发起的 MODEL_API 申请单。
+     *
+     * <p>归属以 {@code applicant_node_id}（提交时写入的申请方节点）为准，而非 {@code submitter}：
+     * 后者是用户名，申请单经 P2P 快照同步到审批方节点后原样保留，各节点账号重名时会被误判为
+     * 本节点申请，导致同一工单同时出现在「我的申请」与「待我审批」。管理员放宽到本节点全部
+     * 申请单，仍不跨节点。</p>
+     */
     public List<Map<String, Object>> listMine(String status, String keyword) {
         sandboxApprovalService.applySyncedApprovals();
         String submitter = actor();
@@ -178,10 +185,11 @@ public class ModelApiApprovalService {
         StringBuilder sql = new StringBuilder(
                 "select * from ds_sandbox_approval where deleted=0 and approval_type=?");
         List<Object> args = new ArrayList<>(List.of(APPROVAL_TYPE));
+        sql.append(" and applicant_node_id=?");
+        args.add(applicant);
         if (!admin) {
-            sql.append(" and (submitter=? or applicant_node_id=?)");
+            sql.append(" and submitter=?");
             args.add(submitter);
-            args.add(applicant);
         }
         if (notBlank(status)) {
             sql.append(" and status=?");
@@ -416,14 +424,53 @@ public class ModelApiApprovalService {
         }
         for (Map<String, Object> row : jdbc.queryForList(
                 "select id from ds_sandbox_approval where approval_type=? and applicant_node_id=? "
-                        + "and status in ('APPROVED','REJECTED') and deleted=0 order by updated_at asc limit 50",
+                        + "and status in ('APPROVED','REJECTED','EXECUTING','FAILED') and deleted=0 "
+                        + "order by updated_at asc limit 50",
                 APPROVAL_TYPE, applicantNodeId)) {
             try {
-                finalizeModelApi(requireApproval(string(row.get("id"))), string(row.get("status")));
+                Map<String, Object> approval = requireApproval(string(row.get("id")));
+                String resolved = resolveFinalStatus(approval);
+                if (!notBlank(resolved)) {
+                    continue;
+                }
+                repairStatus(approval, resolved);
+                finalizeModelApi(approval, resolved);
             } catch (Exception e) {
                 log.warn("finalize MODEL_API approval {} failed: {}", row.get("id"), e.getMessage());
             }
         }
+    }
+
+    /**
+     * 以投票结果判定终态，不信任申请单 status。{@code ds_sandbox_approval} 为共用表，历史上曾被
+     * 沙箱审批执行引擎认领并置为 EXECUTING/FAILED，仅按 status 判定会让已通过的申请单永久停在
+     * 临时 API 状态。
+     *
+     * @return {@code APPROVED} / {@code REJECTED}，尚未表决完成返回空串
+     */
+    private String resolveFinalStatus(Map<String, Object> approval) {
+        String id = string(approval.get("id"));
+        if (count("select count(1) from ds_sandbox_approval_vote where approval_id=? and status='REJECTED'", id) > 0) {
+            return "REJECTED";
+        }
+        long total = count("select count(1) from ds_sandbox_approval_vote where approval_id=?", id);
+        long pending = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and status='PENDING'", id);
+        return total > 0 && pending == 0 ? "APPROVED" : "";
+    }
+
+    /** 把被其他业务改写的申请单状态修回投票判定的终态，使申请方列表不再显示 EXECUTING/FAILED。 */
+    private void repairStatus(Map<String, Object> approval, String resolved) {
+        String current = string(approval.get("status"));
+        if (resolved.equals(current)) {
+            return;
+        }
+        String id = string(approval.get("id"));
+        jdbc.update("update ds_sandbox_approval set status=?,current_stage=?,last_error='',updated_at=? "
+                        + "where id=? and status in ('EXECUTING','FAILED')",
+                resolved, resolved, now(), id);
+        approval.put("status", resolved);
+        approval.put("current_stage", resolved);
+        log.info("MODEL_API approval {} status repaired {} -> {}", id, current, resolved);
     }
 
     /** 终态落库：APPROVED → API ENABLED + 模型 PUBLISHED；REJECTED → API REJECTED（模型保持 APPROVED）。 */

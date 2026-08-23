@@ -47,6 +47,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Z-03 沙箱资源申请与审批：申请单 CRUD、两级审批动作、权限/并发/幂等控制、审批历史与执行引擎。
@@ -64,6 +65,13 @@ import java.util.concurrent.ConcurrentHashMap;
 public class SandboxApprovalService {
 
     private static final Set<String> APPROVAL_TYPES = Set.of("CREATE", "RENEW", "SPEC_CHANGE", "DATA_CHANGE", "CONFIG_CHANGE", "RECYCLE", "ASSET_DELETE");
+    /**
+     * 执行引擎受理范围的 SQL in 子句。{@code ds_sandbox_approval} 被模型 API 供数方审批
+     * （approval_type=MODEL_API，见 ModelApiApprovalService）等业务共用，轮询必须按类型隔离，
+     * 否则会把他类申请单认领为 EXECUTING 并以「未知申请类型」置为 FAILED，阻断其自身落库流程。
+     */
+    private static final String EXECUTABLE_TYPES_SQL = APPROVAL_TYPES.stream()
+            .sorted().map(type -> "'" + type + "'").collect(Collectors.joining(",", "(", ")"));
     private static final Set<String> APPROVAL_ACTIONS = Set.of("APPROVE", "REJECT", "RESUBMIT", "RETRY", "CANCEL");
     private static final Set<String> NETWORK_POLICIES = Set.of("INTERNAL_ONLY", "ALLOW_LIST", "NO_NETWORK");
     private static final Set<String> OPEN_STATUSES = Set.of("DATA_PROVIDER_REVIEW", "OPERATOR_REVIEW", "APPROVED", "EXECUTING");
@@ -415,6 +423,7 @@ public class SandboxApprovalService {
         applySyncedApprovals();
         for (Map<String, Object> row : jdbc.queryForList(
                 "select id from ds_sandbox_approval where status='APPROVED' and deleted=0 "
+                        + "and approval_type in " + EXECUTABLE_TYPES_SQL + " "
                         + "and (applicant_node_id=? or (coalesce(applicant_node_id,'')='' and owner_id=?)) "
                         + "order by approved_at asc limit 20", executorNodeId, executorNodeId)) {
             String id = string(row.get("id"));
@@ -506,7 +515,8 @@ public class SandboxApprovalService {
     public void reclaimStuckExecuting() {
         String threshold = LocalDateTime.now().minusMinutes(10).toString();
         for (Map<String, Object> row : jdbc.queryForList(
-                "select id,retry_count from ds_sandbox_approval where status='EXECUTING' and updated_at<? and deleted=0", threshold)) {
+                "select id,retry_count from ds_sandbox_approval where status='EXECUTING' and updated_at<? and deleted=0 "
+                        + "and approval_type in " + EXECUTABLE_TYPES_SQL, threshold)) {
             String id = string(row.get("id"));
             int retries = intValue(row.get("retry_count"), 0);
             if (retries >= maxRetries) {
