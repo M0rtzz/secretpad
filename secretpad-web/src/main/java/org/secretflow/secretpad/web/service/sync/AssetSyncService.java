@@ -107,11 +107,10 @@ public class AssetSyncService {
                 throw new IllegalStateException("读取数据失败: " + assetId, e);
             }
         }
-        String checksum = metadataChecksum(asset);
-        if (checksum.isBlank()) {
-            checksum = sha256(bytes);
-        }
-        return new AssetDownload(bytes, checksum);
+        // 同步契约：校验和必须对应当前实际下发的字节。
+        // 资产物化为 SQLite 表后经 CsvUtil 重序列化的 CSV 与原始上传文件字节并不逐字节一致，
+        // 若沿用原始文件的 metadata sha256 会导致请求方下载后校验失败（"校验和不一致"）。
+        return new AssetDownload(bytes, sha256(bytes));
     }
 
     private void authorizeRequester(String assetId, String requesterNodeId) {
@@ -334,20 +333,6 @@ public class AssetSyncService {
         }
         meta.put("provider_node_id", row.get("provider_node_id"));
         return meta;
-    }
-
-    private String metadataChecksum(Map<String, Object> asset) {
-        try {
-            String metadata = string(asset.getOrDefault("metadata_json", "{}"));
-            if (metadata.isBlank() || "{}".equals(metadata)) {
-                return "";
-            }
-            Map<?, ?> map = objectMapper.readValue(metadata, Map.class);
-            Object sha = map.get("sha256");
-            return sha == null ? "" : String.valueOf(sha);
-        } catch (Exception e) {
-            return "";
-        }
     }
 
     private String sha256(byte[] bytes) {
