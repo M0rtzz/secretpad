@@ -49,6 +49,23 @@ public class ModelMetricsEvaluatorTest {
     }
 
     @Test
+    public void equivalentNumericClassificationLabelsAreMatched() {
+        Map<String, Object> m = ModelMetricsEvaluator.evaluate(
+                List.of("0", "1", "1.0", "0.0"),
+                List.of("0.0", "1.0", "1", "0"),
+                "classification", 20);
+        assertEquals(List.of("0", "1"), m.get("classes"));
+        assertEquals(1.0, m.get("accuracy"));
+        assertEquals(1.0, m.get("precision"));
+        assertEquals(1.0, m.get("recall"));
+        assertEquals(1.0, m.get("f1"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> cm = (Map<String, Object>) m.get("confusionMatrix");
+        assertEquals(2, cm.get("tp"));
+        assertEquals(2, cm.get("tn"));
+    }
+
+    @Test
     public void imperfectBinaryClassificationCountsConfusionMatrix() {
         // labels  a a b b a | predictions a a b a b  → 3/5 correct
         Map<String, Object> m = ModelMetricsEvaluator.evaluate(

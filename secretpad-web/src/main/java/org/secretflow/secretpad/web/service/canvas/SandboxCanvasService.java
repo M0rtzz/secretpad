@@ -26,6 +26,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -37,6 +38,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -715,12 +717,68 @@ public class SandboxCanvasService {
         result.put("features", features);
         result.put("excludedFields", excluded);
         result.put("preprocessingSteps", preprocessing);
-        result.put("evaluation", modelEvaluation(string(canvasModel.get("model_id")), testId,
-                sandboxId, trainRun, trainNode, graph, sourceRunId));
+        Map<String, Object> savedEvaluation = savedModelEvaluation(canvasModel);
+        result.put("evaluation", savedEvaluation.isEmpty()
+                ? modelEvaluation(string(canvasModel.get("model_id")), testId,
+                        sandboxId, trainRun, trainNode, graph, sourceRunId)
+                : savedEvaluation);
         result.put("testHistory", modelTestHistory(string(canvasModel.get("model_id"))));
-        result.put("featureImportance", cachedFeatureImportance(trainRun, trainNode));
-        result.put("treeStructure", cachedTreeStructure(trainRun, trainNode));
+        Map<String, Object> reportConfig = parseMapOrEmpty(string(canvasModel.get("report_config")));
+        result.put("reportConfig", reportConfig);
+        List<String> visibleSections = stringList(reportConfig.get("visibleSections"));
+        boolean legacyReportConfig = reportConfig.isEmpty();
+        result.put("featureImportance", legacyReportConfig || visibleSections.contains("featureImportance")
+                ? cachedFeatureImportance(trainRun, trainNode) : Map.of("supported", false, "hidden", true));
+        result.put("treeStructure", legacyReportConfig || visibleSections.contains("treeStructure")
+                ? cachedTreeStructure(trainRun, trainNode) : Map.of("supported", false, "hidden", true));
+        Map<String, Object> fullMetrics = parseMapOrEmpty(string(canvasModel.get("evaluation_metrics")));
+        result.put("scorecard", visibleSections.contains("scorecard")
+                ? parseMapOrEmpty(json(fullMetrics.get("scorecard"))) : Map.of());
         return result;
+    }
+
+    /** 保存模型时已全量计算的指标优先于历史测试和画布评估节点，并按报告配置过滤展示字段。 */
+    private Map<String, Object> savedModelEvaluation(Map<String, Object> canvasModel) {
+        String status = string(canvasModel.get("evaluation_status"));
+        Map<String, Object> full = parseMapOrEmpty(string(canvasModel.get("evaluation_metrics")));
+        if (!"SUCCEEDED".equals(status) || full.isEmpty()) {
+            if (notBlank(status)) {
+                return Map.of(
+                        "status", status,
+                        "message", firstNotBlank(string(canvasModel.get("evaluation_error")), "模型评估结果暂不可用"));
+            }
+            return Map.of();
+        }
+        Map<String, Object> config = parseMapOrEmpty(string(canvasModel.get("report_config")));
+        List<String> selected = stringList(config.get("visibleMetrics"));
+        if (selected.isEmpty()) {
+            selected = applicableMetrics(string(canvasModel.get("task_type")));
+        }
+        Map<String, Object> visible = new LinkedHashMap<>();
+        visible.put("metricType", full.get("metricType"));
+        for (String metric : selected) {
+            if (full.containsKey(metric)) {
+                visible.put(metric, full.get(metric));
+            }
+        }
+        Map<String, Object> evaluation = new LinkedHashMap<>();
+        evaluation.put("status", "AVAILABLE");
+        evaluation.put("source", "MODEL_SAVE");
+        evaluation.put("metricsScope", "CONFIGURED");
+        evaluation.put("metricType", full.get("metricType"));
+        evaluation.put("taskType", canvasModel.get("task_type"));
+        evaluation.put("modelCategory", canvasModel.get("model_category"));
+        evaluation.put("selectedMetrics", selected);
+        evaluation.put("availableMetrics", applicableMetrics(string(canvasModel.get("task_type"))));
+        evaluation.put("sampleCount", full.get("samples"));
+        evaluation.put("positiveLabel", full.get("positiveLabel"));
+        evaluation.put("metrics", visible);
+        evaluation.put("inputSummary", Map.of());
+        evaluation.put("outputSummary", Map.of("rowCount", intValue(full.get("samples"), 0)));
+        evaluation.put("resultPreview", Map.of());
+        evaluation.put("createdAt", canvasModel.get("created_at"));
+        evaluation.put("finishedAt", canvasModel.get("created_at"));
+        return evaluation;
     }
 
     /**
@@ -1012,7 +1070,7 @@ public class SandboxCanvasService {
         Map<String, Object> summary = new LinkedHashMap<>();
         for (String key : List.of("id", "canvas_id", "canvas_version", "model_id", "source_node_id",
                 "source_run_id", "source_task_id", "name", "description", "status", "model_status",
-                "model_version", "created_by", "created_at")) {
+                "model_version", "task_type", "model_category", "evaluation_status", "created_by", "created_at")) {
             summary.put(key, model.get(key));
         }
         return summary;
@@ -1205,6 +1263,11 @@ public class SandboxCanvasService {
      */
     private Map<String, Object> recoveredMetrics(Node trainNode, List<String> columns,
             List<List<String>> rows, int totalRows) {
+        return recoveredMetrics(trainNode, columns, rows, totalRows, Map.of());
+    }
+
+    private Map<String, Object> recoveredMetrics(Node trainNode, List<String> columns,
+            List<List<String>> rows, int totalRows, Map<String, Object> reportConfig) {
         String metricType = CanvasOperatorRegistry.metricType(
                 trainNode.componentCode, trainNode.params.get("task"));
         if ("clustering".equals(metricType)) {
@@ -1235,11 +1298,13 @@ public class SandboxCanvasService {
         if (labels.isEmpty()) {
             return Map.of();
         }
-        Map<String, Object> metrics = new LinkedHashMap<>(
-                ModelMetricsEvaluator.evaluate(labels, predictions, metricType));
+        String positiveLabel = firstNotBlank(string(reportConfig.get("positiveLabel")), "1");
+        Map<String, Object> metrics = "classification".equals(metricType)
+                ? classificationMetrics(labels, predictions, positiveLabel)
+                : new LinkedHashMap<>(ModelMetricsEvaluator.evaluate(labels, predictions, metricType));
         metrics.put("samples", labels.size());
         if ("classification".equals(metricType)) {
-            Double auc = rocAuc(labels, probabilities);
+            Double auc = rocAuc(labels, probabilities, string(metrics.get("positiveLabel")));
             if (auc != null) {
                 metrics.put("auc", auc);
             }
@@ -1247,6 +1312,60 @@ public class SandboxCanvasService {
         if (rows.size() < totalRows) {
             metrics.put("totalRows", totalRows);
         }
+        return metrics;
+    }
+
+    /** 二分类指标统一使用同一正类标签；多分类继续使用宏平均口径。 */
+    private Map<String, Object> classificationMetrics(List<String> labels, List<String> predictions,
+            String requestedPositiveLabel) {
+        labels = labels.stream().map(this::canonicalLabel).toList();
+        predictions = predictions.stream().map(this::canonicalLabel).toList();
+        requestedPositiveLabel = canonicalLabel(requestedPositiveLabel);
+        List<String> classes = new ArrayList<>(new LinkedHashSet<>(labels));
+        for (String prediction : predictions) {
+            if (!classes.contains(prediction)) {
+                classes.add(prediction);
+            }
+        }
+        Collections.sort(classes);
+        if (classes.size() != 2) {
+            return new LinkedHashMap<>(ModelMetricsEvaluator.evaluate(labels, predictions, "classification"));
+        }
+        String positive = classes.contains(requestedPositiveLabel)
+                ? requestedPositiveLabel : classes.get(classes.size() - 1);
+        int tp = 0, fp = 0, fn = 0, tn = 0;
+        for (int i = 0; i < labels.size(); i++) {
+            boolean actualPositive = positive.equals(labels.get(i));
+            boolean predictedPositive = positive.equals(predictions.get(i));
+            if (actualPositive && predictedPositive) {
+                tp++;
+            } else if (!actualPositive && predictedPositive) {
+                fp++;
+            } else if (actualPositive) {
+                fn++;
+            } else {
+                tn++;
+            }
+        }
+        double accuracy = (tp + tn) / (double) labels.size();
+        double precision = tp + fp == 0 ? 0 : tp / (double) (tp + fp);
+        double recall = tp + fn == 0 ? 0 : tp / (double) (tp + fn);
+        double f1 = precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall);
+        Map<String, Object> confusion = new LinkedHashMap<>();
+        confusion.put("positive", positive);
+        confusion.put("tp", tp);
+        confusion.put("fp", fp);
+        confusion.put("fn", fn);
+        confusion.put("tn", tn);
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("metricType", "classification");
+        metrics.put("classes", classes);
+        metrics.put("positiveLabel", positive);
+        metrics.put("accuracy", round6(accuracy));
+        metrics.put("precision", round6(precision));
+        metrics.put("recall", round6(recall));
+        metrics.put("f1", round6(f1));
+        metrics.put("confusionMatrix", confusion);
         return metrics;
     }
 
@@ -1285,13 +1404,19 @@ public class SandboxCanvasService {
      * 标签非二分类、概率列缺失或存在非数值时返回 {@code null}，由调用方省略该指标。
      */
     private Double rocAuc(List<String> labels, List<String> probabilities) {
+        return rocAuc(labels, probabilities, "");
+    }
+
+    private Double rocAuc(List<String> labels, List<String> probabilities, String requestedPositiveLabel) {
+        labels = labels.stream().map(this::canonicalLabel).toList();
+        requestedPositiveLabel = canonicalLabel(requestedPositiveLabel);
         Set<String> classes = new LinkedHashSet<>(labels);
         if (classes.size() != 2 || probabilities.size() != labels.size()) {
             return null;
         }
         List<String> ordered = new ArrayList<>(classes);
         Collections.sort(ordered);
-        String positive = ordered.get(1);
+        String positive = ordered.contains(requestedPositiveLabel) ? requestedPositiveLabel : ordered.get(1);
         List<double[]> scored = new ArrayList<>();
         for (int i = 0; i < labels.size(); i++) {
             String raw = probabilities.get(i);
@@ -1329,6 +1454,16 @@ public class SandboxCanvasService {
             return null;
         }
         return round6((rankSum - positives * (positives + 1) / 2) / (positives * negatives));
+    }
+
+    private String canonicalLabel(String value) {
+        String text = value == null ? "" : value.trim();
+        try {
+            BigDecimal number = new BigDecimal(text).stripTrailingZeros();
+            return number.compareTo(BigDecimal.ZERO) == 0 ? "0" : number.toPlainString();
+        } catch (NumberFormatException e) {
+            return text;
+        }
     }
 
     private static double round6(double value) {
@@ -1462,7 +1597,7 @@ public class SandboxCanvasService {
         for (Map<String, Object> nr : rows) {
             String nodeId = string(nr.get("node_id"));
             Node node = graph.nodeById(nodeId);
-            if (node == null || !isTerminal(graph, nodeId) || !seen.add(nodeId)) {
+            if (node == null || !CanvasOperatorRegistry.isTrain(node.componentCode) || !seen.add(nodeId)) {
                 continue;
             }
             result.add(candidateRow(nr, node, inputTable, inputColumns));
@@ -1474,7 +1609,7 @@ public class SandboxCanvasService {
                             + "order by finished_at desc,created_at desc limit 50", canvasId)) {
                 String nodeId = string(nr.get("node_id"));
                 Node node = graph.nodeById(nodeId);
-                if (node == null || !isTerminal(graph, nodeId) || !seen.add(nodeId)) {
+                if (node == null || !CanvasOperatorRegistry.isTrain(node.componentCode) || !seen.add(nodeId)) {
                     continue;
                 }
                 result.add(candidateRow(nr, node, inputTable, inputColumns));
@@ -1497,7 +1632,209 @@ public class SandboxCanvasService {
         item.put("finished_at", string(nr.get("finished_at")));
         item.put("input_table", inputTable);
         item.put("input_columns", inputColumns);
+        String taskType = CanvasOperatorRegistry.metricType(node.componentCode, node.params.get("task"));
+        item.put("task_type", taskType.toUpperCase(Locale.ROOT));
+        item.put("model_category", supportsTreeStructure(node.componentCode) ? "TREE" : "GENERAL");
+        item.put("label", string(node.params.get("label")));
+        item.put("available_metrics", applicableMetrics(taskType));
+        item.put("available_sections", supportsTreeStructure(node.componentCode)
+                ? List.of("featureImportance", "treeStructure", "scorecard") : List.of());
         return item;
+    }
+
+    private List<String> applicableMetrics(String taskType) {
+        if ("regression".equalsIgnoreCase(taskType)) {
+            return List.of("mae", "rmse", "r2");
+        }
+        if ("clustering".equalsIgnoreCase(taskType)) {
+            return List.of("clusterCount", "clusterDistribution", "clusterRatio");
+        }
+        return List.of("accuracy", "precision", "recall", "f1", "auc", "confusionMatrix");
+    }
+
+    /** 报告配置只决定展示范围；评估执行始终计算当前任务类型的全部适用指标。 */
+    private Map<String, Object> normalizeReportConfig(Object raw, String taskType, String modelCategory) {
+        Map<String, Object> requested = raw instanceof Map<?, ?> map ? mapOf(map) : Map.of();
+        List<String> available = applicableMetrics(taskType);
+        List<String> visible = stringList(requested.get("visibleMetrics"));
+        visible = visible.stream().filter(available::contains).distinct().toList();
+        if (visible.isEmpty()) {
+            visible = available;
+        }
+
+        List<String> sections = new ArrayList<>();
+        if ("TREE".equals(modelCategory)) {
+            List<String> allowed = List.of("featureImportance", "treeStructure", "scorecard");
+            sections.addAll(stringList(requested.get("visibleSections")).stream()
+                    .filter(allowed::contains).distinct().toList());
+            if (!requested.containsKey("visibleSections")) {
+                sections.addAll(allowed);
+            }
+        }
+
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("taskType", taskType);
+        config.put("modelCategory", modelCategory);
+        config.put("visibleMetrics", visible);
+        config.put("visibleSections", sections);
+        if ("CLASSIFICATION".equals(taskType)) {
+            String positiveLabel = firstNotBlank(string(requested.get("positiveLabel")), "1");
+            config.put("positiveLabel", positiveLabel);
+            config.put("threshold", requested.get("threshold") instanceof Number number
+                    ? number.doubleValue() : 0.5);
+        }
+        if ("TREE".equals(modelCategory)) {
+            Map<String, Object> scorecard = requested.get("scorecard") instanceof Map<?, ?> map
+                    ? mapOf(map) : new LinkedHashMap<>();
+            scorecard.putIfAbsent("enabled", true);
+            scorecard.put("mode", "CLASSIFICATION".equals(taskType)
+                    ? "BINARY_RISK" : "CONTINUOUS_REGRESSION");
+            scorecard.putIfAbsent("baseScore", 600);
+            scorecard.putIfAbsent("pdo", 20);
+            scorecard.putIfAbsent("baseOdds", 20);
+            scorecard.putIfAbsent("scoreMin", 300);
+            scorecard.putIfAbsent("scoreMax", 900);
+            scorecard.putIfAbsent("higherScoreForHigherPrediction", true);
+            config.put("scorecard", scorecard);
+        }
+        return config;
+    }
+
+    /** 从训练输出表读取全部行并计算完整指标，展示筛选在报告读取阶段完成。 */
+    private Map<String, Object> fullEvaluation(String sandboxId, String outputTable,
+            Node trainNode, Map<String, Object> reportConfig) {
+        if (!notBlank(outputTable)) {
+            return Map.of();
+        }
+        Map<String, Object> table = sandboxDb.readTable(sandboxId, outputTable);
+        List<String> columns = stringList(table.get("header"));
+        List<List<String>> rows = tableRows(table.get("rows"));
+        Map<String, Object> metrics = new LinkedHashMap<>(
+                recoveredMetrics(trainNode, columns, rows, rows.size(), reportConfig));
+        if (supportsTreeStructure(trainNode.componentCode)) {
+            metrics.put("scorecard", scorecardSummary(columns, rows,
+                    CanvasOperatorRegistry.metricType(trainNode.componentCode, trainNode.params.get("task")),
+                    reportConfig));
+        }
+        return metrics;
+    }
+
+    /** 树模型评分卡使用真实预测输出生成聚合分布，不保存逐行评分。 */
+    private Map<String, Object> scorecardSummary(List<String> columns, List<List<String>> rows,
+            String taskType, Map<String, Object> reportConfig) {
+        Map<String, Object> config = reportConfig.get("scorecard") instanceof Map<?, ?> map
+                ? mapOf(map) : Map.of();
+        if (Boolean.FALSE.equals(config.get("enabled"))) {
+            return Map.of("status", "DISABLED");
+        }
+        int valueIndex = columns.indexOf("classification".equals(taskType) ? "pred_prob" : "pred");
+        if (valueIndex < 0) {
+            return Map.of("status", "UNAVAILABLE", "message",
+                    "classification".equals(taskType) ? "缺少 pred_prob 概率列" : "缺少 pred 预测列");
+        }
+        List<Double> values = new ArrayList<>();
+        for (List<String> row : rows) {
+            if (valueIndex >= row.size()) {
+                continue;
+            }
+            try {
+                values.add(Double.parseDouble(row.get(valueIndex)));
+            } catch (Exception ignored) {
+                // 非数值行不进入评分卡汇总，评估样本数会反映实际参与数量。
+            }
+        }
+        if (values.isEmpty()) {
+            return Map.of("status", "UNAVAILABLE", "message", "预测列没有可评分的数值");
+        }
+        List<Double> scores = new ArrayList<>();
+        Map<String, Object> result = new LinkedHashMap<>();
+        if ("classification".equals(taskType)) {
+            double baseScore = number(config.get("baseScore"), 600);
+            double pdo = number(config.get("pdo"), 20);
+            double baseOdds = Math.max(number(config.get("baseOdds"), 20), 0.000001);
+            double factor = pdo / Math.log(2);
+            double offset = baseScore + factor * Math.log(baseOdds);
+            for (double probability : values) {
+                double p = Math.max(0.000001, Math.min(0.999999, probability));
+                scores.add(offset - factor * Math.log(p / (1 - p)));
+            }
+            result.put("mode", "BINARY_RISK");
+            result.put("baseScore", baseScore);
+            result.put("pdo", pdo);
+            result.put("baseOdds", baseOdds);
+        } else {
+            List<Double> sorted = new ArrayList<>(values);
+            Collections.sort(sorted);
+            double lower = percentile(sorted, 0.05);
+            double upper = percentile(sorted, 0.95);
+            double scoreMin = number(config.get("scoreMin"), 300);
+            double scoreMax = number(config.get("scoreMax"), 900);
+            boolean ascending = !Boolean.FALSE.equals(config.get("higherScoreForHigherPrediction"));
+            for (double value : values) {
+                double ratio = upper == lower ? 0.5 : (Math.max(lower, Math.min(upper, value)) - lower) / (upper - lower);
+                scores.add(ascending ? scoreMin + ratio * (scoreMax - scoreMin)
+                        : scoreMax - ratio * (scoreMax - scoreMin));
+            }
+            result.put("mode", "CONTINUOUS_REGRESSION");
+            result.put("scoreMin", scoreMin);
+            result.put("scoreMax", scoreMax);
+            result.put("predictionP5", round6(lower));
+            result.put("predictionP95", round6(upper));
+            result.put("higherScoreForHigherPrediction", ascending);
+        }
+        result.put("status", "AVAILABLE");
+        result.put("samples", scores.size());
+        result.put("minimum", round6(scores.stream().mapToDouble(Double::doubleValue).min().orElse(0)));
+        result.put("maximum", round6(scores.stream().mapToDouble(Double::doubleValue).max().orElse(0)));
+        result.put("average", round6(scores.stream().mapToDouble(Double::doubleValue).average().orElse(0)));
+        result.put("distribution", scoreDistribution(scores, 10));
+        return result;
+    }
+
+    private List<Map<String, Object>> scoreDistribution(List<Double> scores, int bins) {
+        double min = scores.stream().mapToDouble(Double::doubleValue).min().orElse(0);
+        double max = scores.stream().mapToDouble(Double::doubleValue).max().orElse(min);
+        double width = max == min ? 1 : (max - min) / bins;
+        int[] counts = new int[bins];
+        for (double score : scores) {
+            int index = max == min ? 0 : Math.min(bins - 1, (int) ((score - min) / width));
+            counts[index]++;
+        }
+        List<Map<String, Object>> distribution = new ArrayList<>();
+        for (int i = 0; i < bins; i++) {
+            if (counts[i] == 0) {
+                continue;
+            }
+            distribution.add(Map.of(
+                    "from", round6(min + i * width),
+                    "to", round6(min + (i + 1) * width),
+                    "count", counts[i]));
+        }
+        return distribution;
+    }
+
+    private double percentile(List<Double> sorted, double percentile) {
+        if (sorted.size() == 1) {
+            return sorted.get(0);
+        }
+        double position = percentile * (sorted.size() - 1);
+        int lower = (int) Math.floor(position);
+        int upper = (int) Math.ceil(position);
+        if (lower == upper) {
+            return sorted.get(lower);
+        }
+        return sorted.get(lower) + (position - lower) * (sorted.get(upper) - sorted.get(lower));
+    }
+
+    private double number(Object value, double fallback) {
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        try {
+            return Double.parseDouble(string(value));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     /** 工作流输入数据：第一个已配置的数据资源节点（data.table 挂载表 + 列）。 */
@@ -1623,8 +1960,18 @@ public class SandboxCanvasService {
         String status = "DRAFT";
         String outputTable = "";
         String outputColumns = "[]";
+        String taskType = "";
+        String modelCategory = "";
+        Map<String, Object> reportConfig = Map.of();
+        Map<String, Object> evaluationMetrics = Map.of();
+        String evaluationStatus = "";
+        String evaluationError = "";
         String sandboxId = string(canvas.get("sandbox_id"));
         if (notBlank(nodeId)) {
+            Node sourceNode = graph.nodeById(nodeId);
+            if (sourceNode == null || !CanvasOperatorRegistry.isTrain(sourceNode.componentCode)) {
+                throw new IllegalArgumentException("保存为模型只能选择成功运行的训练节点");
+            }
             // 前端选择「可执行工作流结果」节点：取其最近一次成功运行的输出表与模型
             List<Map<String, Object>> nrs = jdbc.queryForList(
                     "select model_id,output_table,run_id,task_id from ds_compute_node_run where canvas_id=? and node_id=? "
@@ -1643,6 +1990,21 @@ public class SandboxCanvasService {
             }
             if (notBlank(outputTable) && sandboxDb.hasTable(sandboxId, outputTable)) {
                 outputColumns = json(tableColumns(sandboxId, outputTable));
+            }
+            taskType = CanvasOperatorRegistry.metricType(sourceNode.componentCode,
+                    sourceNode.params.get("task")).toUpperCase(Locale.ROOT);
+            modelCategory = supportsTreeStructure(sourceNode.componentCode) ? "TREE" : "GENERAL";
+            reportConfig = normalizeReportConfig(request.get("reportConfig"), taskType, modelCategory);
+            try {
+                evaluationMetrics = fullEvaluation(sandboxId, outputTable, sourceNode, reportConfig);
+                evaluationStatus = evaluationMetrics.isEmpty() ? "UNAVAILABLE" : "SUCCEEDED";
+                if (evaluationMetrics.isEmpty()) {
+                    evaluationError = "训练结果缺少评估所需的标签列或预测列";
+                }
+            } catch (Exception e) {
+                evaluationStatus = "FAILED";
+                evaluationError = truncate(e.getMessage(), 1900);
+                log.warn("保存模型时全量评估失败 canvasId={} nodeId={}: {}", canvasId, nodeId, e.getMessage());
             }
         } else if (notBlank(modelId)) {
             // 兼容旧调用：仅传 modelId（训练节点产物）
@@ -1663,6 +2025,24 @@ public class SandboxCanvasService {
             if (notBlank(outputTable) && sandboxDb.hasTable(sandboxId, outputTable)) {
                 outputColumns = json(tableColumns(sandboxId, outputTable));
             }
+            Node sourceNode = graph.nodeById(sourceNodeId);
+            if (sourceNode != null && CanvasOperatorRegistry.isTrain(sourceNode.componentCode)) {
+                taskType = CanvasOperatorRegistry.metricType(sourceNode.componentCode,
+                        sourceNode.params.get("task")).toUpperCase(Locale.ROOT);
+                modelCategory = supportsTreeStructure(sourceNode.componentCode) ? "TREE" : "GENERAL";
+                reportConfig = normalizeReportConfig(request.get("reportConfig"), taskType, modelCategory);
+                try {
+                    evaluationMetrics = fullEvaluation(sandboxId, outputTable, sourceNode, reportConfig);
+                    evaluationStatus = evaluationMetrics.isEmpty() ? "UNAVAILABLE" : "SUCCEEDED";
+                    if (evaluationMetrics.isEmpty()) {
+                        evaluationError = "训练结果缺少评估所需的标签列或预测列";
+                    }
+                } catch (Exception e) {
+                    evaluationStatus = "FAILED";
+                    evaluationError = truncate(e.getMessage(), 1900);
+                    log.warn("保存模型时全量评估失败 canvasId={} modelId={}: {}", canvasId, modelId, e.getMessage());
+                }
+            }
         }
         // 工作流输入数据（数据资源挂载表 + 列），供发布 API 时确定输入 schema
         Map<String, Object> input = workflowInput(graph, sandboxId);
@@ -1676,12 +2056,14 @@ public class SandboxCanvasService {
         String id = "cm-" + shortId();
         String now = now();
         jdbc.update("insert into ds_compute_canvas_model(id,canvas_id,canvas_version,model_id,source_node_id,"
-                        + "source_run_id,source_task_id,name,"
+                        + "source_run_id,source_task_id,name,task_type,model_category,report_config,"
+                        + "evaluation_metrics,evaluation_status,evaluation_error,"
                         + "description,graph_json,status,input_table,input_columns,output_table,output_columns,"
                         + "created_by,created_at,updated_at,deleted) "
-                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                        + "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 id, canvasId, intValue(canvas.get("version"), 1), modelId, sourceNodeId,
-                sourceRunId, sourceTaskId, name,
+                sourceRunId, sourceTaskId, name, taskType, modelCategory, json(reportConfig),
+                json(evaluationMetrics), evaluationStatus, evaluationError,
                 string(request.get("description")), graphJson, status,
                 inputTable, inputColumns, outputTable, outputColumns, actor(), now, now);
         audit("CANVAS_MODEL_SAVED", "CANVAS_MODEL", id,

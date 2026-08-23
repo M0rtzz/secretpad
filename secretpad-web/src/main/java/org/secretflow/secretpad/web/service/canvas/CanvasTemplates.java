@@ -44,15 +44,12 @@ public final class CanvasTemplates {
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "zscore"));
         String n6 = g.node("ml.logistic_regression", "逻辑回归",
                 Map.of("features", List.of("balance", "trans_amount"), "label", "risk_label", "C", 1.0, "max_iter", 1000));
-        String n7 = g.node("ml.binary_classification", "二分类评估",
-                Map.of("label", "risk_label", "pred", "pred", "pred_prob", "pred_prob", "threshold", 0.5));
         g.edge(n1, n2);
         g.edge(n2, n3);
         g.edge(n3, n4);
         g.edge(n4, n5);
         g.edge(n5, n6);
-        g.edge(n6, n7);
-        return template("credit_risk", "银行信用风控二分类", "高额交易风险识别：逻辑回归 + 二分类评估，输出风险概率",
+        return template("credit_risk", "银行信用风控二分类", "高额交易风险识别：逻辑回归输出风险概率，保存模型时生成评估报告",
                 g.build());
     }
 
@@ -85,14 +82,11 @@ public final class CanvasTemplates {
                 Map.of("columns", List.of("balance", "trans_amount"), "method", "zscore"));
         String n5 = g.node("ml.linear_regression", "线性回归",
                 Map.of("features", List.of("balance", "trans_amount"), "label", "income", "fit_intercept", true));
-        String n6 = g.node("ml.regression_evaluation", "回归评估",
-                Map.of("label", "income", "pred", "pred"));
         g.edge(n1, n2);
         g.edge(n2, n3);
         g.edge(n3, n4);
         g.edge(n4, n5);
-        g.edge(n5, n6);
-        return template("income_regression", "收入预测线性回归", "线性回归预测收入指标 + 回归评估（MAE/RMSE/R²）",
+        return template("income_regression", "收入预测线性回归", "线性回归预测收入指标，保存模型时生成 MAE/RMSE/R² 评估报告",
                 g.build());
     }
 

@@ -114,6 +114,10 @@ public final class CanvasOperatorRegistry {
     public static List<Map<String, Object>> builtInComponents() {
         List<Map<String, Object>> rows = new ArrayList<>();
         for (Map<String, Object> op : OPERATORS) {
+            // 模型评估随“保存为模型”统一生成；保留算子定义仅用于兼容历史画布。
+            if (CATEGORY_EVAL.equals(string(op.get("category")))) {
+                continue;
+            }
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("code", op.get("code"));
             item.put("name", op.get("name"));

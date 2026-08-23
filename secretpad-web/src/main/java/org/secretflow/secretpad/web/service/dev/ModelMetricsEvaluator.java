@@ -10,6 +10,7 @@
 
 package org.secretflow.secretpad.web.service.dev;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -106,6 +107,8 @@ public final class ModelMetricsEvaluator {
     }
 
     private static Map<String, Object> classification(List<String> labels, List<String> predictions) {
+        labels = normalizedLabels(labels);
+        predictions = normalizedLabels(predictions);
         Set<String> classes = new LinkedHashSet<>(labels);
         classes.addAll(predictions);
         int total = labels.size();
@@ -174,6 +177,21 @@ public final class ModelMetricsEvaluator {
             metrics.put("confusionMatrix", cm);
         }
         return metrics;
+    }
+
+    /** 数值型类别统一为无多余小数位的形式，例如 1、1.0、1.00 均视为同一类别。 */
+    private static List<String> normalizedLabels(List<String> values) {
+        List<String> normalized = new ArrayList<>(values.size());
+        for (String value : values) {
+            String text = value == null ? "" : value.trim();
+            try {
+                BigDecimal number = new BigDecimal(text).stripTrailingZeros();
+                normalized.add(number.compareTo(BigDecimal.ZERO) == 0 ? "0" : number.toPlainString());
+            } catch (NumberFormatException e) {
+                normalized.add(text);
+            }
+        }
+        return normalized;
     }
 
     private static Map<String, Object> regression(List<String> labels, List<String> predictions) {
