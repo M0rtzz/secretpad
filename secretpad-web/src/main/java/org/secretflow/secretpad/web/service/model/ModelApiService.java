@@ -52,7 +52,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -129,24 +128,23 @@ public class ModelApiService {
 
     /** 发布模型为受控 API：要求模型 APPROVED/PUBLISHED，一次性 app_id+secret（明文仅本次返回）。 */
     public Map<String, Object> create(Map<String, Object> request) {
-        String modelId = required(request, "modelId");
-        String name = required(request, "name");
-        Map<String, Object> model = requireModel(modelId);
-        requireSavedCanvasWorkflow(modelId);
-        String modelStatus = string(model.get("status"));
-        if (!Set.of("APPROVED", "PUBLISHED").contains(modelStatus)) {
-            throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
-                    + ": 仅已通过审批的模型可发布 API（当前 " + modelStatus + "）");
-        }
-        return createApiForModel(modelId, name, string(value(request, "description", "")),
-                parseStringList(jsonArrayString(request.get("authorizedUsers"), "[]")),
-                parseStringList(jsonArrayString(request.get("ipWhitelist"), "[]")),
-                string(value(request, "validFrom", "")), string(value(request, "validTo", "")));
+        // 统一走 publish 的 MODEL 分支，复用供数方审批门禁与模型状态校验
+        Map<String, Object> publish = new LinkedHashMap<>();
+        publish.put("sourceType", "MODEL");
+        publish.put("sourceId", required(request, "modelId"));
+        publish.put("apiName", required(request, "name"));
+        publish.put("description", value(request, "description", ""));
+        publish.put("authUsers", request.get("authorizedUsers"));
+        publish.put("ipWhitelist", request.get("ipWhitelist"));
+        publish.put("validFrom", value(request, "validFrom", ""));
+        publish.put("validTo", value(request, "validTo", ""));
+        return publish(publish);
     }
 
     /**
-     * 统一发布受控 API（轻量化发布体系核心）：{@code sourceType=MODEL|ARTIFACT} 双入口，跳过审批状态机
-     * 直接建立受控 API（status=ENABLED + 一次性 app_id+secret）。
+     * 统一发布受控 API（轻量化发布体系核心）：{@code sourceType=MODEL|ARTIFACT} 双入口。
+     * MODEL 使用跨机构挂载数据时先建立 PENDING API 并提交供数方审批，全部通过后再启用；
+     * 其余来源直接建立受控 API（status=ENABLED + 一次性 app_id+secret）。
      *
      * <ul>
      *   <li>MODEL：{@code sourceId} 为模型 id，要求画布已保存且 APPROVED/PUBLISHED（复用既有门禁）。</li>
@@ -284,7 +282,6 @@ public class ModelApiService {
         dispatch("model.api.approval.submitted",
                 Map.of("id", id, "modelId", modelId, "approvalId", approval.get("id")));
         Map<String, Object> result = new LinkedHashMap<>(enrichApi(requireApi(id)));
-        result.put("secret", secret);
         result.put("approval", approval);
         result.put("approvalRequired", true);
         result.put("notice", "模型使用供数方数据，已提交供数方节点审批，审批通过后自动发布");
@@ -307,39 +304,80 @@ public class ModelApiService {
             tables.add(string(canvas.get("inputTable")));
         }
         collectDataTableNames(graphJson, tables);
-        String currentOwner = gate.effectiveOwner();
         List<Map<String, Object>> providers = new ArrayList<>();
         for (String table : tables) {
             List<Map<String, Object>> dirRows = jdbc.queryForList(
-                    "select asset_id from ds_sandbox_data_dir where sandbox_id=? and table_name=? and kind='MOUNT' and deleted=0 limit 1",
+                    "select asset_id,name from ds_sandbox_data_dir where sandbox_id=? and table_name=? and kind='MOUNT' and deleted=0 limit 1",
                     sandboxId, table);
             String assetId = dirRows.isEmpty() ? "" : string(dirRows.get(0).get("asset_id"));
             if (!notBlank(assetId)) {
                 continue;
             }
-            List<Map<String, Object>> assetRows = jdbc.queryForList(
-                    "select id,name,provider_node_id from ds_data_asset where id=? and deleted=0", assetId);
-            if (assetRows.isEmpty()) {
-                continue;
+
+            // 挂载表在沙箱创建时固化了真实供数节点，是跨节点同步后仍可靠的归属来源。
+            // ds_sandbox_data_dir.asset_id 沿用供数方源资产 id，而本地同步副本会生成新 id，
+            // 因此不能仅用该 id 直查 ds_data_asset 来判断是否需要审批。
+            List<Map<String, Object>> mountRows = jdbc.queryForList(
+                    "select provider_node_id from ds_sandbox_dataset_mount where sandbox_id=? and asset_id=? "
+                            + "and status='READY' and deleted=0 order by updated_at desc limit 1",
+                    sandboxId, assetId);
+            String providerNodeId = mountRows.isEmpty()
+                    ? "" : string(mountRows.get(0).get("provider_node_id"));
+            String assetName = dirRows.isEmpty() ? "" : string(dirRows.get(0).get("name"));
+
+            // 兼容没有挂载表记录的存量数据：再通过本地资产/同步记录/源资产 id 溯源。
+            if (!notBlank(providerNodeId)) {
+                List<Map<String, Object>> assetRows = resolveProviderAsset(assetId);
+                if (!assetRows.isEmpty()) {
+                    Map<String, Object> asset = assetRows.get(0);
+                    providerNodeId = string(asset.get("provider_node_id"));
+                    if (!notBlank(assetName)) {
+                        assetName = string(asset.get("name"));
+                    }
+                }
             }
-            Map<String, Object> asset = assetRows.get(0);
-            String providerNodeId = string(asset.get("provider_node_id"));
-            if (!notBlank(providerNodeId) || Objects.equals(providerNodeId, currentOwner)) {
+            if (!notBlank(providerNodeId) || gate.matchesCurrentNode(providerNodeId)) {
                 continue;
             }
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("tableName", table);
             entry.put("assetId", assetId);
-            entry.put("name", string(asset.get("name")));
+            entry.put("name", notBlank(assetName) ? assetName : assetId);
             entry.put("providerNodeId", providerNodeId);
             try {
-                entry.put("preview", sandboxDb.previewTable(sandboxId, table, 10));
+                entry.put("preview", sandboxDb.previewTable(sandboxId, table, 100));
             } catch (Exception e) {
                 entry.put("preview", null);
             }
             providers.add(entry);
         }
         return providers;
+    }
+
+    /**
+     * 溯源数据资产行：优先按资产 id 直查本节点 {@code ds_data_asset}；跨节点物理同步副本
+     * （挂载记录沿用 provider 侧源资产 id，本节点只存本地同步副本）经 {@code ds_asset_sync_record}
+     * 溯源到本地副本，取到原始 {@code provider_node_id}；无同步记录时按 {@code source_asset_id} 兜底匹配。
+     */
+    private List<Map<String, Object>> resolveProviderAsset(String assetId) {
+        List<Map<String, Object>> assetRows = jdbc.queryForList(
+                "select id,name,provider_node_id from ds_data_asset where id=? and deleted=0", assetId);
+        if (assetRows.isEmpty()) {
+            List<Map<String, Object>> localRows = jdbc.queryForList(
+                    "select local_asset_id from ds_asset_sync_record where asset_id=? and status='SYNCED' "
+                            + "and local_asset_id<>'' order by synced_at desc limit 1", assetId);
+            if (!localRows.isEmpty()) {
+                String localId = string(localRows.get(0).get("local_asset_id"));
+                assetRows = jdbc.queryForList(
+                        "select id,name,provider_node_id from ds_data_asset where id=? and deleted=0", localId);
+            }
+            if (assetRows.isEmpty()) {
+                assetRows = jdbc.queryForList(
+                        "select id,name,provider_node_id from ds_data_asset where source_asset_id=? and deleted=0 limit 1",
+                        assetId);
+            }
+        }
+        return assetRows;
     }
 
     /** 画布模型上下文：project/sandbox/拓扑/输入表（供数方审批载荷来源）。 */
@@ -353,7 +391,17 @@ public class ModelApiService {
         if (rows.isEmpty()) {
             return Map.of();
         }
-        return new LinkedHashMap<>(rows.get(0));
+        Map<String, Object> row = rows.get(0);
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("modelId", row.get("model_id"));
+        context.put("modelName", row.get("model_name"));
+        context.put("graphJson", row.get("graph_json"));
+        context.put("inputTable", row.get("input_table"));
+        context.put("inputColumns", row.get("input_columns"));
+        context.put("status", row.get("status"));
+        context.put("sandboxId", row.get("sandbox_id"));
+        context.put("projectId", row.get("project_id"));
+        return context;
     }
 
     /** 收集画布 data.table（数据资源）节点的 params.table 引用（供数方溯源）。 */
@@ -470,6 +518,7 @@ public class ModelApiService {
     /** 重发调用密钥：新 secret 一次性返回，旧密钥立即失效。 */
     public Map<String, Object> regenerateSecret(String id) {
         Map<String, Object> api = requireApi(id);
+        requireProviderApprovalCompleted(api, "重发调用密钥");
         String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes());
         jdbc.update("update ds_model_api set secret_hash=?,updated_at=? where id=? and deleted=0",
                 sha256(secret), now(), id);
@@ -482,10 +531,28 @@ public class ModelApiService {
     }
 
     public Map<String, Object> enable(String id) {
-        requireApi(id);
+        Map<String, Object> api = requireApi(id);
+        requireProviderApprovalCompleted(api, "启用 API");
         jdbc.update("update ds_model_api set status=?,updated_at=? where id=? and deleted=0", STATUS_ENABLED, now(), id);
         audit("MODEL_API_ENABLE", "MODEL_API", id, "", true);
         return enrichApi(requireApi(id));
+    }
+
+    /** 供数方审批关联的 API 只有在审批终态为 APPROVED 后才允许启用或轮换密钥。 */
+    private void requireProviderApprovalCompleted(Map<String, Object> api, String operation) {
+        String status = string(api.get("status"));
+        String approvalId = string(api.get("approval_id"));
+        if (Set.of("PENDING", "REJECTED").contains(status)) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                    + ": 供数方审批完成前不可" + operation + "（当前 " + status + "）");
+        }
+        if (notBlank(approvalId)
+                && count("select count(1) from ds_sandbox_approval where id=? "
+                                + "and approval_type='MODEL_API' and status='APPROVED' and deleted=0",
+                        approvalId) == 0) {
+            throw new IllegalArgumentException(ModelErrors.MODEL_STATE_CONFLICT
+                    + ": 供数方审批完成前不可" + operation);
+        }
     }
 
     public Map<String, Object> disable(String id) {

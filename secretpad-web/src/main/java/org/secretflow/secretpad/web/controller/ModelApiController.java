@@ -52,7 +52,7 @@ public class ModelApiController {
         return SecretPadResponse.success(service.create(request));
     }
 
-    @Operation(summary = "统一发布受控 API（sourceType=ARTIFACT|MODEL，跳过审批直接可用；一次性 app_id+secret 明文仅本次返回）")
+    @Operation(summary = "统一发布受控 API（MODEL 使用跨机构数据时先进入供数方审批；通过后才启用）")
     @PostMapping("/publish")
     public SecretPadResponse<Map<String, Object>> publish(@RequestBody Map<String, Object> request) {
         return SecretPadResponse.success(service.publish(request));

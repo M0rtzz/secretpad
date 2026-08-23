@@ -233,7 +233,7 @@ public class ModelApiApprovalService {
 
     /* ============================== 详情 ============================== */
 
-    /** 申请单详情：供数方审批人查看模型/数据/拓扑/测试凭证；申请方查看状态。 */
+    /** 申请单详情：仅供数方审批人/管理员查看临时测试凭证；申请方只能查看脱敏状态。 */
     @SuppressWarnings("unchecked")
     public Map<String, Object> detail(String id) {
         sandboxApprovalService.applySyncedApprovals();
@@ -481,7 +481,7 @@ public class ModelApiApprovalService {
                 && (!notBlank(applicant) || gate.matchesCurrentNode(applicant));
     }
 
-    /** 审批人/申请方/管理员可查看明文 secret（供调试调用）。 */
+    /** 仅审批人/管理员可查看明文 secret 并调试；申请方在审批通过前不得取得调用凭证。 */
     private boolean isActorEligible(Map<String, Object> approval) {
         if (gate.isAdmin(gate.currentUser())) {
             return true;
@@ -489,7 +489,7 @@ public class ModelApiApprovalService {
         String voterNode = effectiveOwner();
         boolean voter = count("select count(1) from ds_sandbox_approval_vote where approval_id=? and voter_node_id=?",
                 approval.get("id"), voterNode) > 0;
-        return voter || canCancel(approval);
+        return voter;
     }
 
     /* ============================== 快照同步 ============================== */
