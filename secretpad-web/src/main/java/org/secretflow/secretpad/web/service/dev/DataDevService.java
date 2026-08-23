@@ -1011,6 +1011,11 @@ public class DataDevService {
         if (retries >= maxRetries) {
             throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT + ": 重试次数已达上限 " + maxRetries);
         }
+        if ("JAR".equals(string(task.get("exec_type")))
+                && (!notBlank(string(task.get("artifact_id"))) || intValue(task.get("version"), 0) <= 0)) {
+            throw new IllegalStateException(DevErrors.DEV_STATE_CONFLICT
+                    + ": 此历史 JAR 任务未保存制品文件，无法重试；请重新提交任务并填写制品名称");
+        }
         // 沙箱表源任务（sandbox-db://）走沙箱专用重试：源表重读沙箱库 + 按 exec_type 重派发
         if (string(task.get("source_relative_uri")).startsWith("sandbox-db://")) {
             return retrySandboxTask(id, task, retries);
