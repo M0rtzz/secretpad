@@ -269,7 +269,7 @@ public class ModelApiService {
         Map<String, Object> canvas = canvasModelContext(modelId);
         List<String> providerNodeIds = providers.stream()
                 .map(p -> string(p.get("providerNodeId")))
-                .filter(this::notBlank)
+                .filter(ModelApiService::notBlank)
                 .distinct()
                 .toList();
         Map<String, Object> approval = modelApiApprovalService.submit(
