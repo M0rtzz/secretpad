@@ -26,6 +26,7 @@ import org.secretflow.secretpad.persistence.repository.ProjectApprovalConfigRepo
 import org.secretflow.secretpad.persistence.repository.ProjectInstRepository;
 import org.secretflow.secretpad.persistence.repository.VoteRequestRepository;
 
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -58,6 +59,11 @@ public class P2pPaddingNodeServiceImpl implements PaddingNodeService {
     private final NodeRepository nodeRepository;
 
     private Map<String, String> inst_Node = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void initializeRouteMappings() {
+        refreshRouteMappings();
+    }
 
     @Override
     public void paddingNodes(EntityChangeListener.DbChangeEvent<BaseAggregationRoot> event) {
@@ -99,10 +105,7 @@ public class P2pPaddingNodeServiceImpl implements PaddingNodeService {
         }
         List<String> collect = nodeIds.stream().filter(Objects::nonNull).distinct().collect(Collectors.toList());
         event.setNodeIds(collect);
-        List<NodeInstDTO> nodeDOList = nodeRepository.findInstMasterNodeId();
-        for (NodeInstDTO nodeInstDto : nodeDOList) {
-            inst_Node.put(nodeInstDto.getInstId(), nodeInstDto.getMasterNodeId());
-        }
+        refreshRouteMappings();
     }
 
     private String toInstitutionRouteId(String id) {
@@ -145,7 +148,26 @@ public class P2pPaddingNodeServiceImpl implements PaddingNodeService {
 
     @Override
     public String turnInstToRouteId(String instId) {
-        log.info("inst_Node = {} from {} to {}", inst_Node, instId, inst_Node.get(instId));
-        return inst_Node.get(instId);
+        String routeId = inst_Node.get(instId);
+        if (StringUtils.isBlank(routeId)) {
+            refreshRouteMappings();
+            routeId = inst_Node.get(instId);
+        }
+        if (StringUtils.isBlank(routeId)) {
+            log.warn("P2P route is missing for institution {}, available routes {}", instId, inst_Node.keySet());
+        } else {
+            log.info("P2P route resolved from institution {} to node {}", instId, routeId);
+        }
+        return routeId;
+    }
+
+    private void refreshRouteMappings() {
+        List<NodeInstDTO> nodeDOList = nodeRepository.findInstMasterNodeId();
+        for (NodeInstDTO nodeInstDto : nodeDOList) {
+            if (StringUtils.isNotBlank(nodeInstDto.getInstId())
+                    && StringUtils.isNotBlank(nodeInstDto.getMasterNodeId())) {
+                inst_Node.put(nodeInstDto.getInstId(), nodeInstDto.getMasterNodeId());
+            }
+        }
     }
 }

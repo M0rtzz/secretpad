@@ -22,6 +22,8 @@ import org.secretflow.secretpad.persistence.datasync.producer.p2p.P2pPaddingNode
 import org.secretflow.secretpad.persistence.entity.BaseAggregationRoot;
 import org.secretflow.secretpad.persistence.entity.VoteInviteDO;
 import org.secretflow.secretpad.persistence.entity.VoteRequestDO;
+import org.secretflow.secretpad.persistence.model.NodeInstDTO;
+import org.secretflow.secretpad.persistence.repository.NodeRepository;
 import org.secretflow.secretpad.persistence.repository.VoteRequestRepository;
 
 import org.junit.jupiter.api.Test;
@@ -30,8 +32,11 @@ import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * @author yutu
@@ -42,6 +47,9 @@ public class P2pPaddingNodeServiceImplTest {
 
     @Mock
     private VoteRequestRepository voteRequestRepository;
+
+    @Mock
+    private NodeRepository nodeRepository;
 
 
     @Test
@@ -59,5 +67,18 @@ public class P2pPaddingNodeServiceImplTest {
         Mockito.when(voteRequestRepository.findById(Mockito.any())).thenReturn(voteRequestDOOptional);
         Mockito.when(voteRequestRepository.save(Mockito.any())).thenReturn(null);
         p2pPaddingNodeServiceImpl.compensate(event);
+    }
+
+    @Test
+    public void shouldResolvePersistedRouteImmediatelyAfterRestart() {
+        NodeInstDTO route = Mockito.mock(NodeInstDTO.class);
+        Mockito.when(route.getInstId()).thenReturn("partner-inst");
+        Mockito.when(route.getMasterNodeId()).thenReturn("partner-master-node");
+        Mockito.when(nodeRepository.findInstMasterNodeId()).thenReturn(List.of(route));
+        P2pPaddingNodeServiceImpl service = new P2pPaddingNodeServiceImpl(null, null, null, null, nodeRepository);
+
+        service.initializeRouteMappings();
+
+        assertEquals("partner-master-node", service.turnInstToRouteId("partner-inst"));
     }
 }

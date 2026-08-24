@@ -85,6 +85,9 @@ public class P2pDataSyncRestTemplate extends DataSyncRestTemplate {
                         .data(event.getSource()).build();
                 try {
                     routeId = p2pPaddingNodeService.turnInstToRouteId(node);
+                    if (ObjectUtils.isEmpty(routeId)) {
+                        throw new IllegalStateException("P2P route is missing for institution " + node);
+                    }
                     log.info("P2pDataSyncRestTemplate send, routeId:{} instId:{}", routeId, node);
                     syncResp = p2pDataSyncRestService.sync(node, "secretpad." + routeId + ".svc", syncDataDTO.toJson());
                     if (0 == syncResp.getStatus().getCode()) {
