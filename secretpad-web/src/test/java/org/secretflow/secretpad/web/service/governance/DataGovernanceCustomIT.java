@@ -270,6 +270,11 @@ public class DataGovernanceCustomIT {
     /* ------------------------------- helpers ------------------------------- */
 
     private Map<String, Object> submitCustom(String script, Map<String, Object> params) {
+        return submitCustom(script, params, null);
+    }
+
+    private Map<String, Object> submitCustom(String script, Map<String, Object> params,
+            List<Map<String, Object>> masking) {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("name", "it-custom");
         request.put("nodeId", "alice");
@@ -278,6 +283,9 @@ public class DataGovernanceCustomIT {
         request.put("script", script);
         if (params != null) {
             request.put("params", params);
+        }
+        if (masking != null) {
+            request.put("masking", masking);
         }
         return governance.submitTask(request);
     }
@@ -358,6 +366,27 @@ public class DataGovernanceCustomIT {
         assertEquals(1L, count("select count(1) from ds_unified_log where action='GOVERNANCE_TASK_SUCCEEDED' and resource_id=?", taskId));
         // deleteJob 在取回后调用（幂等）
         assertEquals(1L, count("select count(1) from ds_governance_task where id=? and status='SUCCEEDED'", taskId));
+    }
+
+    /** 自定义抽样输出回收后继续执行平台字段脱敏，并保存脱敏后的结果。 */
+    @Test
+    public void customSuccessAppliesMaskingBeforeRegisteringResult() {
+        List<Map<String, Object>> masking = List.of(Map.of(
+                "column", "phone",
+                "method", "MASK",
+                "params", Map.of("keepLeft", 3, "keepRight", 4, "maskChar", "*")));
+        Map<String, Object> task = submitCustom("print('hello')", Map.of(), masking);
+        String taskId = String.valueOf(task.get("id"));
+
+        JobService.State.jobState = "Succeeded";
+        JobService.State.withEndpoints = true;
+        customExecutor.pollCustomTasks();
+
+        Map<String, Object> after = governance.taskDetail(taskId);
+        assertEquals("SUCCEEDED", String.valueOf(after.get("status")));
+        assertTrue(String.valueOf(after.get("exec_params")).contains("\"phone\""));
+        assertEquals("id,name,phone\n1,custom,138****1234\n2,custom2,138****5678\n",
+                readFile(findResultUri(after)));
     }
 
     /** 2. createJob 失败 → 任务 FAILED + 告警，不落 kuscia_job_id。 */

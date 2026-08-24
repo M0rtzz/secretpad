@@ -291,6 +291,7 @@ public class DataGovernanceService {
         }
         Map<String, Object> policy = resolvePolicyMap(request);
         Map<String, Object> sampling = resolveSampling(request, policy);
+        List<Map<String, Object>> masking = resolveMasking(request, policy);
 
         // 读源 + 行数/字节校验（超限在任务创建前拒绝，不产生任务记录）；物理目录 = 源表属主（kuscia 域）
         List<List<String>> parsed = readCsv(source.getNodeId(), relativeUri);
@@ -311,11 +312,11 @@ public class DataGovernanceService {
             params.putAll(castMap(paramsMap));
         }
 
-        String taskId = createTask(request, "CUSTOM", nodeId, datatableId, relativeUri, policy, sampling, List.of());
+        String taskId = createTask(request, "CUSTOM", nodeId, datatableId, relativeUri, policy, sampling, masking);
         // 自定义任务快照：脚本全文入 script_content，params/输入行数入 exec_params，输入行数入 source_rows
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("sampling", sampling == null ? new LinkedHashMap<>() : sampling);
-        snapshot.put("masking", new ArrayList<>());
+        snapshot.put("masking", masking);
         snapshot.put("custom", Map.of("params", params, "inputRows", data.size()));
         jdbc.update("update ds_governance_task set script_content=?,source_rows=?,exec_params=? where id=?",
                 script, data.size(), json(snapshot), taskId);

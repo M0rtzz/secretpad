@@ -303,7 +303,26 @@ public class GovernanceCustomExecutor {
         }
         List<String> header = new ArrayList<>(parsed.get(0));
         List<List<String>> rows = parsed.size() > 1 ? new ArrayList<>(parsed.subList(1, parsed.size())) : new ArrayList<>();
-        Map<String,Object> resultAsset=dataAssetService.registerGovernedResult(taskId,nodeId,body);
+        byte[] resultBody = body;
+        try {
+            List<GovernanceMaskingExecutor.MaskRule> rules = maskingRules(task);
+            if (!rules.isEmpty()) {
+                for (GovernanceMaskingExecutor.MaskRule rule : rules) {
+                    if (!header.contains(rule.column())) {
+                        throw new IllegalArgumentException("自定义抽样输出缺少待脱敏字段: " + rule.column());
+                    }
+                }
+                GovernanceMaskingExecutor.MaskResult masked = GovernanceMaskingExecutor.apply(header, rows, rules);
+                header = masked.header();
+                rows = masked.rows();
+                resultBody = CsvUtil.toCsv(header, rows).getBytes(StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            fail(taskId, "自定义抽样结果脱敏失败: " + truncate(e.getMessage(), 900), "gov:" + taskId + ":failed");
+            delete(jobId);
+            return;
+        }
+        Map<String,Object> resultAsset=dataAssetService.registerGovernedResult(taskId,nodeId,resultBody);
         String domainDataId=string(resultAsset.get("datatable_id"));
         int affected = jdbc.update("update ds_governance_task set status=?,result_node_id=?,result_datatable_id=?,"
                         + "source_rows=?,result_rows=?,finished_at=?,updated_at=? where id=? and status=?",
@@ -318,6 +337,40 @@ public class GovernanceCustomExecutor {
                 "resultRows", rows.size(), "resultDatatableId", domainDataId));
         // 查询/拉取完成后删除 Job（幂等）
         delete(jobId);
+    }
+
+    /** 从任务快照恢复字段脱敏规则，供自定义脚本输出回收后执行。 */
+    private List<GovernanceMaskingExecutor.MaskRule> maskingRules(Map<String, Object> task) {
+        List<GovernanceMaskingExecutor.MaskRule> rules = new ArrayList<>();
+        String execParams = string(task.get("exec_params"));
+        if (!notBlank(execParams)) {
+            return rules;
+        }
+        try {
+            Map<?, ?> snapshot = objectMapper.readValue(execParams, Map.class);
+            Object maskingValue = snapshot == null ? null : snapshot.get("masking");
+            if (!(maskingValue instanceof List<?> masking)) {
+                return rules;
+            }
+            for (Object value : masking) {
+                if (!(value instanceof Map<?, ?> item)) {
+                    continue;
+                }
+                String column = string(item.get("column"));
+                String method = string(item.get("method"));
+                if (!notBlank(column) || !notBlank(method)) {
+                    throw new IllegalArgumentException("脱敏规则缺少 column/method");
+                }
+                Map<String, String> params = new LinkedHashMap<>();
+                if (item.get("params") instanceof Map<?, ?> rawParams) {
+                    rawParams.forEach((key, param) -> params.put(String.valueOf(key), string(param)));
+                }
+                rules.add(new GovernanceMaskingExecutor.MaskRule(column, method, params));
+            }
+            return rules;
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("任务脱敏快照不是合法 JSON", e);
+        }
     }
 
     private void fail(String taskId, String errorMessage, String dedupeKey) {
