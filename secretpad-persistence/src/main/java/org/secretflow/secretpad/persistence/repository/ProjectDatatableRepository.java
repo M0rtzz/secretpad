@@ -18,9 +18,11 @@ package org.secretflow.secretpad.persistence.repository;
 
 import org.secretflow.secretpad.persistence.entity.ProjectDatatableDO;
 
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
@@ -70,4 +72,16 @@ public interface ProjectDatatableRepository extends BaseRepository<ProjectDatata
      */
     @Query("from ProjectDatatableDO pd where pd.upk.nodeId=:nodeId and pd.upk.datatableId in :datatableIds")
     List<ProjectDatatableDO> authProjectDatatablesByDatatableIds(@Param("nodeId") String nodeId, @Param("datatableIds") List<String> datatableIds);
+
+    /** Update a soft-deleted relation without being affected by the entity-level {@code @Where}. */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Transactional
+    @Query(value = "update project_datatable set is_deleted = 1, gmt_modified = :gmtModified "
+            + "where project_id = :projectId and node_id = :nodeId and datatable_id = :datatableId",
+            nativeQuery = true)
+    int softDeleteIncludingDeleted(
+            @Param("projectId") String projectId,
+            @Param("nodeId") String nodeId,
+            @Param("datatableId") String datatableId,
+            @Param("gmtModified") String gmtModified);
 }

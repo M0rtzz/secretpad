@@ -28,10 +28,15 @@ import org.secretflow.secretpad.service.sync.p2p.DataSyncConsumerTemplate;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
 
 import java.io.IOException;
+import java.time.LocalDateTime;
 import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * @author yutu
@@ -67,6 +72,11 @@ public class P2pDataSyncControllerTest extends ControllerTest {
     private ProjectRepository projectRepository;
     @Resource
     private ProjectDatatableRepository projectDatatableRepository;
+    @Resource
+    private ProjectAssetRepository projectAssetRepository;
+    @Resource
+    @Qualifier("jdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
     @Resource
     private ProjectGraphRepository projectGraphRepository;
     @Resource
@@ -328,5 +338,59 @@ public class P2pDataSyncControllerTest extends ControllerTest {
                         .build())
                 .build());
         projectNodeRepository.deleteAllAuthentic();
+    }
+
+    @Test
+    void duplicateSoftDeleteUpdatesShouldBeIdempotent() {
+        String projectId = "p2p-soft-delete-test";
+        String assetId = "asset-soft-delete-test";
+        String datatableId = "datatable-soft-delete-test";
+        String nodeId = "node-soft-delete-test";
+        jdbcTemplate.update("delete from ds_project_asset where project_id = ?", projectId);
+        jdbcTemplate.update("delete from project_datatable where project_id = ?", projectId);
+
+        ProjectAssetDO projectAsset = ProjectAssetDO.builder()
+                .upk(new ProjectAssetDO.UPK(projectId, assetId))
+                .providerNodeId(nodeId)
+                .assetJson("{}")
+                .attachedBy("admin")
+                .attachedAt("2026-08-24T18:00:00+08:00")
+                .expiresAt("")
+                .build();
+        projectAssetRepository.saveAndFlush(projectAsset);
+        projectAsset.setIsDeleted(true);
+        projectAsset.setGmtModified(LocalDateTime.now());
+
+        ProjectDatatableDO projectDatatable = ProjectDatatableDO.builder()
+                .upk(new ProjectDatatableDO.UPK(projectId, nodeId, datatableId))
+                .tableConfig(List.of())
+                .source(ProjectDatatableDO.ProjectDatatableSource.IMPORTED)
+                .build();
+        projectDatatableRepository.saveAndFlush(projectDatatable);
+        projectDatatable.setIsDeleted(true);
+        projectDatatable.setGmtModified(LocalDateTime.now());
+
+        SyncDataDTO assetUpdate = SyncDataDTO.builder()
+                .action("update")
+                .tableName(ProjectAssetDO.class.getTypeName())
+                .data(projectAsset)
+                .build();
+        SyncDataDTO datatableUpdate = SyncDataDTO.builder()
+                .action("update")
+                .tableName(ProjectDatatableDO.class.getTypeName())
+                .data(projectDatatable)
+                .build();
+        dataSyncConsumerTemplate.consumer("alice", assetUpdate);
+        dataSyncConsumerTemplate.consumer("alice", assetUpdate);
+        dataSyncConsumerTemplate.consumer("alice", datatableUpdate);
+        dataSyncConsumerTemplate.consumer("alice", datatableUpdate);
+
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "select count(*) from ds_project_asset where project_id = ? and asset_id = ? and is_deleted = 1",
+                Integer.class, projectId, assetId));
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "select count(*) from project_datatable where project_id = ? and node_id = ? "
+                        + "and datatable_id = ? and is_deleted = 1",
+                Integer.class, projectId, nodeId, datatableId));
     }
 }

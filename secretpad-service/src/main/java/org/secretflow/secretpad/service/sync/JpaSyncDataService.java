@@ -183,12 +183,51 @@ public class JpaSyncDataService {
             }
         }
         switch (action) {
-            case "create", "update" -> baseRepository.save(data);
+            case "create" -> baseRepository.save(data);
+            case "update" -> {
+                if (!syncSoftDeletedProjectRelation(data)) {
+                    baseRepository.save(data);
+                }
+            }
             case "remove" -> baseRepository.delete(data);
             default -> log.warn("can not find action:{}", action);
         }
         UserContext.remove();
         DataSyncConsumerContext.remove();
+    }
+
+    /**
+     * Soft-deleted project relations are hidden by entity-level filters. A repeated P2P update
+     * must therefore use an unfiltered native update instead of attempting another insert.
+     */
+    private boolean syncSoftDeletedProjectRelation(Object data) {
+        if (data instanceof ProjectAssetDO projectAsset && Boolean.TRUE.equals(projectAsset.getIsDeleted())) {
+            ProjectAssetDO.UPK upk = projectAsset.getUpk();
+            if (upk == null) {
+                return false;
+            }
+            return projectAssetRepository.softDeleteIncludingDeleted(
+                    upk.getProjectId(), upk.getAssetId(), formatModifiedAt(projectAsset)) > 0;
+        }
+        if (data instanceof ProjectDatatableDO projectDatatable
+                && Boolean.TRUE.equals(projectDatatable.getIsDeleted())) {
+            ProjectDatatableDO.UPK upk = projectDatatable.getUpk();
+            if (upk == null) {
+                return false;
+            }
+            return projectDatatableRepository.softDeleteIncludingDeleted(
+                    upk.getProjectId(), upk.getNodeId(), upk.getDatatableId(),
+                    formatModifiedAt(projectDatatable)) > 0;
+        }
+        return false;
+    }
+
+    private String formatModifiedAt(BaseAggregationRoot<?> data) {
+        LocalDateTime modifiedAt = data.getGmtModified();
+        if (modifiedAt == null) {
+            modifiedAt = LocalDateTime.now();
+        }
+        return modifiedAt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
     }
 
     private boolean ignore(@SuppressWarnings(value = {"rawtypes"}) SyncDataDTO dto) {
