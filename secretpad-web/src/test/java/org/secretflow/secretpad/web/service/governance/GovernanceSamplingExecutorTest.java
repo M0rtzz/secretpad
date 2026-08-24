@@ -100,13 +100,30 @@ public class GovernanceSamplingExecutorTest {
     }
 
     @Test
-    void stratifiedCountDistributesEvenly() {
+    void stratifiedCountAppliesToEveryGroup() {
         List<List<String>> out = GovernanceSamplingExecutor.sample(HEADER, rows(90),
                 new GovernanceSamplingExecutor.SamplingParams("STRATIFIED", 6L, null,
                         List.of("category"), null, null, 5L, null));
-        assertEquals(6, out.size()); // 3 组 × 2
+        assertEquals(18, out.size()); // 3 组 × 每组 6 行
         Set<String> categories = new HashSet<>(column(out, 1));
         assertEquals(Set.of("A", "B", "C"), categories);
+    }
+
+    @Test
+    void stratifiedCountTakesAllRowsFromSmallerGroups() {
+        List<List<String>> input = List.of(
+                List.of("1", "A", "10"),
+                List.of("2", "A", "20"),
+                List.of("3", "B", "30"),
+                List.of("4", "B", "40"),
+                List.of("5", "B", "50"),
+                List.of("6", "B", "60"));
+        List<List<String>> out = GovernanceSamplingExecutor.sample(HEADER, input,
+                new GovernanceSamplingExecutor.SamplingParams("STRATIFIED", 3L, null,
+                        List.of("category"), null, null, 5L, null));
+        assertEquals(5, out.size()); // A 层仅 2 行全取，B 层抽取 3 行
+        assertEquals(2, column(out, 1).stream().filter("A"::equals).count());
+        assertEquals(3, column(out, 1).stream().filter("B"::equals).count());
     }
 
     @Test

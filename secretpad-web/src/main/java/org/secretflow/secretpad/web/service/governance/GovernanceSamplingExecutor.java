@@ -34,7 +34,7 @@ import java.util.Set;
  *   <li>RANDOM — pick {@code count} rows, or {@code ceil(n*ratio)} when only ratio is set.</li>
  *   <li>SYSTEMATIC — target {@code k}, step = {@code n/k}, take index {@code offset + j*step}.</li>
  *   <li>STRATIFIED — group by {@code strataColumns}; ratio: ceil(group*ratio) each;
- *       count: distribute evenly, at least 1 per non-empty group while the budget lasts.</li>
+ *       count: take up to {@code count} rows independently from every non-empty group.</li>
  *   <li>CLUSTER — whole clusters: group by {@code clusterColumn} values, or consecutive
  *       blocks of {@code blockSize}; pick {@code count} clusters or a {@code ratio} of them
  *       and include every row of the selected clusters.</li>
@@ -133,10 +133,6 @@ public final class GovernanceSamplingExecutor {
         double ratio = p.ratio() == null || p.ratio() <= 0 ? 0 : p.ratio();
         boolean byCount = p.count() != null && p.count() > 0;
         long count = byCount ? p.count() : 0;
-        int groupsCount = groups.size();
-        long base = byCount ? count / Math.max(1, groupsCount) : -1;
-        long rem = byCount ? count % Math.max(1, groupsCount) : -1;
-        long distributed = 0;
         List<Integer> picked = new ArrayList<>();
         for (Map.Entry<String, List<Integer>> entry : groups.entrySet()) {
             List<Integer> group = entry.getValue();
@@ -145,8 +141,7 @@ public final class GovernanceSamplingExecutor {
             if (!byCount) {
                 take = Math.min(groupSize, (int) Math.ceil(groupSize * ratio));
             } else {
-                take = (int) Math.min(groupSize, base + (distributed < rem ? 1 : 0));
-                distributed++;
+                take = (int) Math.min(groupSize, count);
             }
             if (take > 0) {
                 if (take >= groupSize) {
