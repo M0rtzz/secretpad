@@ -12,6 +12,8 @@ package org.secretflow.secretpad.web.service.sandbox;
 
 import org.secretflow.secretpad.common.dto.UserContextDTO;
 import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
+import org.secretflow.secretpad.common.errorcode.DataErrorCode;
+import org.secretflow.secretpad.common.errorcode.ProjectErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.persistence.entity.SandboxApprovalSyncDO;
@@ -23,6 +25,7 @@ import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncReposi
 import org.secretflow.secretpad.web.service.AssetTimeWindow;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
+import org.secretflow.secretpad.web.service.storage.NodeDatasetStore;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.secretflow.secretpad.web.service.sync.AssetSyncService;
 
@@ -86,6 +89,7 @@ public class SandboxApprovalService {
     private final ProjectDatatableRepository projectDatatableRepository;
     private final AssetSyncService assetSyncService;
     private final SandboxDbService sandboxDbService;
+    private final NodeDatasetStore nodeDatasetStore;
     private final Map<String, Integer> appliedSnapshotHashes = new ConcurrentHashMap<>();
 
     @Value("${secretpad.node-id:kuscia-system}")
@@ -108,7 +112,8 @@ public class SandboxApprovalService {
             ProjectAssetRepository projectAssetRepository,
             ProjectDatatableRepository projectDatatableRepository,
             AssetSyncService assetSyncService,
-            SandboxDbService sandboxDbService) {
+            SandboxDbService sandboxDbService,
+            NodeDatasetStore nodeDatasetStore) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.service = service;
@@ -119,6 +124,7 @@ public class SandboxApprovalService {
         this.projectDatatableRepository = projectDatatableRepository;
         this.assetSyncService = assetSyncService;
         this.sandboxDbService = sandboxDbService;
+        this.nodeDatasetStore = nodeDatasetStore;
     }
 
     /* ------------------------------- 申请单查询 ------------------------------- */
@@ -308,7 +314,7 @@ public class SandboxApprovalService {
     public List<String> submitAssetDeletion(String assetId, String assetName, List<String> projectIds) {
         String applicantNodeId = gate.effectiveOwner();
         if (count("select count(1) from ds_sandbox_approval where approval_type='ASSET_DELETE' and sandbox_id=? and status in ('DATA_PROVIDER_REVIEW','APPROVED','EXECUTING') and deleted=0", assetId) > 0) {
-            throw new IllegalStateException("该数据已有删除申请正在审批中");
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_DELETE_PENDING);
         }
         List<String> approvals = new ArrayList<>();
         String submittedAt = now();
@@ -452,17 +458,19 @@ public class SandboxApprovalService {
             if (!service.isKusciaEnabled() && ("CREATE".equals(type) || "SPEC_CHANGE".equals(type))) {
                 throw new IllegalStateException("Kuscia 运行时未启用，无法执行沙箱拉起类申请");
             }
-            switch (type) {
-                case "CREATE" -> execCreate(approval);
-                case "RENEW" -> execRenew(approval);
-                case "SPEC_CHANGE" -> execSpecChange(approval);
-                case "DATA_CHANGE" -> execDataChange(approval);
-                case "CONFIG_CHANGE" -> execConfigChange(approval);
-                case "RECYCLE" -> execRecycle(approval);
+            boolean shouldComplete = switch (type) {
+                case "CREATE" -> { execCreate(approval); yield true; }
+                case "RENEW" -> { execRenew(approval); yield true; }
+                case "SPEC_CHANGE" -> { execSpecChange(approval); yield true; }
+                case "DATA_CHANGE" -> { execDataChange(approval); yield true; }
+                case "CONFIG_CHANGE" -> { execConfigChange(approval); yield true; }
+                case "RECYCLE" -> { execRecycle(approval); yield true; }
                 case "ASSET_DELETE" -> execAssetDelete(approval);
                 default -> throw new IllegalStateException("未知申请类型: " + type);
+            };
+            if (shouldComplete) {
+                complete(id);
             }
-            complete(id);
         } catch (Exception e) {
             failAndRetry(id, truncate(e.getMessage(), 900));
         }
@@ -678,23 +686,47 @@ public class SandboxApprovalService {
     }
 
     /** Delete only after every referenced project's request has reached unanimous approval. */
-    private void execAssetDelete(Map<String, Object> approval) {
+    private boolean execAssetDelete(Map<String, Object> approval) {
         String assetId = string(approval.get("sandbox_id"));
-        long blockers = count("select count(1) from ds_sandbox_approval where approval_type='ASSET_DELETE' and sandbox_id=? and submitted_at=? and deleted=0 and status not in ('APPROVED','EXECUTING','COMPLETED')",
+        long rejected = count("select count(1) from ds_sandbox_approval a join project p on p.project_id=a.project_id and p.status=1 and p.is_deleted=0 where a.approval_type='ASSET_DELETE' and a.sandbox_id=? and a.submitted_at=? and a.deleted=0 and a.status in ('REJECTED','CANCELLED','FAILED')",
                 assetId, approval.get("submitted_at"));
-        if (blockers > 0) return;
+        if (rejected > 0) {
+            int changed = jdbc.update("update ds_sandbox_approval set status='REJECTED',current_stage='REJECTED',last_error=?,completed_at=?,updated_at=? where id=? and status='EXECUTING' and deleted=0",
+                    "同批次项目审批未全部通过", now(), now(), approval.get("id"));
+            if (changed == 1) {
+                history(string(approval.get("id")), "GROUP_REJECT", "EXECUTING", "REJECTED", "同批次项目审批未全部通过");
+            }
+            return false;
+        }
+        long pending = count("select count(1) from ds_sandbox_approval a join project p on p.project_id=a.project_id and p.status=1 and p.is_deleted=0 where a.approval_type='ASSET_DELETE' and a.sandbox_id=? and a.submitted_at=? and a.deleted=0 and a.status not in ('APPROVED','EXECUTING','COMPLETED')",
+                assetId, approval.get("submitted_at"));
+        if (pending > 0) {
+            jdbc.update("update ds_sandbox_approval set status='APPROVED',current_stage='APPROVED',last_error=?,updated_at=? where id=? and status='EXECUTING' and deleted=0",
+                    "等待同批次项目审批", now(), approval.get("id"));
+            return false;
+        }
         List<Map<String, Object>> assets = jdbc.queryForList("select * from ds_data_asset where id=? and deleted=0", assetId);
-        if (assets.isEmpty()) return;
+        if (assets.isEmpty()) return true;
         Map<String, Object> asset = assets.get(0);
         String datatableId = string(asset.get("datatable_id"));
         Long children = jdbc.queryForObject("select count(1) from ds_data_asset where source_asset_id=? and deleted=0", Long.class, assetId);
         Long mounts = jdbc.queryForObject("select count(1) from ds_sandbox_dataset_mount where asset_id=? and deleted=0", Long.class, assetId);
-        if (children != null && children > 0) throw new IllegalStateException("数据仍被衍生资产引用，不能删除");
-        if (mounts != null && mounts > 0) throw new IllegalStateException("数据仍被运行中的沙箱挂载，不能删除");
+        if (children != null && children > 0) {
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_HAS_DERIVED_ASSET);
+        }
+        if (mounts != null && mounts > 0) {
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_MOUNTED);
+        }
 
         List<String> projects = jdbc.queryForList(
-                "select distinct project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0)",
+                "select distinct refs.project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0) refs join project p on p.project_id=refs.project_id and p.status=1 and p.is_deleted=0",
                 String.class, assetId, datatableId);
+        Set<String> approvedProjects = jdbc.queryForList(
+                "select distinct a.project_id from ds_sandbox_approval a join project p on p.project_id=a.project_id and p.status=1 and p.is_deleted=0 where a.approval_type='ASSET_DELETE' and a.sandbox_id=? and a.submitted_at=? and a.deleted=0 and a.status in ('APPROVED','EXECUTING','COMPLETED')",
+                String.class, assetId, approval.get("submitted_at")).stream().collect(Collectors.toSet());
+        if (!projects.stream().collect(Collectors.toSet()).equals(approvedProjects)) {
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_DELETE_CONFLICT);
+        }
         for (String projectId : projects) {
             projectAssetRepository.findById(new ProjectAssetDO.UPK(projectId, assetId)).ifPresent(projectAsset -> {
                 projectAsset.setIsDeleted(true);
@@ -710,8 +742,10 @@ public class SandboxApprovalService {
         projectAssetRepository.flush();
         projectDatatableRepository.flush();
         assetStorage.delete(string(asset.get("storage_uri")));
+        nodeDatasetStore.remove(assetId);
         int changed = jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=? and deleted=0", now(), assetId);
-        if (changed != 1) throw new IllegalStateException("数据删除发生并发冲突");
+        if (changed != 1) throw SecretpadException.of(DataErrorCode.DATA_ASSET_DELETE_CONFLICT);
+        return true;
     }
 
     private void recreateSandboxJob(Map<String, Object> sandbox, Runnable mutation, String reason) {
@@ -952,7 +986,7 @@ public class SandboxApprovalService {
             throw new IllegalArgumentException("项目不存在: " + projectId);
         }
         if (count("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0", projectId, memberNodeId) == 0) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前节点不是该项目参与方");
+            throw SecretpadException.of(ProjectErrorCode.PROJECT_NODE_NOT_EXISTS);
         }
     }
 

@@ -47,6 +47,26 @@ public enum DataErrorCode implements ErrorCode {
      * File name duplication
      */
     NAME_DUPLICATION_ERROR(202011806),
+    /**
+     * Source asset still has active derived assets
+     */
+    DATA_ASSET_HAS_DERIVED_ASSET(202011807),
+    /**
+     * Asset is still mounted by an active sandbox
+     */
+    DATA_ASSET_MOUNTED(202011808),
+    /**
+     * Asset already has a deletion approval in progress
+     */
+    DATA_ASSET_DELETE_PENDING(202011809),
+    /**
+     * Asset deletion encountered a concurrent state change
+     */
+    DATA_ASSET_DELETE_CONFLICT(202011810),
+    /**
+     * Current node is not the asset provider
+     */
+    DATA_ASSET_DELETE_FORBIDDEN(202011811),
 
     ;
 

@@ -87,6 +87,7 @@ import org.springframework.util.CollectionUtils;
 import org.springframework.util.ObjectUtils;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -117,6 +118,8 @@ public class ProjectServiceImpl implements ProjectService {
     private ProjectInstRepository projectInstRepository;
     @Autowired
     private ProjectNodeRepository projectNodeRepository;
+    @Autowired
+    private ProjectAssetRepository projectAssetRepository;
     @Autowired
     private ProjectDatatableRepository projectDatatableRepository;
     @Autowired
@@ -687,11 +690,33 @@ public class ProjectServiceImpl implements ProjectService {
         if (!ProjectStatusEnum.REVIEWING.getCode().equals(projectDOOptional.get().getStatus())) {
             throw SecretpadException.of(ProjectErrorCode.PROJECT_CAN_NOT_ARCHIVE);
         }
+        archiveProjectAssets(archiveProjectRequest.getProjectId());
         projectInstRepository.deleteByUpkProjectId(archiveProjectRequest.getProjectId());
         projectNodeRepository.deleteByUpkProjectId(archiveProjectRequest.getProjectId());
         ProjectDO projectDO = projectDOOptional.get();
         projectDO.setStatus(ProjectStatusEnum.ARCHIVED.getCode());
         projectRepository.save(projectDO);
+    }
+
+    /** Soft-delete project asset snapshots before project participants are removed. */
+    private void archiveProjectAssets(String projectId) {
+        List<ProjectAssetDO> assets = projectAssetRepository.findByUpkProjectId(projectId);
+        LocalDateTime modifiedAt = LocalDateTime.now(ZoneOffset.UTC);
+        assets.forEach(asset -> {
+            asset.setIsDeleted(true);
+            asset.setGmtModified(modifiedAt);
+        });
+        if (!assets.isEmpty()) {
+            projectAssetRepository.saveAllAndFlush(assets);
+        }
+        List<ProjectDatatableDO> datatables = projectDatatableRepository.findByProjectId(projectId);
+        datatables.forEach(datatable -> {
+            datatable.setIsDeleted(true);
+            datatable.setGmtModified(modifiedAt);
+        });
+        if (!datatables.isEmpty()) {
+            projectDatatableRepository.saveAllAndFlush(datatables);
+        }
     }
 
 
@@ -1021,4 +1046,3 @@ public class ProjectServiceImpl implements ProjectService {
     }
 
 }
-

@@ -44,6 +44,11 @@ public enum AuthErrorCode implements ErrorCode {
     USER_IS_LOCKED(202011603),
 
     RESET_PASSWORD_IS_LOCKED(202011604),
+
+    /**
+     * User session is missing, invalid or expired
+     */
+    SESSION_INVALID(202011605),
     ;
 
     private final int code;

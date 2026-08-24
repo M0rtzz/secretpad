@@ -42,7 +42,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @TestPropertySource(properties = {
         "secretpad.auth.enabled=true",
         "kusciaapi.protocol=notls",
-        "secretpad.node-id=test"
+        "secretpad.node-id=test",
 })
 public class LoginInterceptorTest extends ControllerTest {
 
@@ -54,7 +54,7 @@ public class LoginInterceptorTest extends ControllerTest {
         MockHttpServletRequestBuilder requestBuilder = post("/api/v1alpha1/approval/create").contentType("application/json");
         mockMvc.perform(requestBuilder)
                 .andExpect(status().isOk())
-                .andExpect(content().json("{\"status\":{\"code\":202011602,\"msg\":\"用户认证失败: The request header does not contain header!\"},\"data\":null}"));
+                .andExpect(content().json("{\"status\":{\"code\":202011605,\"msg\":\"用户认证失败: The request header does not contain header!\"},\"data\":null}"));
     }
 
     @Test
@@ -62,7 +62,7 @@ public class LoginInterceptorTest extends ControllerTest {
         MockHttpServletRequestBuilder requestBuilder = post("/api/v1alpha1/approval/create").contentType("application/json").header(AuthConstants.TOKEN_NAME, "123");
         mockMvc.perform(requestBuilder)
                 .andExpect(status().isOk())
-                .andExpect(content().json("{\"status\":{\"code\":202011602,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
+                .andExpect(content().json("{\"status\":{\"code\":202011605,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
     }
 
     @Test
@@ -75,7 +75,7 @@ public class LoginInterceptorTest extends ControllerTest {
         Mockito.when(userTokensRepository.findByToken(Mockito.any())).thenReturn(tokensDO);
         mockMvc.perform(requestBuilder)
                 .andExpect(status().isOk())
-                .andExpect(content().json("{\"status\":{\"code\":202011602,\"msg\":\"用户认证失败: login is expire, please login again.\"},\"data\":null}"));
+                .andExpect(content().json("{\"status\":{\"code\":202011605,\"msg\":\"用户认证失败: login is expire, please login again.\"},\"data\":null}"));
     }
 
     @Test
@@ -88,7 +88,7 @@ public class LoginInterceptorTest extends ControllerTest {
         Mockito.when(userTokensRepository.findByToken(Mockito.any())).thenReturn(tokensDO);
         mockMvc.perform(requestBuilder)
                 .andExpect(status().isOk())
-                .andExpect(content().json("{\"status\":{\"code\":202011602,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
+                .andExpect(content().json("{\"status\":{\"code\":202011605,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
     }
 
     @Test
@@ -101,6 +101,6 @@ public class LoginInterceptorTest extends ControllerTest {
         Mockito.when(userTokensRepository.findByToken(Mockito.any())).thenReturn(tokensDO);
         mockMvc.perform(requestBuilder)
                 .andExpect(status().isOk())
-                .andExpect(content().json("{\"status\":{\"code\":202011602,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
+                .andExpect(content().json("{\"status\":{\"code\":202011605,\"msg\":\"用户认证失败: login is required\"},\"data\":null}"));
     }
 }

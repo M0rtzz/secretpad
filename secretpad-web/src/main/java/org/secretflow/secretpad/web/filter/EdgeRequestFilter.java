@@ -177,17 +177,17 @@ public class EdgeRequestFilter implements Filter, Ordered {
         String token = AuthUtils.findTokenInHeader(request);
         Optional<TokensDO> tokensDO = userTokensRepository.findByToken(token);
         if (tokensDO.isEmpty()) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "Cannot find token in db, user not login in.");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "Cannot find token in db, user not login in.");
         }
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime gmtToken = tokensDO.get().getGmtToken();
         long until = gmtToken.until(now, ChronoUnit.SECONDS);
         if (until > EXPIRE) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "The login session is expire, please login again.");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "The login session is expire, please login again.");
         }
         String sessionData = tokensDO.get().getSessionData();
         if (StringUtils.isBlank(sessionData)) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "The login session is null, please login again.");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "The login session is null, please login again.");
         }
     }
 

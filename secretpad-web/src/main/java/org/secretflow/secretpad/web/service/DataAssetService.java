@@ -7,6 +7,8 @@ package org.secretflow.secretpad.web.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.errorcode.DataErrorCode;
+import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.manager.integration.model.DatatableDTO;
 import org.secretflow.secretpad.persistence.entity.ProjectAssetDO;
@@ -556,10 +558,14 @@ public class DataAssetService {
         requireProvider(asset);
         Long children = jdbc.queryForObject("select count(1) from ds_data_asset where source_asset_id=? and deleted=0", Long.class, id);
         Long mounts = jdbc.queryForObject("select count(1) from ds_sandbox_dataset_mount where asset_id=? and deleted=0", Long.class, id);
-        if (children != null && children > 0) throw new IllegalStateException("数据仍被衍生资产引用，不能删除");
-        if (mounts != null && mounts > 0) throw new IllegalStateException("数据仍被运行中的沙箱挂载，不能删除");
+        if (children != null && children > 0) {
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_HAS_DERIVED_ASSET);
+        }
+        if (mounts != null && mounts > 0) {
+            throw SecretpadException.of(DataErrorCode.DATA_ASSET_MOUNTED);
+        }
         List<String> projects = jdbc.queryForList(
-                "select distinct project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0) order by project_id",
+                "select distinct refs.project_id from (select project_id from ds_project_asset where asset_id=? and deleted=0 and coalesce(is_deleted,0)=0 union select project_id from project_datatable where datatable_id=? and is_deleted=0) refs join project p on p.project_id=refs.project_id and p.status=1 and p.is_deleted=0 order by refs.project_id",
                 String.class, id, asset.get("datatable_id"));
         if (!projects.isEmpty()) {
             List<String> approvalIds = approvalService.submitAssetDeletion(id,
@@ -570,7 +576,7 @@ public class DataAssetService {
         storage.delete(String.valueOf(asset.get("storage_uri")));
         nodeDatasetStore.remove(id);
         int changed = jdbc.update("update ds_data_asset set deleted=1,status='DELETED',updated_at=? where id=? and deleted=0", now(), id);
-        if (changed != 1) throw new IllegalStateException("数据已被删除或状态已变化");
+        if (changed != 1) throw SecretpadException.of(DataErrorCode.DATA_ASSET_DELETE_CONFLICT);
         return Map.of("status", "DELETED", "id", id);
     }
 
@@ -656,7 +662,7 @@ public class DataAssetService {
         return a;
     }
     private Map<String,Object> require(String id) { List<Map<String,Object>> r=jdbc.queryForList("select * from ds_data_asset where id=? and deleted=0",id); if(r.isEmpty()) throw new NoSuchElementException("数据不存在"); return r.get(0); }
-    private void requireProvider(Map<String,Object> a){ if(!matchesOwner(String.valueOf(a.get("provider_node_id")))) throw new SecurityException("仅数据提供方可删除"); }
+    private void requireProvider(Map<String,Object> a){ if(!matchesOwner(String.valueOf(a.get("provider_node_id")))) throw SecretpadException.of(DataErrorCode.DATA_ASSET_DELETE_FORBIDDEN); }
     private void requireProjectMember(String projectId){if(c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())==0)throw new SecurityException("当前节点不是项目成员");}
     private void requireProjectParticipant(String projectId){
         boolean member=c("select count(1) from project_node where project_id=? and node_id=? and is_deleted=0",projectId,owner())>0;

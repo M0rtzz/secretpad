@@ -38,9 +38,12 @@ import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
 
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -56,12 +59,16 @@ public class ProjectArchiveHandler extends AbstractAutonomyVoteTypeHandler {
 
     private final ProjectNodeRepository projectNodeRepository;
     private final ProjectInstRepository projectInstRepository;
+    private final ProjectAssetRepository projectAssetRepository;
+    private final ProjectDatatableRepository projectDatatableRepository;
 
 
-    public ProjectArchiveHandler(VoteInviteRepository voteInviteRepository, VoteRequestRepository voteRequestRepository, NodeRepository nodeRepository, InstRepository instRepository, EnvService envService, ProjectRepository projectRepository, ProjectApprovalConfigRepository projectApprovalConfigRepository, ProjectNodeRepository projectNodeRepository, CertificateService certificateService, NodeManager nodeManager, ProjectInstRepository projectInstRepository) {
+    public ProjectArchiveHandler(VoteInviteRepository voteInviteRepository, VoteRequestRepository voteRequestRepository, NodeRepository nodeRepository, InstRepository instRepository, EnvService envService, ProjectRepository projectRepository, ProjectApprovalConfigRepository projectApprovalConfigRepository, ProjectNodeRepository projectNodeRepository, CertificateService certificateService, NodeManager nodeManager, ProjectInstRepository projectInstRepository, ProjectAssetRepository projectAssetRepository, ProjectDatatableRepository projectDatatableRepository) {
         super(voteInviteRepository, voteRequestRepository, nodeRepository, instRepository, envService, projectRepository, projectApprovalConfigRepository, nodeManager, certificateService);
         this.projectNodeRepository = projectNodeRepository;
         this.projectInstRepository = projectInstRepository;
+        this.projectAssetRepository = projectAssetRepository;
+        this.projectDatatableRepository = projectDatatableRepository;
     }
 
 
@@ -170,6 +177,7 @@ public class ProjectArchiveHandler extends AbstractAutonomyVoteTypeHandler {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public void doCallBackApproved(VoteRequestDO voteRequestDO) {
         if (!envService.isCurrentInstEnvironment(voteRequestDO.getInitiator())) {
             LOGGER.info("not initiator return");
@@ -195,6 +203,7 @@ public class ProjectArchiveHandler extends AbstractAutonomyVoteTypeHandler {
         if (projectInstMap.containsKey(inst_id)) {
             ProjectDO dbProjectDO = currentDBProjectDO.get();
             if (ProjectStatusEnum.APPROVED.getCode().equals(dbProjectDO.getStatus())) {
+                archiveProjectAssets(projectArchiveDO.getProjectId());
                 projectInstRepository.deleteAll(projectInstDOS);
                 projectNodeRepository.deleteAll(projectNodeDOS);
                 LOGGER.info("archive project,delete project inst success");
@@ -211,13 +220,36 @@ public class ProjectArchiveHandler extends AbstractAutonomyVoteTypeHandler {
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public void flushVoteStatus(String voteID) {
         Optional<ProjectApprovalConfigDO> projectApprovalConfigDO = projectApprovalConfigRepository.findById(voteID);
         String projectId = projectApprovalConfigDO.get().getProjectId();
         Optional<ProjectDO> projectDOOptional = projectRepository.findById(projectId);
         ProjectDO projectDO = projectDOOptional.get();
+        archiveProjectAssets(projectId);
         projectDO.setStatus(ProjectStatusEnum.ARCHIVED.getCode());
         projectRepository.save(projectDO);
+    }
+
+    /** Soft-delete project asset snapshots before project participants are removed. */
+    private void archiveProjectAssets(String projectId) {
+        List<ProjectAssetDO> assets = projectAssetRepository.findByUpkProjectId(projectId);
+        LocalDateTime modifiedAt = LocalDateTime.now(ZoneOffset.UTC);
+        assets.forEach(asset -> {
+            asset.setIsDeleted(true);
+            asset.setGmtModified(modifiedAt);
+        });
+        if (!assets.isEmpty()) {
+            projectAssetRepository.saveAllAndFlush(assets);
+        }
+        List<ProjectDatatableDO> datatables = projectDatatableRepository.findByProjectId(projectId);
+        datatables.forEach(datatable -> {
+            datatable.setIsDeleted(true);
+            datatable.setGmtModified(modifiedAt);
+        });
+        if (!datatables.isEmpty()) {
+            projectDatatableRepository.saveAllAndFlush(datatables);
+        }
     }
 
     @Override

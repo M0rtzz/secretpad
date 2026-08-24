@@ -39,7 +39,7 @@ public class AuthUtils {
     public static String findTokenInHeader(HttpServletRequest request) {
         String token = request.getHeader(AuthConstants.TOKEN_NAME);
         if (StringUtils.isEmpty(token)) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "The request header does not contain User-Token!");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "The request header does not contain User-Token!");
         }
         return token;
     }

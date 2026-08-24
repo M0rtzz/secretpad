@@ -253,13 +253,13 @@ public class LoginInterceptor implements HandlerInterceptor {
         String token = AuthUtils.findTokenInHeader(request);
         Optional<TokensDO> tokensDO = userTokensRepository.findByToken(token);
         if (tokensDO.isEmpty()) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "login is required");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "login is required");
         }
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime gmtToken = tokensDO.get().getGmtToken();
         long until = gmtToken.until(now, ChronoUnit.SECONDS);
         if (until > EXPIRE) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "login is expire, please login again.");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "login is expire, please login again.");
         }
         userTokensRepository.saveAndFlush(
                 TokensDO.builder()
@@ -272,7 +272,7 @@ public class LoginInterceptor implements HandlerInterceptor {
 
         String sessionData = tokensDO.get().getSessionData();
         if (StringUtils.isBlank(sessionData)) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "login is required");
+            throw SecretpadException.of(AuthErrorCode.SESSION_INVALID, "login is required");
         }
         UserContextDTO userContextDTO = UserContextDTO.fromJson(sessionData);
         UserContext.setBaseUser(userContextDTO);

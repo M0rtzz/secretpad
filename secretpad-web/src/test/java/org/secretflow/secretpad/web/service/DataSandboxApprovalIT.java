@@ -11,6 +11,7 @@
 package org.secretflow.secretpad.web.service;
 
 import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.errorcode.DataErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.enums.PlatformTypeEnum;
 import org.secretflow.secretpad.common.enums.UserOwnerTypeEnum;
@@ -152,11 +153,15 @@ public class DataSandboxApprovalIT {
         jdbc.update("delete from ds_sandbox_snapshot");
         jdbc.update("delete from ds_resource_allocation");
         jdbc.update("delete from ds_alert_event");
-        jdbc.update("delete from project_node where project_id='p1'");
-        jdbc.update("delete from project where project_id='p1'");
+        jdbc.update("delete from project_node where project_id in ('p1','p2')");
+        jdbc.update("delete from project where project_id in ('p1','p2')");
         jdbc.update("insert into project(project_id,name,owner_id,status,is_deleted) values('p1','Approval IT','alice',1,0)");
         jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','alice',0)");
         jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p1','carol',0)");
+        jdbc.update("insert or replace into ds_sandbox_image(id,name,image_ref,kuscia_app_image,description,enabled,created_by,created_at,updated_at) values(?,?,?,'','','1','test',?,?)",
+                IMAGE_ID, "SecretFlow", "secretflow:test", LocalDateTime.now().toString(), LocalDateTime.now().toString());
+        jdbc.update("insert or ignore into ds_resource_quota(owner_id,cpu_cores,memory_gb,gpu_count,storage_gb,updated_by,updated_at) values('alice',16,64,4,1024,'test',?)",
+                LocalDateTime.now().toString());
         jdbc.update("update ds_gpu_ledger set status='AVAILABLE',owner_id='',allocated_at=''");
         jdbc.update("update ds_resource_quota set cpu_cores=16,memory_gb=64,gpu_count=4,storage_gb=1024 where owner_id='alice'");
         JobService.State.createJobCode = KusciaAPIConstants.OK;
@@ -601,6 +606,102 @@ public class DataSandboxApprovalIT {
 
         approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意"));
         assertEquals("APPROVED", approvalStatus(approvalId));
+    }
+
+    /** 归档项目遗留的资产关系不应触发删除审批。 */
+    @Test
+    public void archivedProjectAssetReferenceDoesNotRequireApproval() {
+        String assetId = "asset-delete-it-archived";
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','PROCESSED','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                assetId, "归档项目数据", "alice", "alice", "GOVERNANCE", assetId, "alice",
+                LocalDateTime.now().toString(), LocalDateTime.now().toString());
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p1',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                assetId, "alice");
+        jdbc.update("update project set status=2 where project_id='p1'");
+        jdbc.update("update project_node set is_deleted=1 where project_id='p1'");
+
+        Map<String, Object> result = dataAssetService.delete(assetId);
+
+        assertEquals("DELETED", result.get("status"));
+        assertEquals(1L, count("select deleted from ds_data_asset where id=?", assetId));
+        assertEquals(0L, count("select count(1) from ds_sandbox_approval where sandbox_id=?", assetId));
+    }
+
+    /** 源数据存在活动衍生资产时返回明确的数据业务错误。 */
+    @Test
+    public void derivedAssetReferenceReturnsBusinessError() {
+        String sourceId = "asset-delete-it-source";
+        String childId = "asset-delete-it-child";
+        String now = LocalDateTime.now().toString();
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','RAW','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                sourceId, "源数据", "alice", "alice", "FILE", sourceId, "alice", now, now);
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','PROCESSED',?,?,'','{}',?,?,?,1,'ACTIVE',0)",
+                childId, "衍生数据", "alice", "alice", "GOVERNANCE", sourceId, childId, "alice", now, now);
+
+        SecretpadException error = assertThrows(SecretpadException.class,
+                () -> dataAssetService.delete(sourceId));
+
+        assertEquals(DataErrorCode.DATA_ASSET_HAS_DERIVED_ASSET, error.getErrorCode());
+    }
+
+    /** 多项目删除审批中任一项目拒绝后，其余审批不得被误标记为完成。 */
+    @Test
+    public void rejectedProjectPreventsAssetDeletionGroupCompletion() {
+        String assetId = "asset-delete-it-rejected-group";
+        String now = LocalDateTime.now().toString();
+        jdbc.update("insert into project(project_id,name,owner_id,status,is_deleted) values('p2','Approval IT 2','alice',1,0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p2','alice',0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p2','carol',0)");
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','RAW','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                assetId, "多项目审批数据", "alice", "alice", "FILE", assetId, "alice", now, now);
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p1',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", assetId, "alice");
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p2',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", assetId, "alice");
+
+        Map<String, Object> result = dataAssetService.delete(assetId);
+        List<Map<String, Object>> approvals = jdbc.queryForList("select id,project_id from ds_sandbox_approval where sandbox_id=? order by project_id", assetId);
+        assertEquals(2, approvals.size());
+        String rejectedId = String.valueOf(approvals.get(0).get("id"));
+        String approvedId = String.valueOf(approvals.get(1).get("id"));
+
+        UserContext.setBaseUser(carol());
+        approvalService.approvalAction(Map.of("id", rejectedId, "action", "REJECT", "comment", "拒绝删除"));
+        approvalService.approvalAction(Map.of("id", approvedId, "action", "APPROVE", "comment", "同意删除"));
+        jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING' where id=?", approvedId);
+        UserContext.setBaseUser(alice());
+        approvalService.executeOne(approvedId);
+
+        assertEquals("REJECTED", approvalStatus(rejectedId));
+        assertEquals("REJECTED", approvalStatus(approvedId));
+        assertEquals(0L, count("select deleted from ds_data_asset where id=?", assetId));
+        assertEquals(2L, count("select count(1) from ds_project_asset where asset_id=? and is_deleted=0", assetId));
+        assertEquals("PENDING_APPROVAL", result.get("status"));
+    }
+
+    /** 审批提交后新增项目引用时，旧审批快照不得覆盖并删除新增引用。 */
+    @Test
+    public void projectReferenceAddedAfterApprovalCausesConflict() {
+        String assetId = "asset-delete-it-reference-race";
+        String now = LocalDateTime.now().toString();
+        jdbc.update("insert into ds_data_asset(id,name,provider_node_id,processor_node_id,ingestion_type,modality,data_stage,source_asset_id,datatable_id,storage_uri,metadata_json,created_by,created_at,updated_at,version,status,deleted) values(?,?,?,?,?,'TABULAR','RAW','',?,'','{}',?,?,?,1,'ACTIVE',0)",
+                assetId, "引用变化数据", "alice", "alice", "FILE", assetId, "alice", now, now);
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p1',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", assetId, "alice");
+        Map<String, Object> result = dataAssetService.delete(assetId);
+        String approvalId = String.valueOf(((List<?>) result.get("approvalIds")).get(0));
+        UserContext.setBaseUser(carol());
+        approvalService.approvalAction(Map.of("id", approvalId, "action", "APPROVE", "comment", "同意删除"));
+
+        jdbc.update("insert into project(project_id,name,owner_id,status,is_deleted) values('p2','Approval IT 2','alice',1,0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p2','alice',0)");
+        jdbc.update("insert into project_node(project_id,node_id,is_deleted) values('p2','carol',0)");
+        jdbc.update("insert into ds_project_asset(project_id,asset_id,provider_node_id,asset_json,attached_by,attached_at,expires_at,deleted,is_deleted,gmt_create,gmt_modified) values('p2',?,?,'{}','alice','','',0,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", assetId, "alice");
+        jdbc.update("update ds_sandbox_approval set status='EXECUTING',current_stage='EXECUTING' where id=?", approvalId);
+        UserContext.setBaseUser(alice());
+        approvalService.executeOne(approvalId);
+
+        assertEquals("APPROVED", approvalStatus(approvalId));
+        assertEquals(1L, count("select retry_count from ds_sandbox_approval where id=?", approvalId));
+        assertEquals(0L, count("select deleted from ds_data_asset where id=?", assetId));
+        assertEquals(1L, count("select count(1) from ds_project_asset where project_id='p2' and asset_id=? and is_deleted=0", assetId));
     }
 
     /** 数据目录应展示挂载项目；其他项目节点查看时应标记为项目共享数据。 */
