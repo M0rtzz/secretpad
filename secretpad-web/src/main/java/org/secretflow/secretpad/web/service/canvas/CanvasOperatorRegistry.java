@@ -35,8 +35,23 @@ public final class CanvasOperatorRegistry {
     private CanvasOperatorRegistry() {
     }
 
+    /**
+     * Python 3.11 import 守卫会影响按名称加载 ASCII codec。XGBoost 读取版本文件时显式使用
+     * {@code encoding="ascii"}，这里将该兼容编码映射为等价的 UTF-8，且仅作用于单次执行进程。
+     */
+    public static final String PYTHON_ASCII_OPEN_COMPAT = """
+            import builtins as _ds_builtins
+            _ds_original_open = _ds_builtins.open
+            def _ds_compatible_open(*args, **kwargs):
+                if kwargs.get("encoding") == "ascii":
+                    kwargs["encoding"] = "utf-8"
+                return _ds_original_open(*args, **kwargs)
+            _ds_builtins.open = _ds_compatible_open
+            """;
+
     /** 画布节点统一脚本：import modeling_ops + 转发 main()（--input/--output/--params 由 runner 注入）。 */
-    public static final String RENDER_SCRIPT = "import modeling_ops as mops\nmops.main()\n";
+    public static final String RENDER_SCRIPT = PYTHON_ASCII_OPEN_COMPAT
+            + "import modeling_ops as mops\nmops.main()\n";
 
     private static final String DEFAULT_CPU = "0.5";
     private static final String DEFAULT_MEMORY = "512Mi";

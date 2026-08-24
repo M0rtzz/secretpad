@@ -880,16 +880,17 @@ public class SandboxCanvasService {
     private Map<String, Object> runModelInspection(String sandboxId, String canvasId, String nodeId,
             String inputTable, String operatorCode, String outputPrefix, String script, String failureLabel) {
         String outputTable = outputPrefix + shortId();
+        String compatibleScript = CanvasOperatorRegistry.PYTHON_ASCII_OPEN_COMPAT + script;
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("op", operatorCode);
         String taskId = dataDevService.createCanvasTask(sandboxId, canvasId, nodeId, operatorCode,
-                script, params, List.of(), outputTable);
+                compatibleScript, params, List.of(), outputTable);
         dataDevService.claimCanvasTask(taskId);
         byte[] inputCsv = sandboxDb.readTableCsv(sandboxId, inputTable);
         String nodeDomain = string(jdbc.queryForMap(
                 "select owner_id from ds_sandbox where id=? and deleted=0", sandboxId).get("owner_id"));
         devJobExecutor.submitSandboxChannel(taskId, nodeDomain,
-                Base64.getEncoder().encodeToString(inputCsv), "PYTHON", script, params, List.of(),
+                Base64.getEncoder().encodeToString(inputCsv), "PYTHON", compatibleScript, params, List.of(),
                 sandboxId, inputTable, outputTable, new LinkedHashSet<>(Set.of(inputTable)), "canvas");
         Map<String, Object> execution = devJobExecutor.runAndAwait(taskId);
         if (!"SUCCEEDED".equals(string(execution.get("status")))) {

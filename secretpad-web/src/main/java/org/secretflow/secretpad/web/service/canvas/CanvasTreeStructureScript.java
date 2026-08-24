@@ -144,6 +144,7 @@ public final class CanvasTreeStructureScript {
         sb.append("def main():\n");
         sb.append("    ap = argparse.ArgumentParser(description=\"Canvas tree structure export\")\n");
         sb.append("    ap.add_argument(\"--input\", required=True)\n");
+        sb.append("    ap.add_argument(\"--input-table\", default=\"\")\n");
         sb.append("    ap.add_argument(\"--output\", required=True)\n");
         sb.append("    ap.add_argument(\"--params\", default=\"{}\")\n");
         sb.append("    args = ap.parse_args()\n");
