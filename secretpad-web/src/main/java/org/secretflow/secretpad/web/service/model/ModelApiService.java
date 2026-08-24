@@ -18,6 +18,7 @@ import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.service.EnvService;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
+import org.secretflow.secretpad.web.service.canvas.CanvasOperatorRegistry;
 import org.secretflow.secretpad.web.service.dev.DevDependencyChecker;
 import org.secretflow.secretpad.web.service.dev.DevFunctionWrapper;
 import org.secretflow.secretpad.web.service.dev.DevJobExecutor;
@@ -693,7 +694,7 @@ public class ModelApiService {
         Map<String, Object> artifact = requireArtifact(string(model.get("artifact_id")));
         Map<String, Object> version = requireVersion(string(model.get("artifact_id")), string(model.get("artifact_version_id")));
         String execType = string(artifact.get("type"));
-        String nodeId = notBlank(string(model.get("node_id"))) ? string(model.get("node_id")) : envService.getPlatformNodeId();
+        String nodeId = envService.getPlatformNodeId();
         Map<String, Object> params = modelTestService.mergedParams(version, body.get("params"));
         String inputB64 = Base64.getEncoder().encodeToString(inputCsv.getBytes(StandardCharsets.UTF_8));
         String taskId = createInvokeTask(modelId, nodeId, execType, params, rows.size());
@@ -785,8 +786,9 @@ public class ModelApiService {
         String jarB64OrScript;
         List<String> allowedImports;
         if ("PYTHON".equals(execType)) {
-            jarB64OrScript = string(version.get("content_text"));
-            modelTestService.validatePython(jarB64OrScript);
+            String sourceScript = string(version.get("content_text"));
+            modelTestService.validatePython(sourceScript);
+            jarB64OrScript = CanvasOperatorRegistry.PYTHON_ASCII_OPEN_COMPAT + sourceScript;
             allowedImports = new ArrayList<>(modelTestService.enabledWhitelist());
         } else {
             jarB64OrScript = Base64.getEncoder().encodeToString(modelTestService.readJar(string(version.get("file_path"))));
