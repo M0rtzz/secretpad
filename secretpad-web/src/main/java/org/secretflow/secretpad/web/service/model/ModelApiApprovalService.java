@@ -394,7 +394,24 @@ public class ModelApiApprovalService {
             }
             Object parsed = objectMapper.readValue(response.body(), Object.class);
             if (parsed instanceof Map<?, ?> map) {
-                return castMap(map);
+                Map<String, Object> envelope = castMap(map);
+                Object statusValue = envelope.get("status");
+                if (statusValue instanceof Map<?, ?> statusMap) {
+                    Map<String, Object> remoteStatus = castMap(statusMap);
+                    String code = string(remoteStatus.get("code"));
+                    if (!"0".equals(code)) {
+                        throw new IllegalArgumentException(ModelErrors.MODEL_API_INVOKE_FAILED
+                                + ": 申请方节点调用失败: " + string(remoteStatus.get("msg")));
+                    }
+                    Object data = envelope.get("data");
+                    if (data instanceof Map<?, ?> dataMap) {
+                        return castMap(dataMap);
+                    }
+                    throw new IllegalArgumentException(
+                            ModelErrors.MODEL_API_INVOKE_FAILED + ": 申请方节点未返回有效推理结果");
+                }
+                // 兼容未包装 SecretPadResponse 的旧节点响应。
+                return envelope;
             }
             return Map.of("raw", response.body());
         } catch (HttpConnectTimeoutException e) {
