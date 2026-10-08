@@ -20,7 +20,8 @@ import static org.secretflow.secretpad.web.service.SystemManagementSupport.bool;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.newId;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.now;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.number;
-import static org.secretflow.secretpad.web.service.SystemManagementSupport.requireAdmin;
+import static org.secretflow.secretpad.web.service.SystemManagementSupport.TENANT_MANAGE;
+import static org.secretflow.secretpad.web.service.SystemManagementSupport.USER_MANAGE;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.text;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.validation;
 
@@ -28,7 +29,6 @@ import org.secretflow.secretpad.common.util.UserContext;
 
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -65,16 +65,17 @@ public class SystemTenantService {
     private static final Pattern CODE_PATTERN = Pattern.compile("^[a-z][a-z0-9-]{1,31}$");
 
     private final JdbcTemplate jdbc;
+    private final SystemAccessService access;
 
-    @Value("${secretpad.auth.pad_name:admin}")
-    private String adminName;
-
-    public SystemTenantService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc) {
+    public SystemTenantService(@Qualifier("jdbcTemplate") JdbcTemplate jdbc, SystemAccessService access) {
         this.jdbc = jdbc;
+        this.access = access;
     }
 
+    /** 租户列表；租户范围内的管理者（如项目管理员）只能看到本租户。 */
     public List<Map<String, Object>> list() {
-        requireAdmin(adminName);
+        access.requireAny(TENANT_MANAGE, USER_MANAGE);
+        String scope = access.managedTenantScope();
         Map<String, Map<String, Double>> usage = tenantUsage("");
         Map<String, Integer> userCounts = new LinkedHashMap<>();
         jdbc.query("select ua.tenant_id, count(1) c from ds_user_assignment ua "
@@ -85,17 +86,20 @@ public class SystemTenantService {
                 currentOwnerId());
         List<Map<String, Object>> tenants = jdbc.queryForList(
                 "select * from ds_tenant where deleted = 0 order by created_at desc");
-        return tenants.stream().map(row -> {
-            Map<String, Object> tenant = toTenant(row);
-            String id = String.valueOf(row.get("id"));
-            tenant.put("userCount", userCounts.getOrDefault(id, 0));
-            tenant.put("usage", toResourceMap(usage.getOrDefault(id, Map.of())));
-            return tenant;
-        }).toList();
+        return tenants.stream()
+                .filter(row -> scope == null || scope.equals(String.valueOf(row.get("id"))))
+                .map(row -> {
+                    Map<String, Object> tenant = toTenant(row);
+                    String id = String.valueOf(row.get("id"));
+                    tenant.put("userCount", userCounts.getOrDefault(id, 0));
+                    tenant.put("usage", toResourceMap(usage.getOrDefault(id, Map.of())));
+                    return tenant;
+                })
+                .toList();
     }
 
     public Map<String, Object> overview() {
-        requireAdmin(adminName);
+        access.requireAny(TENANT_MANAGE);
         List<Map<String, Object>> pools = jdbc.queryForList(
                 "select resource_type, total_amount, unit, warning_threshold, critical_threshold "
                         + "from ds_resource_pool where enabled = 1 order by resource_type");
@@ -143,7 +147,7 @@ public class SystemTenantService {
 
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> save(Map<String, Object> request) {
-        requireAdmin(adminName);
+        access.requireAny(TENANT_MANAGE);
         String id = text(request, "id");
         Map<String, Object> existing = StringUtils.isEmpty(id) ? null : requireTenant(id);
         String code = existing == null
@@ -211,7 +215,7 @@ public class SystemTenantService {
 
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> changeStatus(Map<String, Object> request) {
-        requireAdmin(adminName);
+        access.requireAny(TENANT_MANAGE);
         String id = text(request, "id");
         requireTenant(id);
         String status = text(request, "status").toUpperCase(Locale.ROOT);
@@ -225,7 +229,7 @@ public class SystemTenantService {
 
     @Transactional(rollbackFor = Exception.class)
     public void delete(Map<String, Object> request) {
-        requireAdmin(adminName);
+        access.requireAny(TENANT_MANAGE);
         String id = text(request, "id");
         requireTenant(id);
         Integer users = jdbc.queryForObject("select count(1) from ds_user_assignment ua "

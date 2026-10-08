@@ -68,7 +68,12 @@ class SystemUserManagementServiceTest {
         jdbc.update("insert into user_accounts(name,owner_id,display_name) values(?,?,?)",
                 "bob", "node-b", "Bob");
 
-        service = new SystemUserManagementService(jdbc, mock(ModelApiService.class));
+        SystemAccessService access = new SystemAccessService(jdbc);
+        ReflectionTestUtils.setField(access, "adminName", "devadmin");
+        SystemRoleService roleService = new SystemRoleService(
+                jdbc, new SystemTenantService(jdbc, access), access);
+        service = new SystemUserManagementService(
+                jdbc, mock(ModelApiService.class), access, roleService);
         ReflectionTestUtils.setField(service, "adminName", "devadmin");
         UserContext.setBaseUser(UserContextDTO.builder()
                 .name("devadmin")

@@ -17,6 +17,7 @@
 package org.secretflow.secretpad.web.controller;
 
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
+import org.secretflow.secretpad.web.service.SystemAccessService;
 import org.secretflow.secretpad.web.service.SystemRoleService;
 import org.secretflow.secretpad.web.service.SystemTenantService;
 
@@ -30,7 +31,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Tenant, role and assignment management APIs (node-local, administrator only).
+ * Tenant, role and assignment management APIs (node-local, permission based).
  */
 @RestController
 @RequestMapping("/api/v1alpha1/system")
@@ -38,11 +39,19 @@ public class SystemManagementController {
 
     private final SystemTenantService tenantService;
     private final SystemRoleService roleService;
+    private final SystemAccessService accessService;
 
     public SystemManagementController(SystemTenantService tenantService,
-                                      SystemRoleService roleService) {
+                                      SystemRoleService roleService,
+                                      SystemAccessService accessService) {
         this.tenantService = tenantService;
         this.roleService = roleService;
+        this.accessService = accessService;
+    }
+
+    @GetMapping("/me/context")
+    public SecretPadResponse<Map<String, Object>> currentContext() {
+        return SecretPadResponse.success(accessService.context());
     }
 
     @GetMapping("/tenants/list")

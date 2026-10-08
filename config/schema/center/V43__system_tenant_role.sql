@@ -63,12 +63,12 @@ values
 insert or ignore into ds_role
     (id, name, description, permissions, system_role, created_at, updated_at, deleted)
 values
-    ('role-admin', '沙箱管理员', '使用沙箱平台的全部业务功能',
-     '["workbench:view","project:manage","node:manage","data:catalog","data:governance","sandbox:apply","sandbox:review","compute:use","model:review","log:view"]',
+    ('role-admin', '沙箱管理员', '拥有全部业务与系统管理权限；不归属租户，不受租户配额与冻结约束',
+     '["workbench:view","project:manage","node:manage","data:catalog","data:governance","sandbox:apply","sandbox:review","compute:use","model:review","log:view","system:user","system:role","system:tenant"]',
      1, strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'),
      strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'), 0),
-    ('role-project-manager', '项目管理员', '管理项目成员、资源申请与项目级审批',
-     '["workbench:view","project:manage","node:manage","data:catalog","sandbox:apply","sandbox:review","compute:use"]',
+    ('role-project-manager', '项目管理员', '管理项目、本租户用户、资源申请与项目级审批',
+     '["workbench:view","project:manage","node:manage","data:catalog","data:governance","sandbox:apply","sandbox:review","compute:use","system:user"]',
      1, strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'),
      strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'), 0),
     ('role-developer', '数据开发人员', '使用数据目录、数据计算和沙箱能力',

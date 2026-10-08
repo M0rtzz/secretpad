@@ -16,7 +16,6 @@
 
 package org.secretflow.secretpad.web.service;
 
-import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
 import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.Sha256Utils;
@@ -53,20 +52,38 @@ public class SystemUserManagementService {
 
     private final JdbcTemplate jdbc;
     private final ModelApiService modelApiService;
+    private final SystemAccessService access;
+    private final SystemRoleService roleService;
 
     @Value("${secretpad.auth.pad_name:admin}")
     private String adminName;
 
     public SystemUserManagementService(
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
-            ModelApiService modelApiService) {
+            ModelApiService modelApiService,
+            SystemAccessService access,
+            SystemRoleService roleService) {
         this.jdbc = jdbc;
         this.modelApiService = modelApiService;
+        this.access = access;
+        this.roleService = roleService;
     }
 
     public List<Map<String, Object>> list() {
-        requireAdmin();
+        requireUserManager();
         String ownerId = UserContext.getUser().getOwnerId();
+        String scope = access.managedTenantScope();
+        if (scope != null) {
+            // 租户范围内的管理者只能看到本租户的账号
+            return jdbc.query(
+                    "select name, display_name, account_status, last_login_at, gmt_create "
+                            + "from user_accounts "
+                            + "where owner_id = ? and is_deleted = 0 and lower(name) in "
+                            + "(select account from ds_user_assignment where tenant_id = ? and tenant_id <> '') "
+                            + "order by gmt_create desc",
+                    (rs, rowNum) -> toUser(rs),
+                    ownerId, scope);
+        }
         return jdbc.query(
                 "select name, display_name, account_status, last_login_at, gmt_create "
                         + "from user_accounts "
@@ -101,7 +118,7 @@ public class SystemUserManagementService {
 
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> create(Map<String, Object> request) {
-        requireAdmin();
+        requireUserManager();
         String account = normalizeAccount(value(request, "account"));
         String displayName = normalizeDisplayName(value(request, "displayName"), account);
         String ownerId = UserContext.getUser().getOwnerId();
@@ -111,6 +128,10 @@ public class SystemUserManagementService {
         if (activeAccountExists(account)) {
             validationError("账户名已存在");
         }
+        // 账号与租户、角色分配在同一事务内创建，普通用户必须归属租户
+        String tenantId = value(request, "tenantId").trim();
+        List<String> roleIds = SystemManagementSupport.stringList(request, "roleIds");
+        roleService.validateAssignment(tenantId, roleIds, "");
 
         try {
             revokeSessions(account);
@@ -132,6 +153,7 @@ public class SystemUserManagementService {
                             + "(user_type, user_key, target_type, target_code) "
                             + "values ('EDGE_USER', ?, 'ROLE', 'EDGE_USER')",
                     account);
+            roleService.writeAssignment(account, tenantId, roleIds);
         } catch (DataIntegrityViolationException e) {
             throw SecretpadException.of(
                     SystemErrorCode.VALIDATION_ERROR, e, "账户名已存在");
@@ -141,8 +163,9 @@ public class SystemUserManagementService {
 
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> update(Map<String, Object> request) {
-        requireAdmin();
+        requireUserManager();
         String account = normalizeAccount(value(request, "account"));
+        access.assertCanManage(account);
         String ownerId = UserContext.getUser().getOwnerId();
         requireManagedUser(account, ownerId);
         String displayName = normalizeDisplayName(value(request, "displayName"), account);
@@ -157,8 +180,9 @@ public class SystemUserManagementService {
 
     @Transactional(rollbackFor = Exception.class)
     public Map<String, Object> changeStatus(Map<String, Object> request) {
-        requireAdmin();
+        requireUserManager();
         String account = normalizeAccount(value(request, "account"));
+        access.assertCanManage(account);
         String status = value(request, "status").trim().toUpperCase(Locale.ROOT);
         if (!ENABLED.equals(status) && !DISABLED.equals(status)) {
             validationError("用户状态只能为 ENABLED 或 DISABLED");
@@ -180,8 +204,9 @@ public class SystemUserManagementService {
 
     @Transactional(rollbackFor = Exception.class)
     public void resetPassword(Map<String, Object> request) {
-        requireAdmin();
+        requireUserManager();
         String account = normalizeAccount(value(request, "account"));
+        access.assertCanManage(account);
         String ownerId = UserContext.getUser().getOwnerId();
         Map<String, Object> user = requireManagedUser(account, ownerId);
         String storedName = String.valueOf(user.get("account"));
@@ -198,8 +223,9 @@ public class SystemUserManagementService {
 
     @Transactional(rollbackFor = Exception.class)
     public void delete(Map<String, Object> request) {
-        requireAdmin();
+        requireUserManager();
         String account = normalizeAccount(value(request, "account"));
+        access.assertCanManage(account);
         String ownerId = UserContext.getUser().getOwnerId();
         Map<String, Object> user = requireManagedUser(account, ownerId);
         String storedName = String.valueOf(user.get("account"));
@@ -263,10 +289,8 @@ public class SystemUserManagementService {
         jdbc.update("delete from user_tokens where lower(name) = lower(?)", account);
     }
 
-    private void requireAdmin() {
-        if (!StringUtils.equalsIgnoreCase(adminName, UserContext.getUserName())) {
-            throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "仅管理员可管理用户");
-        }
+    private void requireUserManager() {
+        access.requireAny(SystemManagementSupport.USER_MANAGE);
     }
 
     private String normalizeAccount(String account) {
