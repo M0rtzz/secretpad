@@ -25,7 +25,6 @@ import static org.secretflow.secretpad.web.service.SystemManagementSupport.USER_
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.text;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.validation;
 
-import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
 import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
@@ -266,7 +265,7 @@ public class SystemTenantService implements AccountLoginGuard {
             }
             String tenantId = access.tenantOf(account);
             if (StringUtils.isNotEmpty(tenantId) && FROZEN.equals(tenantStatus(tenantId))) {
-                throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "账号所属租户已冻结，请联系管理员");
+                throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, "账号所属租户已冻结，请联系管理员");
             }
         } catch (SecretpadException e) {
             throw e;

@@ -156,7 +156,7 @@ public class SystemUserManagementService {
             roleService.writeAssignment(account, tenantId, roleIds);
         } catch (DataIntegrityViolationException e) {
             throw SecretpadException.of(
-                    SystemErrorCode.VALIDATION_ERROR, e, "账户名已存在");
+                    SystemErrorCode.BUSINESS_RULE_ERROR, e, "账户名已存在");
         }
         return requireManagedUser(account, ownerId);
     }
@@ -314,7 +314,8 @@ public class SystemUserManagementService {
         return value == null ? "" : String.valueOf(value);
     }
 
+    /** 用户管理的业务校验失败，提示原样展示给用户（不带“入参校验失败”前缀）。 */
     private void validationError(String message) {
-        throw SecretpadException.of(SystemErrorCode.VALIDATION_ERROR, message);
+        throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, message);
     }
 }

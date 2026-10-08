@@ -10,11 +10,14 @@
 
 package org.secretflow.secretpad.web.controller;
 
+import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.service.model.common.SecretPadResponse;
 import org.secretflow.secretpad.web.service.sandbox.SandboxApprovalService;
 
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -24,6 +27,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Z-03 沙箱资源申请与审批 APIs：申请单 CRUD、两级审批动作、审批历史与门禁配置。
@@ -32,6 +36,7 @@ import java.util.Map;
  * 可审核——权限由 {@link SandboxApprovalService} 内按角色/状态机校验。</p>
  */
 @Tag(name = "Data Sandbox Approval", description = "沙箱资源申请与审批（创建/续期/规格变更/回收）")
+@Slf4j
 @RestController
 @RequestMapping("/api/v1alpha1/data-sandbox/approvals")
 public class SandboxApprovalController {
@@ -79,5 +84,16 @@ public class SandboxApprovalController {
     @GetMapping("/config")
     public SecretPadResponse<Map<String, Object>> config() {
         return SecretPadResponse.success(service.approvalConfig());
+    }
+
+    /**
+     * 申请与审批的业务校验以 IllegalArgumentException、IllegalStateException 抛出，提示原样展示给用户；
+     * 全局处理器会将其归为未知错误并加“系统未知错误”前缀。仅作用于本控制器。
+     */
+    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
+    public SecretPadResponse<Object> handleBusinessRule(RuntimeException e) {
+        log.warn("Sandbox approval request rejected: {}", e.getMessage());
+        return new SecretPadResponse<>(new SecretPadResponse.SecretPadResponseStatus(
+                SystemErrorCode.BUSINESS_RULE_ERROR.getCode(), Objects.toString(e.getMessage(), "操作失败")), null);
     }
 }

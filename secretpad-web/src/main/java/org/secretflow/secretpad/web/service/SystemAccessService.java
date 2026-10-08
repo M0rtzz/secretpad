@@ -20,7 +20,7 @@ import static org.secretflow.secretpad.web.service.SystemManagementSupport.ADMIN
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.BUSINESS_PERMISSION_KEYS;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.PERMISSION_KEYS;
 
-import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
+import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 
@@ -121,7 +121,7 @@ public class SystemAccessService {
                 return;
             }
         }
-        throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "当前账号无权执行该操作");
+        throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, "当前账号无权执行该操作");
     }
 
     /** G3：授予或定义的权限不得超出操作者自身权限。 */
