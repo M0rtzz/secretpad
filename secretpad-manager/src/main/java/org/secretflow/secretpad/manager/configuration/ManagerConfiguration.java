@@ -45,10 +45,12 @@ public class ManagerConfiguration {
      * Create a new abstract datatable manager via domain data service blocking stub
      *
      * @param kusciaGrpcClientAdapter domain data service blocking stub
-     * @return abstract datatable manager
+     * @return datatable manager; declared with the concrete type so that both
+     * {@link AbstractDatatableManager} and {@link DatatableManager} injection points
+     * resolve regardless of bean creation order
      */
     @Bean
-    AbstractDatatableManager datatableManager(
+    DatatableManager datatableManager(
             KusciaGrpcClientAdapter kusciaGrpcClientAdapter, FeatureTableRepository featureTableRepository
     ) {
         return new DatatableManager(kusciaGrpcClientAdapter, featureTableRepository);
