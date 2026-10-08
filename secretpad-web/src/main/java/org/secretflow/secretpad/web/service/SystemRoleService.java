@@ -194,7 +194,7 @@ public class SystemRoleService {
         access.assertCanManage(account);
         String tenantId = text(request, "tenantId");
         List<String> roleIds = stringList(request, "roleIds");
-        validateAssignment(tenantId, roleIds, access.tenantOf(account));
+        validateAssignment(account, tenantId, roleIds, access.tenantOf(account));
         writeAssignment(account, tenantId, roleIds);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("account", account);
@@ -205,11 +205,11 @@ public class SystemRoleService {
 
     /**
      * 校验分配内容：普通用户必须归属租户，沙箱管理员不归属租户；所授角色不得超出操作者权限；
-     * 租户范围内的管理者只能分配到本租户；新选择的租户须为正常状态。
+     * 租户范围内的管理者只能分配到本租户；新选择的租户须为正常状态，且转入的沙箱占用不超过其配额。
      *
      * @param currentTenantId 账号当前租户，新建账号传空串
      */
-    void validateAssignment(String tenantId, List<String> roleIds, String currentTenantId) {
+    void validateAssignment(String account, String tenantId, List<String> roleIds, String currentTenantId) {
         Set<String> granted = new LinkedHashSet<>();
         for (String roleId : roleIds) {
             granted.addAll(SystemAccessService.readPermissions(requireRole(roleId).get("permissions")));
@@ -231,6 +231,7 @@ public class SystemRoleService {
         // 已冻结租户不能新分配用户；保持原租户不变时允许保存，便于只调整角色
         if (!tenantId.equals(currentTenantId)) {
             tenantService.requireActiveTenant(tenantId);
+            tenantService.assertTransferWithinQuota(account, tenantId);
         }
     }
 

@@ -17,6 +17,7 @@
 package org.secretflow.secretpad.web.service;
 
 import org.secretflow.secretpad.common.dto.UserContextDTO;
+import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.web.service.model.ModelApiService;
@@ -228,12 +229,14 @@ class SystemManagementPermissionTest {
 
         assertDoesNotThrow(() -> tenantService.assertResourceApplication(
                 "dev1", Map.of("cpuCores", 4), ""));
-        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
-                "dev1", Map.of("cpuCores", 8), ""));
+        SecretpadException exceeded = assertThrows(SecretpadException.class,
+                () -> tenantService.assertResourceApplication("dev1", Map.of("cpuCores", 8), ""));
+        // 业务拒绝的提示原样展示，不带“系统未知错误”前缀
+        assertEquals(SystemErrorCode.BUSINESS_RULE_ERROR, exceeded.getErrorCode());
         // 规格变更排除目标沙箱自身的占用
         assertDoesNotThrow(() -> tenantService.assertResourceApplication(
                 "dev1", Map.of("cpuCores", 16), "sbx-1"));
-        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
+        assertThrows(SecretpadException.class, () -> tenantService.assertResourceApplication(
                 "loner", Map.of("cpuCores", 1), ""));
         // 节点管理员与沙箱管理员豁免
         assertDoesNotThrow(() -> tenantService.assertResourceApplication(
@@ -241,6 +244,42 @@ class SystemManagementPermissionTest {
         userService.create(user("sa1", "", "role-admin"));
         assertDoesNotThrow(() -> tenantService.assertResourceApplication(
                 "sa1", Map.of("cpuCores", 999), ""));
+    }
+
+    @Test
+    void tenantTransferCarriesSandboxUsageAndRespectsQuota() {
+        // 联合建模租户 CPU 配额 16 核，平台运营租户 32 核
+        userService.create(user("dev1", "tenant-platform", "role-developer"));
+        userService.create(user("dev2", "tenant-research", "role-developer"));
+        jdbc.update("insert into ds_sandbox(id, created_by) values ('sbx-1', 'dev1'), ('sbx-2', 'dev2')");
+        jdbc.update("insert into ds_resource_allocation values ('a1', 'sbx-1', 'CPU', 12, 'BOUND'), "
+                + "('a2', 'sbx-2', 'CPU', 8, 'BOUND')");
+
+        SecretpadException rejected = assertThrows(SecretpadException.class, () -> roleService.saveAssignment(
+                Map.of("account", "dev1", "tenantId", "tenant-research", "roleIds", List.of("role-developer"))));
+        assertEquals(SystemErrorCode.BUSINESS_RULE_ERROR, rejected.getErrorCode());
+        assertEquals("tenant-platform", access.tenantOf("dev1"));
+        // 保持原租户、只调整角色时不校验转入
+        assertDoesNotThrow(() -> roleService.saveAssignment(Map.of("account", "dev2",
+                "tenantId", "tenant-research", "roleIds", List.of("role-project-manager"))));
+
+        jdbc.update("update ds_resource_allocation set state = 'RELEASED' where id = 'a1'");
+        jdbc.update("insert into ds_resource_allocation values ('a3', 'sbx-1', 'CPU', 8, 'RESERVED')");
+        assertDoesNotThrow(() -> roleService.saveAssignment(
+                Map.of("account", "dev1", "tenantId", "tenant-research", "roleIds", List.of("role-developer"))));
+        assertEquals("tenant-research", access.tenantOf("dev1"));
+    }
+
+    @Test
+    void recreatedAccountInheritsSandboxUsageForQuotaCheck() {
+        // 已删除账号遗留的沙箱：按创建人名称关联到同名重建的账号
+        jdbc.update("insert into ds_sandbox(id, created_by) values ('sbx-1', 'dev1')");
+        jdbc.update("insert into ds_resource_allocation values ('a1', 'sbx-1', 'CPU', 20, 'BOUND')");
+
+        assertThrows(SecretpadException.class,
+                () -> userService.create(user("dev1", "tenant-research", "role-developer")));
+        assertEquals(0, count("select count(1) from user_accounts where name = 'dev1' and is_deleted = 0"));
+        assertDoesNotThrow(() -> userService.create(user("dev1", "tenant-platform", "role-developer")));
     }
 
     @Test
@@ -254,7 +293,7 @@ class SystemManagementPermissionTest {
         assertEquals(0, count("select count(1) from user_tokens where name = 'dev1'"));
         assertEquals(1, count("select count(1) from user_tokens where name = 'sa1'"));
         assertThrows(SecretpadException.class, () -> tenantService.check("dev1"));
-        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
+        assertThrows(SecretpadException.class, () -> tenantService.assertResourceApplication(
                 "dev1", Map.of("cpuCores", 1), ""));
         assertDoesNotThrow(() -> tenantService.check("sa1"));
         assertDoesNotThrow(() -> tenantService.check("devadmin"));

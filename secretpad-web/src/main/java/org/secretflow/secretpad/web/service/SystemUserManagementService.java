@@ -131,7 +131,7 @@ public class SystemUserManagementService {
         // 账号与租户、角色分配在同一事务内创建，普通用户必须归属租户
         String tenantId = value(request, "tenantId").trim();
         List<String> roleIds = SystemManagementSupport.stringList(request, "roleIds");
-        roleService.validateAssignment(tenantId, roleIds, "");
+        roleService.validateAssignment(account, tenantId, roleIds, "");
 
         try {
             revokeSessions(account);

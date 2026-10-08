@@ -68,6 +68,10 @@ public enum SystemErrorCode implements ErrorCode {
     REMOTE_CALL_ERROR(2020111011),
 
     REQUEST_FREQUENCY_ERROR(2020111012),
+    /**
+     * Business rule rejection, the message is shown to users as is
+     */
+    BUSINESS_RULE_ERROR(202011111),
 
     ;
 

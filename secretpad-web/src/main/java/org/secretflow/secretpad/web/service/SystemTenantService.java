@@ -26,6 +26,7 @@ import static org.secretflow.secretpad.web.service.SystemManagementSupport.text;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.validation;
 
 import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
+import org.secretflow.secretpad.common.errorcode.SystemErrorCode;
 import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
 import org.secretflow.secretpad.service.auth.AccountLoginGuard;
@@ -288,10 +289,12 @@ public class SystemTenantService implements AccountLoginGuard {
             String tenantId = access.tenantOf(account);
             String status = StringUtils.isEmpty(tenantId) ? null : tenantStatus(tenantId);
             if (status == null) {
-                throw new IllegalArgumentException("当前账号未归属租户，不能申请沙箱资源，请联系管理员分配租户");
+                throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR,
+                        "当前账号未归属租户，不能申请沙箱资源，请联系管理员分配租户");
             }
             if (FROZEN.equals(status)) {
-                throw new IllegalArgumentException("所属租户已冻结，不能申请沙箱资源");
+                throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR,
+                        "所属租户已冻结，不能申请沙箱资源");
             }
             Map<String, Object> tenant = requireTenant(tenantId);
             Map<String, Double> used = tenantUsage(StringUtils.defaultString(sandboxId))
@@ -307,19 +310,19 @@ public class SystemTenantService implements AccountLoginGuard {
                 double quota = toDouble(tenant.get(meta[0]));
                 if (amount > 0 && current + amount > quota + 1e-9) {
                     String name = meta[2].replace("配额", "");
-                    throw new IllegalArgumentException(String.format(Locale.ROOT,
+                    throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, String.format(Locale.ROOT,
                             "%s超出所属租户配额：已用 %s %s，本次申请 %s %s，配额 %s %s",
                             name, format(current), meta[3], format(amount), meta[3], format(quota), meta[3]));
                 }
             });
-        } catch (IllegalArgumentException e) {
+        } catch (SecretpadException e) {
             throw e;
         } catch (RuntimeException e) {
             log.warn("Skip tenant quota check for {} because of an internal error", account, e);
         }
     }
 
-    /** 当前用户所属租户的配额与实际占用，供申请表单提示；未归属租户时返回空。 */
+    /** 当前用户所属租户的配额与已占用量，供申请表单提示；未归属租户时返回空。 */
     public Map<String, Object> quotaSummary(String tenantId) {
         Map<String, Object> result = new LinkedHashMap<>();
         if (StringUtils.isEmpty(tenantId)) {
@@ -363,6 +366,39 @@ public class SystemTenantService implements AccountLoginGuard {
             throw validation("所选租户已冻结，不能分配用户");
         }
         return tenant;
+    }
+
+    /**
+     * 账号转入租户前的配额校验。租户占用按沙箱创建人的当前租户统计，账号名下沙箱的占用随账号转入，
+     * 转入后不得超过目标租户配额；同名重建的账号同样继承旧沙箱的占用，一并校验。
+     */
+    void assertTransferWithinQuota(String account, String tenantId) {
+        Map<String, Double> moving = new LinkedHashMap<>();
+        jdbc.query("select a.resource_type, coalesce(sum(a.amount), 0) used from ds_resource_allocation a "
+                        + "join ds_sandbox s on s.id = a.sandbox_id and s.deleted = 0 "
+                        + "where a.state in ('RESERVED', 'BOUND') and lower(s.created_by) = ? "
+                        + "group by a.resource_type",
+                rs -> {
+                    moving.put(rs.getString("resource_type"), rs.getDouble("used"));
+                },
+                StringUtils.defaultString(account).toLowerCase(Locale.ROOT));
+        if (moving.isEmpty()) {
+            return;
+        }
+        Map<String, Object> tenant = requireTenant(tenantId);
+        Map<String, Double> used = tenantUsage("").getOrDefault(tenantId, Map.of());
+        RESOURCES.forEach((type, meta) -> {
+            double amount = moving.getOrDefault(type, 0d);
+            double current = used.getOrDefault(type, 0d);
+            double quota = toDouble(tenant.get(meta[0]));
+            if (amount > 0 && current + amount > quota + 1e-9) {
+                String name = meta[2].replace("配额", "");
+                throw SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, String.format(Locale.ROOT,
+                        "该用户名下沙箱占用 %s %s %s，转入后超出目标租户%s配额（已用 %s %s，配额 %s %s），"
+                                + "请先停止或回收其沙箱，或调高租户配额",
+                        name, format(amount), meta[3], name, format(current), meta[3], format(quota), meta[3]));
+            }
+        });
     }
 
     /**
@@ -425,7 +461,7 @@ public class SystemTenantService implements AccountLoginGuard {
         RESOURCES.forEach((type, meta) -> {
             double current = used.getOrDefault(type, 0d);
             if (quota.get(type) + 1e-9 < current) {
-                throw validation(String.format(Locale.ROOT, "%s不能低于当前实际占用 %s %s",
+                throw validation(String.format(Locale.ROOT, "%s不能低于当前已占用 %s %s",
                         meta[2], format(current), meta[3]));
             }
         });

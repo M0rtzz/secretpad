@@ -1215,16 +1215,33 @@ public class SandboxApprovalService {
         if (tenantService == null || !Set.of("CREATE", "SPEC_CHANGE").contains(type)) {
             return;
         }
-        Map<String, Object> resources = new LinkedHashMap<>(request);
-        if ("SPEC_CHANGE".equals(type)) {
-            // 规格变更未填写的资源项沿用沙箱当前规格
-            Map<String, Object> sandbox = requireSandbox(sandboxId);
-            resources.putIfAbsent("cpuCores", sandbox.get("cpu_cores"));
-            resources.putIfAbsent("memoryGb", sandbox.get("memory_gb"));
-            resources.putIfAbsent("gpuCount", sandbox.get("gpu_count"));
-            resources.putIfAbsent("storageGb", sandbox.get("storage_gb"));
-        }
+        Map<String, Object> resources = tenantQuotaResources(request,
+                "SPEC_CHANGE".equals(type) ? requireSandbox(sandboxId) : null);
         tenantService.assertResourceApplication(operator(), resources, "CREATE".equals(type) ? "" : sandboxId);
+    }
+
+    /**
+     * 租户校验使用的申请量，与执行阶段取值一致：规格变更中缺省、无效或不大于 0 的项沿用沙箱当前规格
+     * （见 execSpecChange），GPU 按执行阶段取整。
+     *
+     * @param sandbox 规格变更的目标沙箱，创建申请传 null
+     */
+    static Map<String, Object> tenantQuotaResources(Map<String, Object> request, Map<String, Object> sandbox) {
+        Map<String, Object> resources = new LinkedHashMap<>(request);
+        if (sandbox == null) {
+            resources.put("gpuCount", intValue(request.get("gpuCount"), 0));
+            return resources;
+        }
+        resources.put("cpuCores", specAmount(request.get("cpuCores"), number(sandbox.get("cpu_cores"), 1)));
+        resources.put("memoryGb", specAmount(request.get("memoryGb"), number(sandbox.get("memory_gb"), 2)));
+        resources.put("gpuCount", intValue(request.get("gpuCount"), (int) number(sandbox.get("gpu_count"), 0)));
+        resources.put("storageGb", specAmount(request.get("storageGb"), number(sandbox.get("storage_gb"), 10)));
+        return resources;
+    }
+
+    private static double specAmount(Object value, double current) {
+        double amount = number(value, current);
+        return amount > 0 ? amount : current;
     }
 
     private String operator() {
