@@ -116,6 +116,7 @@ public class SystemUserManagementService {
             revokeSessions(account);
             jdbc.update("delete from sys_user_permission_rel where lower(user_key) = ?", account);
             jdbc.update("delete from sys_user_node_rel where lower(user_id) = ?", account);
+            removeAssignments(account);
 
             jdbc.update(
                     "insert into user_accounts "
@@ -205,6 +206,7 @@ public class SystemUserManagementService {
         revokeSessions(storedName);
         jdbc.update("delete from sys_user_permission_rel where lower(user_key) = ?", account);
         jdbc.update("delete from sys_user_node_rel where lower(user_id) = ?", account);
+        removeAssignments(account);
         modelApiService.removeAuthorizedUser(storedName);
         jdbc.update(
                 "update user_accounts set is_deleted = 1, gmt_modified = CURRENT_TIMESTAMP "
@@ -249,6 +251,12 @@ public class SystemUserManagementService {
         user.put("createdAt", rs.getString("gmt_create"));
         user.put("systemAccount", StringUtils.equalsIgnoreCase(adminName, account));
         return user;
+    }
+
+    /** 清理系统管理中的租户与角色分配，避免同名重建的账号继承旧分配。 */
+    private void removeAssignments(String account) {
+        jdbc.update("delete from ds_user_role where account = ?", account);
+        jdbc.update("delete from ds_user_assignment where account = ?", account);
     }
 
     private void revokeSessions(String account) {
