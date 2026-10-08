@@ -25,12 +25,14 @@ import org.secretflow.secretpad.persistence.repository.SandboxApprovalSyncReposi
 import org.secretflow.secretpad.web.service.AssetTimeWindow;
 import org.secretflow.secretpad.web.service.DataSandboxMvpService;
 import org.secretflow.secretpad.web.service.MinioAssetStorage;
+import org.secretflow.secretpad.web.service.SystemTenantService;
 import org.secretflow.secretpad.web.service.storage.NodeDatasetStore;
 import org.secretflow.secretpad.web.service.storage.SandboxDbService;
 import org.secretflow.secretpad.web.service.sync.AssetSyncService;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -101,6 +103,10 @@ public class SandboxApprovalService {
 
     @Value("${secretpad.data-sandbox.approval.max-retries:3}")
     private int maxRetries;
+
+    /** 系统管理的租户校验；未注入时不做租户校验，行为与原有逻辑一致。 */
+    @Autowired(required = false)
+    private SystemTenantService tenantService;
 
     public SandboxApprovalService(
             @Qualifier("jdbcTemplate") JdbcTemplate jdbc,
@@ -285,6 +291,7 @@ public class SandboxApprovalService {
             }
         }
         assertNoOpenApproval(type, ownerId, sandboxId);
+        assertTenantQuota(type, request, sandboxId);
         Map<String, Object> payload = new LinkedHashMap<>(request);
         if (Set.of("CREATE", "DATA_CHANGE").contains(type)) {
             payload.put("datasetNames",
@@ -1201,6 +1208,23 @@ public class SandboxApprovalService {
 
     private String engineActor() {
         return "system:" + nodeId;
+    }
+
+    /** 增加资源占用的申请（创建、规格变更）在提交前按申请人所属租户校验，仅本节点、仅此一处。 */
+    private void assertTenantQuota(String type, Map<String, Object> request, String sandboxId) {
+        if (tenantService == null || !Set.of("CREATE", "SPEC_CHANGE").contains(type)) {
+            return;
+        }
+        Map<String, Object> resources = new LinkedHashMap<>(request);
+        if ("SPEC_CHANGE".equals(type)) {
+            // 规格变更未填写的资源项沿用沙箱当前规格
+            Map<String, Object> sandbox = requireSandbox(sandboxId);
+            resources.putIfAbsent("cpuCores", sandbox.get("cpu_cores"));
+            resources.putIfAbsent("memoryGb", sandbox.get("memory_gb"));
+            resources.putIfAbsent("gpuCount", sandbox.get("gpu_count"));
+            resources.putIfAbsent("storageGb", sandbox.get("storage_gb"));
+        }
+        tenantService.assertResourceApplication(operator(), resources, "CREATE".equals(type) ? "" : sandboxId);
     }
 
     private String operator() {

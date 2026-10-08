@@ -27,6 +27,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -51,7 +52,9 @@ public class SystemManagementController {
 
     @GetMapping("/me/context")
     public SecretPadResponse<Map<String, Object>> currentContext() {
-        return SecretPadResponse.success(accessService.context());
+        Map<String, Object> context = new LinkedHashMap<>(accessService.context());
+        context.putAll(tenantService.quotaSummary(String.valueOf(context.get("tenantId"))));
+        return SecretPadResponse.success(context);
     }
 
     @GetMapping("/tenants/list")

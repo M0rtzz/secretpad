@@ -25,8 +25,12 @@ import static org.secretflow.secretpad.web.service.SystemManagementSupport.USER_
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.text;
 import static org.secretflow.secretpad.web.service.SystemManagementSupport.validation;
 
+import org.secretflow.secretpad.common.errorcode.AuthErrorCode;
+import org.secretflow.secretpad.common.exception.SecretpadException;
 import org.secretflow.secretpad.common.util.UserContext;
+import org.secretflow.secretpad.service.auth.AccountLoginGuard;
 
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -46,8 +50,9 @@ import java.util.regex.Pattern;
  * <p>Only reads and writes tables of the current node; it does not depend on
  * other business services.</p>
  */
+@Slf4j
 @Service
-public class SystemTenantService {
+public class SystemTenantService implements AccountLoginGuard {
 
     static final String ACTIVE = "ACTIVE";
     static final String FROZEN = "FROZEN";
@@ -224,6 +229,11 @@ public class SystemTenantService {
         }
         jdbc.update("update ds_tenant set status = ?, updated_at = ? where id = ? and deleted = 0",
                 status, now(), id);
+        if (FROZEN.equals(status)) {
+            // 冻结后立即清除该租户用户的会话，沙箱管理员不归属租户、不受影响
+            jdbc.update("delete from user_tokens where lower(name) in "
+                    + "(select account from ds_user_assignment where tenant_id = ?)", id);
+        }
         return toTenant(requireTenant(id));
     }
 
@@ -241,6 +251,109 @@ public class SystemTenantService {
         jdbc.update("update ds_tenant set deleted = 1, updated_at = ? where id = ? and deleted = 0", now(), id);
         // 清理已删除账号遗留的分配行，避免误判
         jdbc.update("delete from ds_user_assignment where tenant_id = ?", id);
+    }
+
+    /**
+     * 登录准入：所属租户已冻结时拒绝登录。节点管理员、沙箱管理员与未归属租户的账号直接通过；
+     * 查询异常记录日志后放行。
+     */
+    @Override
+    public void check(String account) {
+        try {
+            if (access.isSandboxAdmin(account)) {
+                return;
+            }
+            String tenantId = access.tenantOf(account);
+            if (StringUtils.isNotEmpty(tenantId) && FROZEN.equals(tenantStatus(tenantId))) {
+                throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "账号所属租户已冻结，请联系管理员");
+            }
+        } catch (SecretpadException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("Skip tenant login check for {} because of an internal error", account, e);
+        }
+    }
+
+    /**
+     * 提交沙箱资源申请（CREATE、SPEC_CHANGE）前的租户校验：沙箱管理员豁免；普通用户须归属正常状态的
+     * 租户，且租户当前占用加本次申请量不超过租户配额。校验自身出错时记录日志后放行。
+     *
+     * @param sandboxId 规格变更的目标沙箱，其当前占用不计入；创建申请传空串
+     */
+    public void assertResourceApplication(String account, Map<String, Object> request, String sandboxId) {
+        try {
+            if (access.isSandboxAdmin(account)) {
+                return;
+            }
+            String tenantId = access.tenantOf(account);
+            String status = StringUtils.isEmpty(tenantId) ? null : tenantStatus(tenantId);
+            if (status == null) {
+                throw new IllegalArgumentException("当前账号未归属租户，不能申请沙箱资源，请联系管理员分配租户");
+            }
+            if (FROZEN.equals(status)) {
+                throw new IllegalArgumentException("所属租户已冻结，不能申请沙箱资源");
+            }
+            Map<String, Object> tenant = requireTenant(tenantId);
+            Map<String, Double> used = tenantUsage(StringUtils.defaultString(sandboxId))
+                    .getOrDefault(tenantId, Map.of());
+            Map<String, Double> requested = Map.of(
+                    "CPU", requestedAmount(request, "cpuCores", 1),
+                    "MEMORY", requestedAmount(request, "memoryGb", 2),
+                    "GPU", requestedAmount(request, "gpuCount", 0),
+                    "STORAGE", requestedAmount(request, "storageGb", 10));
+            RESOURCES.forEach((type, meta) -> {
+                double amount = requested.get(type);
+                double current = used.getOrDefault(type, 0d);
+                double quota = toDouble(tenant.get(meta[0]));
+                if (amount > 0 && current + amount > quota + 1e-9) {
+                    String name = meta[2].replace("配额", "");
+                    throw new IllegalArgumentException(String.format(Locale.ROOT,
+                            "%s超出所属租户配额：已用 %s %s，本次申请 %s %s，配额 %s %s",
+                            name, format(current), meta[3], format(amount), meta[3], format(quota), meta[3]));
+                }
+            });
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.warn("Skip tenant quota check for {} because of an internal error", account, e);
+        }
+    }
+
+    /** 当前用户所属租户的配额与实际占用，供申请表单提示；未归属租户时返回空。 */
+    public Map<String, Object> quotaSummary(String tenantId) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (StringUtils.isEmpty(tenantId)) {
+            return result;
+        }
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select * from ds_tenant where id = ? and deleted = 0", tenantId);
+        if (rows.isEmpty()) {
+            return result;
+        }
+        Map<String, Object> tenant = toTenant(rows.get(0));
+        result.put("tenantStatus", tenant.get("status"));
+        result.put("tenantQuota", toResourceMap(Map.of(
+                "CPU", toDouble(rows.get(0).get("cpu_cores")),
+                "MEMORY", toDouble(rows.get(0).get("memory_gb")),
+                "GPU", toDouble(rows.get(0).get("gpu_count")),
+                "STORAGE", toDouble(rows.get(0).get("storage_gb")))));
+        result.put("tenantUsage", toResourceMap(tenantUsage("").getOrDefault(tenantId, Map.of())));
+        return result;
+    }
+
+    private String tenantStatus(String tenantId) {
+        return jdbc.queryForList("select status from ds_tenant where id = ? and deleted = 0",
+                        String.class, tenantId)
+                .stream().findFirst().orElse(null);
+    }
+
+    private static double requestedAmount(Map<String, Object> request, String key, double fallback) {
+        Object value = request == null ? null : request.get(key);
+        if (value == null || StringUtils.isBlank(String.valueOf(value))) {
+            return fallback;
+        }
+        double amount = toDouble(value);
+        return amount > 0 ? amount : fallback;
     }
 
     /** 返回未删除且状态正常的租户；供分配关系校验使用。 */

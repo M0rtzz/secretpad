@@ -29,6 +29,7 @@ import org.secretflow.secretpad.persistence.repository.*;
 import org.secretflow.secretpad.service.AuthService;
 import org.secretflow.secretpad.service.EnvService;
 import org.secretflow.secretpad.service.SysResourcesBizService;
+import org.secretflow.secretpad.service.auth.AccountLoginGuard;
 import org.secretflow.secretpad.service.UserService;
 
 import jakarta.annotation.Resource;
@@ -86,6 +87,9 @@ public class AuthServiceImpl implements AuthService {
 
     @Value("${secretpad.auth.pad_name:admin}")
     private String adminName;
+
+    @Autowired(required = false)
+    private List<AccountLoginGuard> accountLoginGuards;
 
     @Resource
     private CacheManager cacheManager;
@@ -174,6 +178,11 @@ public class AuthServiceImpl implements AuthService {
         if (!adminName.equalsIgnoreCase(user.getName())
                 && !"ENABLED".equalsIgnoreCase(user.getAccountStatus())) {
             throw SecretpadException.of(AuthErrorCode.AUTH_FAILED, "account is disabled");
+        }
+        if (!adminName.equalsIgnoreCase(user.getName()) && accountLoginGuards != null) {
+            for (AccountLoginGuard guard : accountLoginGuards) {
+                guard.check(user.getName());
+            }
         }
 
         //checkPassword success

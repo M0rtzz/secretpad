@@ -41,6 +41,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -59,6 +60,7 @@ class SystemManagementPermissionTest {
     private SystemAccessService access;
     private SystemRoleService roleService;
     private SystemUserManagementService userService;
+    private SystemTenantService tenantService;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -87,6 +89,10 @@ class SystemManagementPermissionTest {
         jdbc.execute("create table sys_user_permission_rel (user_type varchar(16), user_key varchar(128), "
                 + "target_type varchar(16), target_code varchar(64))");
         jdbc.execute("create table sys_user_node_rel (user_id varchar(128), node_id varchar(64))");
+        jdbc.execute("create table ds_sandbox (id varchar(64) primary key, created_by varchar(128), "
+                + "deleted integer not null default 0)");
+        jdbc.execute("create table ds_resource_allocation (id varchar(64) primary key, sandbox_id varchar(64), "
+                + "resource_type varchar(32), amount real, state varchar(16))");
         try (Connection connection = dataSource.getConnection()) {
             // 迁移脚本含中文，须按 UTF-8 读取，与 Flyway 一致
             ScriptUtils.executeSqlScript(connection,
@@ -96,7 +102,8 @@ class SystemManagementPermissionTest {
 
         access = new SystemAccessService(jdbc);
         ReflectionTestUtils.setField(access, "adminName", "devadmin");
-        roleService = new SystemRoleService(jdbc, new SystemTenantService(jdbc, access), access);
+        tenantService = new SystemTenantService(jdbc, access);
+        roleService = new SystemRoleService(jdbc, tenantService, access);
         userService = new SystemUserManagementService(jdbc, mock(ModelApiService.class), access, roleService);
         ReflectionTestUtils.setField(userService, "adminName", "devadmin");
         loginAs("devadmin");
@@ -209,6 +216,62 @@ class SystemManagementPermissionTest {
         assertEquals("tenant-research", pm.get("tenantId"));
         assertTrue(((Collection<?>) pm.get("permissions")).contains("system:user"));
         assertFalse(((Collection<?>) pm.get("permissions")).contains("system:role"));
+    }
+
+    @Test
+    void resourceApplicationRequiresTenantAndRespectsQuota() {
+        // 联合建模租户预置配额：CPU 16 核
+        userService.create(user("dev1", "tenant-research", "role-developer"));
+        jdbc.update("insert into user_accounts(name, owner_id) values ('loner', 'node-a')");
+        jdbc.update("insert into ds_sandbox(id, created_by) values ('sbx-1', 'dev1')");
+        jdbc.update("insert into ds_resource_allocation values ('a1', 'sbx-1', 'CPU', 12, 'BOUND')");
+
+        assertDoesNotThrow(() -> tenantService.assertResourceApplication(
+                "dev1", Map.of("cpuCores", 4), ""));
+        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
+                "dev1", Map.of("cpuCores", 8), ""));
+        // 规格变更排除目标沙箱自身的占用
+        assertDoesNotThrow(() -> tenantService.assertResourceApplication(
+                "dev1", Map.of("cpuCores", 16), "sbx-1"));
+        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
+                "loner", Map.of("cpuCores", 1), ""));
+        // 节点管理员与沙箱管理员豁免
+        assertDoesNotThrow(() -> tenantService.assertResourceApplication(
+                "devadmin", Map.of("cpuCores", 999), ""));
+        userService.create(user("sa1", "", "role-admin"));
+        assertDoesNotThrow(() -> tenantService.assertResourceApplication(
+                "sa1", Map.of("cpuCores", 999), ""));
+    }
+
+    @Test
+    void frozenTenantBlocksLoginAndRevokesSessions() {
+        userService.create(user("dev1", "tenant-research", "role-developer"));
+        userService.create(user("sa1", "", "role-admin"));
+        jdbc.update("insert into user_tokens(name, token) values ('dev1', 't1'), ('sa1', 't2')");
+
+        tenantService.changeStatus(Map.of("id", "tenant-research", "status", "FROZEN"));
+
+        assertEquals(0, count("select count(1) from user_tokens where name = 'dev1'"));
+        assertEquals(1, count("select count(1) from user_tokens where name = 'sa1'"));
+        assertThrows(SecretpadException.class, () -> tenantService.check("dev1"));
+        assertThrows(IllegalArgumentException.class, () -> tenantService.assertResourceApplication(
+                "dev1", Map.of("cpuCores", 1), ""));
+        assertDoesNotThrow(() -> tenantService.check("sa1"));
+        assertDoesNotThrow(() -> tenantService.check("devadmin"));
+
+        tenantService.changeStatus(Map.of("id", "tenant-research", "status", "ACTIVE"));
+        assertDoesNotThrow(() -> tenantService.check("dev1"));
+    }
+
+    @Test
+    void internalErrorsDoNotBlockApplicationsOrLogin() {
+        userService.create(user("dev1", "tenant-research", "role-developer"));
+        jdbc.execute("drop table ds_resource_allocation");
+
+        assertDoesNotThrow(() -> tenantService.assertResourceApplication(
+                "dev1", Map.of("cpuCores", 1), ""));
+        jdbc.execute("drop table ds_tenant");
+        assertDoesNotThrow(() -> tenantService.check("dev1"));
     }
 
     private void loginAs(String account) {
