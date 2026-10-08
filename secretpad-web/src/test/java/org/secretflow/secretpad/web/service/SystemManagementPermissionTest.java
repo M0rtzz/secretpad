@@ -126,8 +126,10 @@ class SystemManagementPermissionTest {
 
     @Test
     void ordinaryUserMustBelongToTenant() {
-        assertThrows(SecretpadException.class,
+        SecretpadException rejected = assertThrows(SecretpadException.class,
                 () -> userService.create(user("dev1", "", "role-developer")));
+        // 系统管理的校验提示原样展示，不带“入参校验失败”前缀
+        assertEquals(SystemErrorCode.BUSINESS_RULE_ERROR, rejected.getErrorCode());
         assertEquals(0, count("select count(1) from user_accounts where name = 'dev1'"));
     }
 

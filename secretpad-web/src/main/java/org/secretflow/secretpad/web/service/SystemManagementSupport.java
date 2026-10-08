@@ -100,7 +100,8 @@ final class SystemManagementSupport {
                 .toList();
     }
 
+    /** 系统管理的业务校验失败，提示原样展示给用户（不带“入参校验失败”前缀）。 */
     static SecretpadException validation(String message) {
-        return SecretpadException.of(SystemErrorCode.VALIDATION_ERROR, message);
+        return SecretpadException.of(SystemErrorCode.BUSINESS_RULE_ERROR, message);
     }
 }
